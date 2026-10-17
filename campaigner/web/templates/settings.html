@@ -1,0 +1,61 @@
+{% extends "base.html" %}
+{% block title %}Settings{% endblock %}
+{% block main %}
+<header class="head"><div><h1>Settings</h1></div></header>
+<div class="grid2">
+  <div class="stack-y">
+    <section class="card">
+      <div class="card-head"><h2>Outlook</h2></div>
+      {% if account %}
+        <p><span class="dot on"></span>Connected as <b>{{ account }}</b>. Email goes out from this mailbox and lands in your Sent Items.</p>
+        <button class="btn" id="login">Reconnect</button>
+      {% elif not client_id %}
+        <p>Add <code>OC_CLIENT_ID</code> and <code>OC_TENANT_ID</code> to <code>outlook-campaigns/.env</code>, then restart the dashboard. See README → <i>Register an app in Entra ID</i>.</p>
+      {% else %}
+        <p>Not connected. Clicking opens a Microsoft sign-in in your browser.</p>
+        <button class="btn primary" id="login">Connect Outlook</button>
+      {% endif %}
+      <p class="meta" id="login-state">{% if login_state.error %}Last attempt failed: {{ login_state.error }}{% endif %}</p>
+    </section>
+
+    <section class="card">
+      <div class="card-head"><h2>LinkedIn detection</h2></div>
+      <p>Accepts and replies are read from LinkedIn's notification emails in this mailbox. In LinkedIn → Settings → Communications → Email, keep these on:</p>
+      <ul class="meta"><li>Invitations: <i>invitation accepted</i></li><li>Messages: <i>new messages</i></li></ul>
+      <p class="meta">Detection matches the lead's full name in the notification. If it misses one, use <i>Mark connected</i> or <i>They replied</i>.</p>
+    </section>
+
+    <section class="card">
+      <div class="card-head"><h2>Scheduler</h2></div>
+      <p>The dashboard runs everything every {{ tick_minutes }} min while it's open. To start it at login and keep it running:</p>
+      <pre class="log">./oc install</pre>
+      <p class="meta">Emails respect each campaign's send window and caps. The Mac has to be awake.</p>
+    </section>
+  </div>
+
+  <section class="card">
+    <div class="card-head"><h2>Run log</h2><div class="actions"><button class="btn" data-run>Run now</button></div></div>
+    <pre class="log" id="log">{{ logs | join("\n") or "No runs yet in this session." }}</pre>
+  </section>
+</div>
+{% endblock %}
+{% block scripts %}
+<script>
+  const login = document.getElementById("login");
+  login && login.addEventListener("click", async () => {
+    try { await api("/api/login"); $("#login-state").textContent = "Waiting for the Microsoft sign-in in your browser…"; poll(); }
+    catch (e) { toast(e.message, true); }
+  });
+  async function poll() {
+    const s = await (await fetch("/api/state")).json();
+    $("#log").textContent = s.logs.join("\n") || "No runs yet in this session.";
+    if (s.login.state === "waiting") return setTimeout(poll, 1500);
+    if (s.login.state === "done") location.reload();
+    if (s.login.state === "failed") $("#login-state").textContent = "Sign-in failed: " + s.login.error;
+  }
+  setInterval(async () => {
+    const s = await (await fetch("/api/state")).json();
+    $("#log").textContent = s.logs.join("\n") || "No runs yet in this session.";
+  }, 5000);
+</script>
+{% endblock %}

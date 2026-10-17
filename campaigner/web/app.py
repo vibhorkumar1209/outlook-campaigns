@@ -1,0 +1,499 @@
+"""Local dashboard. FastAPI + server-rendered Jinja. Listens on 127.0.0.1 only."""
+from __future__ import annotations
+
+import json
+import os
+import secrets
+from datetime import datetime, timedelta
+from pathlib import Path
+from zoneinfo import ZoneInfo, available_timezones
+
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+from jinja2 import TemplateError, TemplateSyntaxError
+
+from .. import db, engine, importer, stats
+from ..db import iso, one, parse, rows, scalar, utcnow
+from ..render import ENV, email_html, lead_context, render_text
+from ..runner import Runner
+
+HERE = Path(__file__).parent
+PORT = int(os.environ.get("OC_PORT", "8765"))
+HOSTS = {f"127.0.0.1:{PORT}", f"localhost:{PORT}"}
+STATUS_TONE = {
+    "active": "info", "open": "info", "pending": "muted", "done": "muted", "draft": "muted",
+    "replied": "good", "connected": "good", "paused": "warning", "stopped": "warning", "invited": "info",
+    "bounced": "critical", "error": "critical", "none": "muted",
+}
+SAMPLE_LEAD = {"first_name": "Jane", "last_name": "Doe", "company": "Acme Corp", "title": "Head of IT",
+               "email": "jane@example.com", "linkedin_url": "https://www.linkedin.com/in/janedoe", "data": "{}"}
+DEFAULT_SEQUENCE = [
+    {"channel": "li_connect", "delay_days": 0, "body":
+        "Hi {{ first_name }}, I work with IT leaders at companies like {{ company }}. Would be good to connect."},
+    {"channel": "email", "delay_days": 1, "subject": "{{ company }} + quick idea", "body":
+        "Hi {{ first_name }},\n\nSaw {{ company }} is growing its IT team. As {{ title | default('a leader there', true) }}, "
+        "you might find this useful: ...\n\nWorth a 15-minute call next week?"},
+    {"channel": "li_message", "delay_days": 3, "body":
+        "Thanks for connecting, {{ first_name }}! I sent you a short note by email. Happy to share more here if easier."},
+    {"channel": "email", "delay_days": 4, "body": "Hi {{ first_name }}, bumping this up in case it got buried."},
+    {"channel": "email", "delay_days": 7, "body":
+        "Hi {{ first_name }}, last note from me. If it's not a priority for {{ company }} right now, "
+        "just reply \"no\" and I won't follow up again."},
+]
+
+runner = Runner()
+app = FastAPI(docs_url=None, redoc_url=None)
+app.mount("/static", StaticFiles(directory=HERE / "static"), name="static")
+templates = Jinja2Templates(directory=HERE / "templates")
+UPLOADS: dict[str, dict] = {}
+
+
+def local_tz():
+    return datetime.now().astimezone().tzinfo
+
+
+def _ago(s: str | None) -> str:
+    dt = parse(s) if isinstance(s, str) else s
+    if not dt:
+        return "never"
+    secs = (utcnow() - dt).total_seconds()
+    future, secs = secs < 0, abs(secs)
+    for unit, n in (("d", 86400), ("h", 3600), ("m", 60)):
+        if secs >= n:
+            v = f"{int(secs // n)}{unit}"
+            return f"in {v}" if future else f"{v} ago"
+    return "just now"
+
+
+def _local(s: str | None, fmt: str = "%b %d %H:%M") -> str:
+    dt = parse(s) if isinstance(s, str) else s
+    return dt.astimezone(local_tz()).strftime(fmt) if dt else "-"
+
+
+templates.env.filters.update(ago=_ago, local=_local)
+templates.env.globals.update(
+    tone=lambda s: STATUS_TONE.get(s, "muted"),
+    channel_label=lambda c: engine.CHANNELS.get(c, c),
+    CHANNELS=engine.CHANNELS, CONDITIONS=engine.CONDITIONS, FIELDS=importer.FIELDS,
+)
+
+OPEN_TASKS_SQL = """SELECT COUNT(*) FROM tasks t JOIN enrollments e ON e.id = t.enrollment_id
+                    JOIN campaigns c ON c.id = e.campaign_id WHERE t.status = 'open' AND c.status = 'active'"""
+
+
+@app.middleware("http")
+async def local_only(request: Request, call_next):
+    # Block DNS rebinding and cross-site form posts: this app can send email as you.
+    if request.headers.get("host", "") not in HOSTS:
+        return PlainTextResponse("bad host", 400)
+    if request.method not in ("GET", "HEAD"):
+        origin = request.headers.get("origin") or request.headers.get("referer") or ""
+        if not any(origin.startswith(f"http://{h}") for h in HOSTS):
+            return PlainTextResponse("cross-origin request blocked", 403)
+    return await call_next(request)
+
+
+@app.on_event("startup")
+def _start():
+    if os.environ.get("OC_TICKER", "1") == "1":
+        runner.start_loop(int(os.environ.get("OC_TICK_MINUTES", "10")))
+
+
+def page(request: Request, name: str, conn, **ctx):
+    base = {
+        "account": runner.account(),
+        "last_tick": db.get_setting(conn, "last_tick"),
+        "open_tasks": scalar(conn, OPEN_TASKS_SQL),
+        "path": request.url.path,
+        "msg": request.query_params.get("msg"),
+        "err": request.query_params.get("err"),
+    }
+    return templates.TemplateResponse(request, name, {**base, **ctx})
+
+
+def back(url: str, **q) -> RedirectResponse:
+    from urllib.parse import urlencode
+
+    return RedirectResponse(url + ("?" + urlencode(q) if q else ""), status_code=303)
+
+
+def get_campaign(conn, cid: int) -> dict:
+    c = one(conn, "SELECT * FROM campaigns WHERE id = ?", cid)
+    if not c:
+        raise HTTPException(404, "campaign not found")
+    return c
+
+
+# ---------- overview ----------
+
+@app.get("/")
+def overview(request: Request):
+    conn = db.connect()
+    tz = local_tz()
+    act = stats.activity(conn, tz)
+    peak = max([d["email"] + d["linkedin"] for d in act] + [1])
+    return page(request, "overview.html", conn, o=stats.overview(conn, tz), act=act, peak=peak,
+                campaigns=stats.campaign_rows(conn), replies=stats.recent_replies(conn))
+
+
+# ---------- LinkedIn queue ----------
+
+@app.get("/tasks")
+def tasks(request: Request, campaign: int | None = None):
+    conn = db.connect()
+    sql = """SELECT t.*, c.id campaign_id, c.name campaign, l.id lead_id, l.first_name, l.last_name, l.company,
+                    l.title, l.linkedin_url, l.li_state,
+                    (SELECT COUNT(*) FROM steps s WHERE s.campaign_id = c.id) n_steps
+             FROM tasks t JOIN enrollments e ON e.id = t.enrollment_id
+             JOIN campaigns c ON c.id = e.campaign_id JOIN leads l ON l.id = e.lead_id
+             WHERE t.status = 'open' AND c.status = 'active'"""
+    args = ()
+    if campaign:
+        sql += " AND c.id = ?"
+        args = (campaign,)
+    items = rows(conn, sql + " ORDER BY t.created_at, t.id", *args)
+    done_today = scalar(conn, "SELECT COUNT(*) FROM events WHERE type = 'task_done' AND at >= ?",
+                        iso(utcnow().astimezone(local_tz()).replace(hour=0, minute=0, second=0)))
+    camps = rows(conn, "SELECT id, name FROM campaigns WHERE status = 'active' ORDER BY name")
+    return page(request, "tasks.html", conn, tasks=items, campaigns=camps, campaign=campaign, done_today=done_today)
+
+
+@app.post("/api/tasks/{task_id}")
+async def task_action(task_id: int, request: Request):
+    body = await request.json()
+    if body.get("action") not in ("done", "skip", "connected", "replied"):
+        raise HTTPException(400, "bad action")
+    conn = db.connect()
+    try:
+        engine.complete_task(conn, task_id, body["action"], body.get("body"))
+    except ValueError as e:
+        raise HTTPException(409, str(e))
+    return {"ok": True, "open": scalar(conn, OPEN_TASKS_SQL)}
+
+
+# ---------- campaigns ----------
+
+@app.get("/campaigns")
+def campaigns(request: Request):
+    conn = db.connect()
+    return page(request, "campaigns.html", conn, campaigns=stats.campaign_rows(conn))
+
+
+@app.post("/campaigns")
+def create_campaign(name: str = Form(...)):
+    conn = db.connect()
+    cur = conn.execute("INSERT INTO campaigns (name, created_at) VALUES (?, ?)", (name.strip() or "Untitled", iso(utcnow())))
+    _save_steps(conn, cur.lastrowid, _validate_steps(DEFAULT_SEQUENCE)[0])
+    return back(f"/campaigns/{cur.lastrowid}", tab="sequence", msg="Campaign created with a starter sequence. Edit it, import leads, then activate.")
+
+
+@app.get("/campaigns/{cid}")
+def campaign(request: Request, cid: int, tab: str = "overview", status: str | None = None):
+    conn = db.connect()
+    c = get_campaign(conn, cid)
+    steps = rows(conn, "SELECT * FROM steps WHERE campaign_id = ? ORDER BY pos", cid)
+    has_li = any(s["channel"] in engine.LI for s in steps)
+    ctx = {"c": c, "tab": tab, "steps": steps, "counts": stats.status_counts(conn, cid)}
+    if tab == "overview":
+        ctx.update(funnel=stats.funnel(conn, cid, has_li), step_stats=stats.step_stats(conn, cid, steps))
+    elif tab == "sequence":
+        ctx["preview_leads"] = rows(conn, """SELECT l.id, l.first_name, l.last_name, l.company FROM leads l
+            JOIN enrollments e ON e.lead_id = l.id WHERE e.campaign_id = ? ORDER BY e.id LIMIT 50""", cid)
+    elif tab == "leads":
+        sql = """SELECT e.*, l.first_name, l.last_name, l.company, l.title, l.email, l.linkedin_url, l.li_state
+                 FROM enrollments e JOIN leads l ON l.id = e.lead_id WHERE e.campaign_id = ?"""
+        args = [cid]
+        if status:
+            sql += " AND e.status = ?"
+            args.append(status)
+        ctx.update(enrollments=rows(conn, sql + " ORDER BY e.id LIMIT 1000", *args), status=status)
+    elif tab == "settings":
+        tz = engine.tz_of(c)
+        start = parse(c["start_at"])
+        ctx.update(start_local=start.astimezone(tz).strftime("%Y-%m-%dT%H:%M") if start else "",
+                   days=c["window_days"].split(","), zones=sorted(available_timezones()))
+    return page(request, "campaign.html", conn, **ctx)
+
+
+@app.post("/campaigns/{cid}/settings")
+def campaign_settings(cid: int, name: str = Form(...), timezone: str = Form(""), start_at: str = Form(""),
+                      window_days: list[str] = Form([]), window_start: str = Form("09:30"), window_end: str = Form("17:00"),
+                      email_daily_cap: int = Form(40), li_daily_cap: int = Form(20), gap_min: int = Form(45),
+                      gap_max: int = Form(120), signature: str = Form("")):
+    conn = db.connect()
+    get_campaign(conn, cid)
+    url = f"/campaigns/{cid}"
+    timezone = timezone.strip()
+    if timezone and timezone not in available_timezones():
+        return back(url, tab="settings", err=f"Unknown timezone {timezone}")
+    if not window_days:
+        return back(url, tab="settings", err="Pick at least one send day")
+    if window_start >= window_end:
+        return back(url, tab="settings", err="Send window must end after it starts")
+    tz = ZoneInfo(timezone) if timezone else local_tz()
+    start = iso(datetime.fromisoformat(start_at).replace(tzinfo=tz)) if start_at else None
+    gap_min, gap_max = max(0, gap_min), max(gap_min, gap_max)
+    conn.execute("""UPDATE campaigns SET name = ?, timezone = ?, start_at = ?, window_days = ?, window_start = ?,
+                    window_end = ?, email_daily_cap = ?, li_daily_cap = ?, gap_min = ?, gap_max = ?, signature = ?
+                    WHERE id = ?""",
+                 (name.strip() or "Untitled", timezone or None, start, ",".join(window_days), window_start, window_end,
+                  max(0, email_daily_cap), max(0, li_daily_cap), gap_min, gap_max, signature, cid))
+    return back(url, tab="settings", msg="Saved")
+
+
+@app.post("/campaigns/{cid}/status")
+def campaign_status(cid: int, status: str = Form(...)):
+    conn = db.connect()
+    get_campaign(conn, cid)
+    url = f"/campaigns/{cid}"
+    if status not in ("draft", "active", "paused"):
+        raise HTTPException(400)
+    if status == "active":
+        if not scalar(conn, "SELECT COUNT(*) FROM steps WHERE campaign_id = ?", cid):
+            return back(url, err="Add at least one step first")
+        if not scalar(conn, "SELECT COUNT(*) FROM enrollments WHERE campaign_id = ?", cid):
+            return back(url, err="Import leads into this campaign first")
+    conn.execute("UPDATE campaigns SET status = ? WHERE id = ?", (status, cid))
+    if status == "active":
+        runner.run_async()
+    return back(url, msg={"active": "Live. First run started.", "paused": "Paused. Replies are still tracked.",
+                          "draft": "Back to draft."}[status])
+
+
+@app.post("/campaigns/{cid}/delete")
+def campaign_delete(cid: int):
+    conn = db.connect()
+    conn.execute("DELETE FROM campaigns WHERE id = ?", (cid,))
+    return back("/campaigns", msg="Campaign deleted")
+
+
+def _validate_steps(raw: list[dict]) -> tuple[list[dict], list[str]]:
+    out, errs, seen_email = [], [], False
+    for i, s in enumerate(raw):
+        n = f"Step {i + 1}"
+        ch = s.get("channel")
+        if ch not in engine.CHANNELS:
+            errs.append(f"{n}: unknown channel")
+            continue
+        cond = s.get("condition") or "always"
+        if cond not in engine.CONDITIONS:
+            errs.append(f"{n}: unknown condition")
+        try:
+            delay = float(s.get("delay_days") or 0)
+        except (TypeError, ValueError):
+            delay = -1
+        if delay < 0:
+            errs.append(f"{n}: wait must be 0 or more days")
+        subject = ((s.get("subject") or "").strip() or None) if ch == "email" else None
+        body = (s.get("body") or "") if ch != "li_view" else ""
+        in_thread = bool(s.get("in_thread", True))
+        if ch == "email":
+            if not subject and (not seen_email or not in_thread):
+                errs.append(f"{n}: subject needed ({'first email starts the thread' if not seen_email else 'new thread'})")
+            seen_email = True
+        if ch in ("email", "li_message") and not body.strip():
+            errs.append(f"{n}: message is empty")
+        if ch == "li_connect" and len(body) > 300:
+            errs.append(f"{n}: LinkedIn invite notes max 300 characters")
+        for label, t in (("subject", subject), ("message", body)):
+            try:
+                ENV.parse(t or "")
+            except TemplateSyntaxError as e:
+                errs.append(f"{n} {label}: template syntax: {e.message}")
+        out.append({"pos": i, "channel": ch, "delay_days": max(delay, 0), "condition": cond, "subject": subject,
+                    "body": body, "in_thread": 1 if in_thread else 0})
+    if not raw:
+        errs.append("Add at least one step")
+    return out, errs
+
+
+def _save_steps(conn, cid: int, steps: list[dict]) -> None:
+    conn.execute("BEGIN")
+    conn.execute("DELETE FROM steps WHERE campaign_id = ?", (cid,))
+    for s in steps:
+        conn.execute("INSERT INTO steps (campaign_id, pos, channel, delay_days, condition, subject, body, in_thread) "
+                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                     (cid, s["pos"], s["channel"], s["delay_days"], s["condition"], s["subject"], s["body"], s["in_thread"]))
+    conn.execute("COMMIT")
+
+
+@app.post("/api/campaigns/{cid}/steps")
+async def save_steps(cid: int, request: Request):
+    conn = db.connect()
+    get_campaign(conn, cid)
+    steps, errs = _validate_steps((await request.json()).get("steps") or [])
+    if errs:
+        return JSONResponse({"ok": False, "errors": errs}, status_code=422)
+    _save_steps(conn, cid, steps)
+    return {"ok": True}
+
+
+@app.post("/api/preview")
+async def preview(request: Request):
+    p = await request.json()
+    conn = db.connect()
+    c = get_campaign(conn, int(p["campaign_id"]))
+    lead = one(conn, "SELECT * FROM leads WHERE id = ?", p.get("lead_id")) if p.get("lead_id") else None
+    ctx = lead_context(lead or SAMPLE_LEAD)
+    st = p.get("step") or {}
+    try:
+        if st.get("channel") == "email":
+            subject = render_text(st.get("subject") or p.get("first_subject") or "", ctx)
+            if not st.get("subject") and p.get("in_thread_followup"):
+                subject = "Re: " + subject
+            return {"subject": subject, "html": email_html(st.get("body") or "", c["signature"], ctx)}
+        text = render_text(st.get("body") or "", ctx)
+        return {"text": text, "chars": len(text)}
+    except TemplateError as e:
+        return {"error": str(e)}
+
+
+@app.post("/api/enrollments/{eid}/stop")
+def stop(eid: int):
+    conn = db.connect()
+    engine.stop_enrollment(conn, eid)
+    return {"ok": True}
+
+
+# ---------- leads ----------
+
+@app.get("/leads")
+def leads(request: Request, q: str = ""):
+    conn = db.connect()
+    like = f"%{q.strip()}%"
+    items = rows(conn, """
+        SELECT l.*, (SELECT COUNT(*) FROM enrollments e WHERE e.lead_id = l.id) n_campaigns,
+          (SELECT status FROM enrollments e WHERE e.lead_id = l.id ORDER BY e.id DESC LIMIT 1) last_status,
+          (SELECT MAX(at) FROM events ev WHERE ev.lead_id = l.id AND ev.type IN ('sent', 'task_done', 'reply')) last_touch
+        FROM leads l
+        WHERE ? = '' OR l.first_name || ' ' || l.last_name LIKE ? OR l.email LIKE ? OR l.company LIKE ?
+        ORDER BY l.id DESC LIMIT 500""", q.strip(), like, like, like)
+    return page(request, "leads.html", conn, leads=items, q=q, total=scalar(conn, "SELECT COUNT(*) FROM leads"))
+
+
+@app.get("/leads/{lid}")
+def lead(request: Request, lid: int):
+    conn = db.connect()
+    l = one(conn, "SELECT * FROM leads WHERE id = ?", lid)
+    if not l:
+        raise HTTPException(404)
+    ens = rows(conn, """SELECT e.*, c.name campaign, c.status campaign_status,
+                          (SELECT COUNT(*) FROM steps s WHERE s.campaign_id = c.id) n_steps
+                        FROM enrollments e JOIN campaigns c ON c.id = e.campaign_id WHERE e.lead_id = ? ORDER BY e.id""", lid)
+    events = rows(conn, """SELECT ev.*, c.name campaign FROM events ev LEFT JOIN campaigns c ON c.id = ev.campaign_id
+                           WHERE ev.lead_id = ? ORDER BY ev.at DESC, ev.id DESC""", lid)
+    extras = json.loads(l["data"] or "{}")
+    return page(request, "lead.html", conn, l=l, enrollments=ens, events=events, extras=extras)
+
+
+@app.post("/api/leads/{lid}")
+async def lead_action(lid: int, request: Request):
+    p = await request.json()
+    conn = db.connect()
+    if not one(conn, "SELECT id FROM leads WHERE id = ?", lid):
+        raise HTTPException(404)
+    act, now = p.get("action"), utcnow()
+    if act == "replied":
+        if not engine.mark_replied(conn, lid, p.get("channel") or "linkedin", now, detail="marked manually"):
+            raise HTTPException(409, "lead is not in an open sequence")
+    elif act == "connected":
+        engine.set_connected(conn, lid, now, source="marked manually")
+    elif act == "stop_all":
+        for e in rows(conn, "SELECT id FROM enrollments WHERE lead_id = ?", lid):
+            engine.stop_enrollment(conn, e["id"], now=now)
+    elif act == "update":
+        email = (p.get("email") or "").strip().lower() or None
+        li = importer.normalize_linkedin(p.get("linkedin_url") or "") if p.get("linkedin_url") else None
+        if p.get("linkedin_url") and not li:
+            raise HTTPException(422, "Not a linkedin.com/in/ URL")
+        if email and not importer.EMAIL_RE.match(email):
+            raise HTTPException(422, "Invalid email")
+        try:
+            conn.execute("UPDATE leads SET email = ?, linkedin_url = ? WHERE id = ?", (email, li, lid))
+        except Exception:
+            raise HTTPException(409, "That email or URL belongs to another lead")
+    else:
+        raise HTTPException(400, "bad action")
+    return {"ok": True}
+
+
+# ---------- import ----------
+
+@app.get("/import")
+def import_page(request: Request, campaign: int | None = None):
+    conn = db.connect()
+    return page(request, "import.html", conn, campaigns=rows(conn, "SELECT id, name, status FROM campaigns ORDER BY id DESC"),
+                campaign=campaign)
+
+
+@app.post("/import/upload")
+async def import_upload(request: Request, file: UploadFile = File(...), campaign_id: str = Form("")):
+    conn = db.connect()
+    content = await file.read()
+    try:
+        headers, data = importer.read_table(file.filename or "", content)
+    except Exception as e:
+        return back("/import", err=f"Could not read {file.filename}: {e}")
+    if not data:
+        return back("/import", err="No rows found")
+    token = secrets.token_urlsafe(12)
+    UPLOADS.clear()  # one pending upload at a time; keeps memory bounded
+    UPLOADS[token] = {"filename": file.filename, "headers": headers, "rows": data}
+    return page(request, "import_map.html", conn, token=token, filename=file.filename, headers=headers,
+                sample=data[:5], total=len(data), mapping=importer.guess_mapping(headers),
+                campaigns=rows(conn, "SELECT id, name, status FROM campaigns ORDER BY id DESC"),
+                campaign_id=int(campaign_id) if campaign_id.isdigit() else None)
+
+
+@app.post("/import/commit")
+async def import_commit(request: Request):
+    form = await request.form()
+    up = UPLOADS.pop(str(form.get("token")), None)
+    if not up:
+        return back("/import", err="Upload expired. Please upload again.")
+    mapping = {f: str(form.get(f"map_{f}") or "") for f in importer.FIELDS}
+    if not mapping["email"] and not mapping["linkedin_url"]:
+        return back("/import", err="Map at least an Email or LinkedIn URL column")
+    conn = db.connect()
+    cid = str(form.get("campaign_id") or "")
+    if cid == "new":
+        cur = conn.execute("INSERT INTO campaigns (name, created_at) VALUES (?, ?)",
+                           (str(form.get("new_campaign") or "").strip() or Path(up["filename"]).stem, iso(utcnow())))
+        cid = cur.lastrowid
+        _save_steps(conn, cid, _validate_steps(DEFAULT_SEQUENCE)[0])
+    cid = int(cid) if str(cid).isdigit() else None
+    summary = importer.import_rows(conn, up["rows"], mapping, cid)
+    c = get_campaign(conn, cid) if cid else None
+    return page(request, "import_done.html", conn, s=summary, c=c, filename=up["filename"])
+
+
+# ---------- settings / runner ----------
+
+@app.get("/settings")
+def settings(request: Request):
+    conn = db.connect()
+    return page(request, "settings.html", conn, logs=list(runner.logs)[-120:], busy=runner.busy,
+                login_state=runner.login_state, client_id=bool(os.environ.get("OC_CLIENT_ID")),
+                tick_minutes=os.environ.get("OC_TICK_MINUTES", "10"))
+
+
+@app.post("/api/run")
+def run_now():
+    runner.run_async()
+    return {"ok": True}
+
+
+@app.post("/api/login")
+def start_login():
+    if not os.environ.get("OC_CLIENT_ID"):
+        raise HTTPException(400, "OC_CLIENT_ID missing in .env, see README")
+    runner.start_login()
+    return {"ok": True}
+
+
+@app.get("/api/state")
+def state():
+    return {"busy": runner.busy, "login": runner.login_state, "account": runner.account(),
+            "logs": list(runner.logs)[-120:]}

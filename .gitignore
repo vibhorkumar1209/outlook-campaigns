@@ -1,0 +1,5 @@
+.venv/
+.env
+__pycache__/
+# Database holds your contacts and history: never commit it.
+data/

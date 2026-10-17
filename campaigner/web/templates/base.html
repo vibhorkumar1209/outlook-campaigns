@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}Outreach{% endblock %} · Outreach</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<div class="shell">
+  <aside class="side">
+    <div class="brand"><b>▌</b>outreach</div>
+    <nav class="nav">
+      {% set nav = [("/", "Overview"), ("/tasks", "LinkedIn queue"), ("/campaigns", "Campaigns"), ("/leads", "Leads"), ("/import", "Import"), ("/settings", "Settings")] %}
+      {% for href, label in nav %}
+        {% set on = path == href or (href != "/" and path.startswith(href)) %}
+        <a href="{{ href }}" class="{{ 'on' if on }}" {% if href == '/tasks' %}id="nav-tasks"{% endif %}>
+          <span>{{ label }}</span>
+          {% if href == "/tasks" and open_tasks %}<span class="badge">{{ open_tasks }}</span>{% endif %}
+        </a>
+      {% endfor %}
+    </nav>
+    <div class="side-foot">
+      <div><span class="dot {{ 'on' if account }}"></span>{{ account or "Outlook not connected" }}</div>
+      <div>last run {{ last_tick | ago }}</div>
+    </div>
+  </aside>
+  <main>
+    {% if not account and path != "/settings" %}
+      <div class="banner">Outlook not connected, so email steps are waiting. LinkedIn tasks still queue. <a href="/settings">Connect Outlook →</a></div>
+    {% endif %}
+    {% if msg %}<div class="flash">{{ msg }}</div>{% endif %}
+    {% if err %}<div class="flash err">{{ err }}</div>{% endif %}
+    {% block main %}{% endblock %}
+  </main>
+</div>
+<div id="tip" class="tip" hidden></div>
+<script src="/static/app.js"></script>
+{% block scripts %}{% endblock %}
+</body>
+</html>

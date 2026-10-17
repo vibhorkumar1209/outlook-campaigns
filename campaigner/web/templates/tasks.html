@@ -1,0 +1,52 @@
+{% extends "base.html" %}
+{% from "_macros.html" import chip, lead_name %}
+{% block title %}LinkedIn queue{% endblock %}
+{% block main %}
+<header class="head">
+  <div>
+    <h1>LinkedIn queue <span class="meta">· <span id="tasks-left">{{ tasks | length }}</span> open · {{ done_today }} done today</span></h1>
+    <p class="sub">Copy &amp; open → paste in LinkedIn → send → Done. Invite accepts and replies are picked up from LinkedIn's notification emails.</p>
+  </div>
+  <form class="actions" method="get">
+    <select name="campaign" onchange="this.form.submit()">
+      <option value="">All live campaigns</option>
+      {% for c in campaigns %}<option value="{{ c.id }}" {{ 'selected' if campaign == c.id }}>{{ c.name }}</option>{% endfor %}
+    </select>
+  </form>
+</header>
+
+{% if not tasks %}
+  <div class="empty">Queue empty. Tasks show up here when a live sequence reaches a LinkedIn step.</div>
+{% endif %}
+
+<div class="tasks">
+{% for t in tasks %}
+  <article class="task card" data-task="{{ t.id }}" data-url="{{ t.linkedin_url }}">
+    <div class="task-head">
+      <div class="avatar">{{ (t.first_name[:1] ~ t.last_name[:1]) | upper or "?" }}</div>
+      <div class="who">
+        <a href="/leads/{{ t.lead_id }}" class="name">{{ lead_name(t) }}</a>
+        <div class="meta">{{ t.title }}{% if t.title and t.company %} · {% endif %}{{ t.company }}</div>
+      </div>
+      <div class="task-tags">
+        {{ chip(t.channel) }}
+        <span class="meta">{{ t.campaign }} · step {{ t.step_pos + 1 }}/{{ t.n_steps }} · {{ t.created_at | ago }}</span>
+      </div>
+    </div>
+    {% if t.channel != "li_view" %}
+      <textarea class="task-body" rows="4" aria-label="Message text">{{ t.body }}</textarea>
+      {% if t.channel == "li_connect" %}<div class="count" data-count></div>{% endif %}
+    {% else %}
+      <div class="meta">Visit their profile so it shows up in their "who viewed" list.</div>
+    {% endif %}
+    <div class="task-actions">
+      <button class="btn primary" data-act="open">{{ "Open profile" if t.channel == "li_view" else "Copy & open profile" }}</button>
+      <button class="btn" data-act="done">Done</button>
+      <button class="btn ghost" data-act="skip">Skip</button>
+      {% if t.channel == "li_connect" %}<button class="btn ghost" data-act="connected">Already connected</button>{% endif %}
+      <button class="btn ghost" data-act="replied">They replied</button>
+    </div>
+  </article>
+{% endfor %}
+</div>
+{% endblock %}

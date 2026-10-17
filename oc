@@ -1,0 +1,3 @@
+#!/bin/sh
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+PYTHONPATH="$ROOT" exec "$ROOT/.venv/bin/python" -m campaigner "$@"

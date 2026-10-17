@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% from "_macros.html" import pill, lead_name %}
+{% block title %}Leads{% endblock %}
+{% block main %}
+<header class="head">
+  <div><h1>Leads <span class="meta">· {{ total }}</span></h1><p class="sub">One record per person across all campaigns, matched by email or LinkedIn URL.</p></div>
+  <div class="actions">
+    <form method="get"><input name="q" value="{{ q }}" placeholder="Search name, email, company" style="width:260px"></form>
+    <a class="btn primary" href="/import">Import</a>
+  </div>
+</header>
+{% if leads %}
+<section class="card"><div class="tbl-wrap"><table class="t">
+  <thead><tr><th>Name</th><th>Company</th><th>Email</th><th>LinkedIn</th><th class="num">Campaigns</th><th>Latest status</th><th>Last touch</th></tr></thead>
+  <tbody>
+  {% for l in leads %}
+    <tr>
+      <td><a href="/leads/{{ l.id }}">{{ lead_name(l) }}</a><div class="meta">{{ l.title }}</div></td>
+      <td>{{ l.company }}</td>
+      <td class="meta">{{ l.email or "–" }}</td>
+      <td>{% if l.linkedin_url %}<a href="{{ l.linkedin_url }}" target="_blank" rel="noopener">profile</a> {{ pill(l.li_state) if l.li_state != "none" }}{% else %}<span class="meta">–</span>{% endif %}</td>
+      <td class="num">{{ l.n_campaigns }}</td>
+      <td>{{ pill(l.last_status) if l.last_status else "" }}</td>
+      <td class="meta">{{ l.last_touch | ago if l.last_touch else "–" }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table></div></section>
+{% else %}
+  <div class="empty">{% if q %}No leads match "{{ q }}".{% else %}No leads yet. <a href="/import">Import a CSV or Excel file</a>.{% endif %}</div>
+{% endif %}
+{% endblock %}

@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% from "_macros.html" import tile %}
+{% block title %}Imported{% endblock %}
+{% block main %}
+<header class="head">
+  <div><h1>Imported {{ filename }}</h1>{% if c %}<p class="sub">into <a href="/campaigns/{{ c.id }}">{{ c.name }}</a> ({{ c.status }})</p>{% endif %}</div>
+  <div class="actions">
+    {% if c %}<a class="btn primary" href="/campaigns/{{ c.id }}?tab=sequence">Review sequence →</a>{% endif %}
+    <a class="btn" href="/leads">All leads</a>
+  </div>
+</header>
+<section class="tiles">
+  {{ tile("New leads", s.created) }}
+  {{ tile("Updated", s.updated, "matched existing") }}
+  {{ tile("Enrolled", s.enrolled) }}
+  {{ tile("Already in campaign", s.already_enrolled) }}
+  {{ tile("Skipped rows", s.skipped_rows) }}
+</section>
+{% if s.skipped %}
+<section class="card">
+  <div class="card-head"><h2>Row notes</h2></div>
+  <ul class="meta">{% for m in s.skipped[:200] %}<li>{{ m }}</li>{% endfor %}</ul>
+</section>
+{% endif %}
+{% endblock %}

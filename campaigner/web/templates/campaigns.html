@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% from "_macros.html" import pill %}
+{% block title %}Campaigns{% endblock %}
+{% block main %}
+<header class="head">
+  <div><h1>Campaigns</h1><p class="sub">New campaigns start as a draft with a five-step starter sequence. Nothing sends until you activate.</p></div>
+  <form class="actions" method="post" action="/campaigns">
+    <input name="name" placeholder="Campaign name" required style="width:240px">
+    <button class="btn primary">Create</button>
+  </form>
+</header>
+
+{% if campaigns %}
+<section class="card"><div class="tbl-wrap"><table class="t">
+  <thead><tr><th>Name</th><th>Status</th><th class="num">Steps</th><th class="num">Leads</th><th class="num">In sequence</th><th class="num">Contacted</th><th class="num">Replied</th><th class="num">LinkedIn queue</th><th>Created</th></tr></thead>
+  <tbody>
+  {% for c in campaigns %}
+    <tr>
+      <td><a href="/campaigns/{{ c.id }}">{{ c.name }}</a></td>
+      <td>{{ pill(c.status) }}</td>
+      <td class="num">{{ c.n_steps }}</td>
+      <td class="num">{{ c.enrolled }}</td>
+      <td class="num">{{ c.in_sequence }}</td>
+      <td class="num">{{ c.contacted }}</td>
+      <td class="num">{{ c.replied }}{% if c.contacted %} <span class="meta">{{ (100 * c.replied / c.contacted) | round | int }}%</span>{% endif %}</td>
+      <td class="num">{{ c.tasks_open }}</td>
+      <td class="meta">{{ c.created_at | local("%b %d") }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table></div></section>
+{% else %}
+  <div class="empty">No campaigns yet. Name one above to start.</div>
+{% endif %}
+{% endblock %}

@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block title %}Import{% endblock %}
+{% block main %}
+<header class="head"><div><h1>Import leads</h1><p class="sub">CSV or Excel. Each row needs an email or a LinkedIn profile URL; ideally both. You map columns next.</p></div></header>
+<form class="card" method="post" action="/import/upload" enctype="multipart/form-data">
+  <div class="form-grid">
+    <label class="f">File (.csv, .xlsx)<input type="file" name="file" accept=".csv,.xlsx,.xlsm,text/csv" required></label>
+    <label class="f">Add to campaign
+      <select name="campaign_id">
+        <option value="">Choose on the next screen</option>
+        {% for c in campaigns %}<option value="{{ c.id }}" {{ 'selected' if campaign == c.id }}>{{ c.name }} ({{ c.status }})</option>{% endfor %}
+      </select>
+    </label>
+  </div>
+  <p class="meta">Duplicates merge: a row matching an existing lead's email or LinkedIn URL updates that lead and doesn't create a second one. Unmapped columns are kept and usable in templates, e.g. <code>{{ "{{ industry }}" }}</code>.</p>
+  <button class="btn primary">Upload</button>
+</form>
+{% endblock %}

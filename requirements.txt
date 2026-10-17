@@ -1,0 +1,8 @@
+msal>=1.31
+msal-extensions>=1.2
+requests>=2.32
+Jinja2>=3.1
+openpyxl>=3.1
+fastapi>=0.115
+uvicorn>=0.30
+python-multipart>=0.0.9
