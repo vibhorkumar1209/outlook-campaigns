@@ -11,7 +11,7 @@
   <aside class="side">
     <div class="brand"><b>▌</b>outreach</div>
     <nav class="nav">
-      {% set nav = [("/", "Overview"), ("/tasks", "LinkedIn queue"), ("/campaigns", "Campaigns"), ("/leads", "Leads"), ("/import", "Import"), ("/settings", "Settings")] %}
+      {% set nav = [("/", "Overview"), ("/tasks", "LinkedIn queue"), ("/campaigns", "Campaigns"), ("/leads", "Leads"), ("/senders", "Senders"), ("/import", "Import"), ("/settings", "Settings")] %}
       {% for href, label in nav %}
         {% set on = path == href or (href != "/" and path.startswith(href)) %}
         <a href="{{ href }}" class="{{ 'on' if on }}" {% if href == '/tasks' %}id="nav-tasks"{% endif %}>
@@ -21,13 +21,15 @@
       {% endfor %}
     </nav>
     <div class="side-foot">
-      <div><span class="dot {{ 'on' if account }}"></span>{{ account or "Outlook not connected" }}</div>
+      <div><span class="dot {{ 'on' if n_connected }}"></span>{% if n_connected %}{{ n_connected }} mailbox{{ "es" if n_connected != 1 }} connected{% else %}No mailbox connected{% endif %}</div>
       <div>last run {{ last_tick | ago }}</div>
     </div>
   </aside>
   <main>
-    {% if not account and path != "/settings" %}
-      <div class="banner">Outlook not connected, so email steps are waiting. LinkedIn tasks still queue. <a href="/settings">Connect Outlook →</a></div>
+    {% if not n_connected and path != "/senders" %}
+      <div class="banner">No mailbox connected, so email steps are waiting. LinkedIn tasks still queue. <a href="/senders">Connect a mailbox →</a></div>
+    {% elif senders_nav | rejectattr("connected") | list and path != "/senders" %}
+      <div class="banner">{{ (senders_nav | rejectattr("connected") | map(attribute="email") | join(", ")) }} needs to sign in again. Its emails wait. <a href="/senders">Reconnect →</a></div>
     {% endif %}
     {% if msg %}<div class="flash">{{ msg }}</div>{% endif %}
     {% if err %}<div class="flash err">{{ err }}</div>{% endif %}

@@ -12,7 +12,7 @@
 
 {% if campaigns %}
 <section class="card"><div class="tbl-wrap"><table class="t">
-  <thead><tr><th>Name</th><th>Status</th><th class="num">Steps</th><th class="num">Leads</th><th class="num">In sequence</th><th class="num">Contacted</th><th class="num">Replied</th><th class="num">LinkedIn queue</th><th>Created</th></tr></thead>
+  <thead><tr><th>Name</th><th>Status</th><th class="num">Steps</th><th class="num">Leads</th><th class="num">In sequence</th><th class="num">Contacted</th><th class="num">Bounce</th><th class="num">Open</th><th class="num">Click</th><th class="num">Replied</th><th class="num">LinkedIn queue</th><th>Created</th></tr></thead>
   <tbody>
   {% for c in campaigns %}
     <tr>
@@ -22,6 +22,9 @@
       <td class="num">{{ c.enrolled }}</td>
       <td class="num">{{ c.in_sequence }}</td>
       <td class="num">{{ c.contacted }}</td>
+      <td class="num">{{ pct(c.email.bounce_rate) }}</td>
+      <td class="num">{{ pct(c.email.open_rate) }}</td>
+      <td class="num">{{ pct(c.email.click_rate) }}</td>
       <td class="num">{{ c.replied }}{% if c.contacted %} <span class="meta">{{ (100 * c.replied / c.contacted) | round | int }}%</span>{% endif %}</td>
       <td class="num">{{ c.tasks_open }}</td>
       <td class="meta">{{ c.created_at | local("%b %d") }}</td>

@@ -1,11 +1,11 @@
 {% extends "base.html" %}
-{% from "_macros.html" import pill, chip, lead_name %}
+{% from "_macros.html" import pill, chip, lead_name, tile %}
 {% block title %}{{ c.name }}{% endblock %}
 {% block main %}
 <header class="head">
   <div>
     <h1>{{ c.name }} {{ pill(c.status) }}</h1>
-    <p class="sub">{{ steps | length }} steps · {{ counts.values() | sum }} leads · sends {{ c.window_days.replace(",", " ") }} {{ c.window_start }}–{{ c.window_end }}{% if c.timezone %} {{ c.timezone }}{% endif %}</p>
+    <p class="sub">from {% if sender %}<a href="/senders">{{ sender.email }}</a>{% else %}<a href="/senders">no mailbox yet</a>{% endif %} · {{ steps | length }} steps · {{ counts.values() | sum }} leads · sends {{ c.window_days.replace(",", " ") }} {{ c.window_start }}–{{ c.window_end }}{% if c.timezone %} {{ c.timezone }}{% endif %}</p>
   </div>
   <div class="actions">
     {% if c.status != "active" %}
@@ -29,7 +29,25 @@
 </nav>
 
 {% if tab == "overview" %}
-  <div class="grid2">
+  {% if has_email %}
+  <section class="card">
+    <div class="card-head">
+      <h2>Email performance</h2>
+      <span class="meta">unique people{% if not tracker %} · open/click tracking not set up (<a href="/settings">Settings</a>){% elif not (c.track_opens or c.track_clicks) %} · tracking off for this campaign{% endif %}{% if em.machine %} · {{ em.machine }} scanner hits excluded{% endif %}</span>
+    </div>
+    <section class="tiles four" style="margin:0">
+      {{ tile("Sent", em.sent, em.leads ~ " people") }}
+      {{ tile("Delivered", pct(em.delivery_rate), em.delivered ~ " people") }}
+      {{ tile("Bounced", pct(em.bounce_rate), em.bounced ~ " people") }}
+      {{ tile("Opened", pct(em.open_rate), em.opened ~ " people · estimate") }}
+      {{ tile("Clicked", pct(em.click_rate), em.clicked ~ " people") }}
+      {{ tile("Click-to-open", pct(em.click_to_open)) }}
+      {{ tile("Replied", pct(em.reply_rate), em.replied ~ " people") }}
+      {{ tile("Unsubscribed", em.unsubscribed, pct(em.unsub_rate)) }}
+    </section>
+  </section>
+  {% endif %}
+  <div class="grid2" style="margin-top:16px">
     <section class="card">
       <div class="card-head"><h2>Funnel</h2><span class="meta">% of enrolled</span></div>
       <div class="funnel">
@@ -55,9 +73,9 @@
     </section>
   </div>
   <section class="card" style="margin-top:16px">
-    <div class="card-head"><h2>By step</h2><span class="meta">Replies count against the last step done before the reply</span></div>
+    <div class="card-head"><h2>By step</h2><span class="meta">Replies count against the last step done before the reply · <a href="?tab=sequence">open the flow →</a></span></div>
     <div class="tbl-wrap"><table class="t">
-      <thead><tr><th>#</th><th>Step</th><th>When</th><th class="num">Done</th><th class="num">Queued</th><th class="num">Up next</th><th class="num">Skipped</th><th class="num">Replies</th><th class="num">Reply rate</th></tr></thead>
+      <thead><tr><th>#</th><th>Step</th><th>When</th><th class="num">Done</th><th class="num">Queued</th><th class="num">Up next</th><th class="num">Skipped</th><th class="num">Opened</th><th class="num">Clicked</th><th class="num">Replies</th><th class="num">Reply rate</th></tr></thead>
       <tbody>
       {% for s in step_stats %}
         <tr>
@@ -68,6 +86,9 @@
           <td class="num">{{ s.queued if s.channel != "email" else "–" }}</td>
           <td class="num">{{ s.waiting }}</td>
           <td class="num">{{ s.skipped }}</td>
+          {% set se = step_em.get(s.pos) %}
+          <td class="num">{{ pct(se.open_rate) if se else "–" }}</td>
+          <td class="num">{{ pct(se.click_rate) if se else "–" }}</td>
           <td class="num">{{ s.replies }}</td>
           <td class="num">{{ (s.rate ~ "%") if s.rate is not none else "–" }}</td>
         </tr>
@@ -77,34 +98,29 @@
   </section>
 
 {% elif tab == "sequence" %}
-  {% if c.status == "active" %}<div class="banner">This campaign is live. Edits apply to upcoming steps. Leads keep their step number, so reordering moves where they are.</div>{% endif %}
-  <div id="seq" class="seq" data-campaign="{{ c.id }}" data-channels='{{ CHANNELS | tojson }}' data-conditions='{{ CONDITIONS | tojson }}'
-       data-vars='{{ ["first_name", "last_name", "name", "company", "title"] | tojson }}'>
-    <div>
-      <div id="steps" class="steps"></div>
-      <div class="add-row">
-        <span class="meta" style="align-self:center">Add:</span>
-        <button class="btn sm" data-add="email">+ Email</button>
-        <button class="btn sm" data-add="li_connect">+ LinkedIn connect</button>
-        <button class="btn sm" data-add="li_message">+ LinkedIn message</button>
-        <button class="btn sm" data-add="li_view">+ View profile</button>
-        <button class="btn" id="seq-save" style="margin-left:auto">Save sequence</button>
+  {% if c.status == "active" %}<div class="banner">This campaign is live. Edits apply to upcoming steps. Leads keep their step number, so reordering changes which step they're on.</div>{% endif %}
+  <div id="seq" class="builder" data-campaign="{{ c.id }}" data-channels='{{ CHANNELS | tojson }}' data-conditions='{{ CONDITIONS | tojson }}'
+       data-vars='{{ ["first_name", "last_name", "name", "company", "title", "unsubscribe_url"] | tojson }}'
+       data-leads='{{ preview_leads | tojson }}' data-engage="{{ 1 if c.li_engage else 0 }}"
+       data-enrolled="{{ counts.values() | sum }}" data-pending="{{ counts.get('pending', 0) }}">
+    <div class="builder-bar">
+      <div class="legend">
+        <span><i class="sw email"></i>Email</span>
+        <span><i class="sw linkedin"></i>LinkedIn</span>
+        <span><i class="lg-diamond"></i>Condition</span>
+        {% if c.li_engage %}<span><i class="lg-lane"></i>Parallel track</span>{% endif %}
+        <span class="exit-pill">Exits anytime: reply · bounce · unsubscribe</span>
       </div>
-      <ul id="seq-errors" class="errors"></ul>
-      <p class="meta">Write plain text: a blank line starts a new paragraph. Variables use <code>{{ "{{ first_name }}" }}</code>. For a fallback, write <code>{{ "{{ title | default('there', true) }}" }}</code>. Extra import columns are available by their snake_case header name.</p>
+      <span id="seq-dirty" class="meta"></span>
+      <button class="btn" id="seq-save">Save sequence</button>
     </div>
-    <aside class="card preview">
-      <div class="card-head"><h2 id="preview-title">Preview</h2></div>
-      <label class="f">Render for
-        <select id="preview-lead">
-          {% for l in preview_leads %}<option value="{{ l.id }}">{{ lead_name(l) }}{% if l.company %} · {{ l.company }}{% endif %}</option>{% endfor %}
-          {% if not preview_leads %}<option value="">Sample lead (Jane Doe, Acme Corp)</option>{% endif %}
-        </select>
-      </label>
-      <div id="preview-out" style="margin-top:12px"></div>
-    </aside>
+    <ul id="seq-errors" class="errors"></ul>
+    <div class="builder-main">
+      <div class="canvas"><div id="flow" class="flow" aria-label="Sequence flowchart"></div></div>
+      <aside class="card inspector" id="inspector" aria-live="polite"></aside>
+    </div>
   </div>
-  <script id="seq-data" type="application/json">{{ steps | tojson }}</script>
+  <script id="seq-data" type="application/json">{{ seq_steps | tojson }}</script>
 
 {% elif tab == "leads" %}
   <div class="filters">
@@ -139,6 +155,12 @@
   <form class="card" method="post" action="/campaigns/{{ c.id }}/settings">
     <div class="form-grid">
       <label class="f">Name<input name="name" value="{{ c.name }}" required></label>
+      <label class="f">Send from
+        <select name="sender">
+          {% for s in senders %}<option value="{{ s.account }}" {{ 'selected' if (c.sender or (senders[0].account if senders)) == s.account }}>{{ s.email }}{{ "" if s.connected else " (sign in again)" }}</option>{% endfor %}
+          {% if not senders %}<option value="">No mailbox connected yet</option>{% endif %}
+        </select>
+      </label>
       <label class="f">Timezone (blank = this Mac)
         <input name="timezone" value="{{ c.timezone or '' }}" list="zones" placeholder="e.g. Asia/Kolkata">
         <datalist id="zones">{% for z in zones %}<option value="{{ z }}">{% endfor %}</datalist>
@@ -159,6 +181,12 @@
         {% endfor %}
       </div>
     </div>
+    <div style="margin-top:14px" class="days">
+      <label><input type="checkbox" name="track_opens" value="1" {{ 'checked' if c.track_opens }} {{ 'disabled' if not tracker }}> Track opens (pixel)</label>
+      <label><input type="checkbox" name="track_clicks" value="1" {{ 'checked' if c.track_clicks }} {{ 'disabled' if not tracker }}> Track clicks (link redirect)</label>
+      <label><input type="checkbox" name="li_engage" value="1" {{ 'checked' if c.li_engage }}> Weekly like + comment on their LinkedIn posts while in sequence</label>
+    </div>
+    <p class="meta">{% if not tracker %}Tracking isn't set up yet: see Settings → Tracking. {% endif %}Changing the sender only affects new threads. Leads already emailed keep getting follow-ups from the mailbox that started their thread. For cold outreach, turning tracking off can improve inbox placement.</p>
     <label class="f" style="margin-top:14px">Email signature (plain text, appended to every email; Graph doesn't add your Outlook signature)
       <textarea name="signature" rows="4">{{ c.signature }}</textarea>
     </label>

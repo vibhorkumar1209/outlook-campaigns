@@ -95,11 +95,62 @@ CREATE TABLE IF NOT EXISTS events (
     at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS senders (
+    account TEXT PRIMARY KEY,                       -- M365 sign-in name
+    email TEXT NOT NULL,                            -- address mail goes out from
+    name TEXT NOT NULL DEFAULT '',
+    daily_cap INTEGER NOT NULL DEFAULT 150,         -- across all campaigns using this mailbox
+    created_at TEXT NOT NULL
+);
+
+-- One row per email sent; carries the tracking id (sid) used in pixel/click/unsubscribe URLs.
+CREATE TABLE IF NOT EXISTS sends (
+    id TEXT PRIMARY KEY,
+    enrollment_id INTEGER REFERENCES enrollments(id) ON DELETE SET NULL,
+    campaign_id INTEGER REFERENCES campaigns(id) ON DELETE SET NULL,
+    lead_id INTEGER NOT NULL REFERENCES leads(id) ON DELETE CASCADE,
+    step_pos INTEGER NOT NULL,
+    sender TEXT NOT NULL,
+    subject TEXT,
+    tracked INTEGER NOT NULL DEFAULT 0,             -- bit 1 = opens, bit 2 = clicks
+    sent_at TEXT NOT NULL,
+    opened_at TEXT,
+    opens INTEGER NOT NULL DEFAULT 0,
+    clicked_at TEXT,
+    clicks INTEGER NOT NULL DEFAULT 0,
+    machine_events INTEGER NOT NULL DEFAULT 0       -- scanner/prefetch hits, excluded from rates
+);
+
+-- LinkedIn likes/comments you did from an Engage task; used to avoid repeating a post.
+CREATE TABLE IF NOT EXISTS engagements (
+    id INTEGER PRIMARY KEY,
+    lead_id INTEGER NOT NULL REFERENCES leads(id) ON DELETE CASCADE,
+    task_id INTEGER REFERENCES tasks(id) ON DELETE SET NULL,
+    post_url TEXT,
+    liked INTEGER NOT NULL DEFAULT 0,
+    commented INTEGER NOT NULL DEFAULT 0,
+    comment TEXT,
+    at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS ix_sends_campaign ON sends (campaign_id, step_pos);
+CREATE INDEX IF NOT EXISTS ix_sends_sender ON sends (sender, sent_at);
 CREATE INDEX IF NOT EXISTS ix_events_lead ON events (lead_id, at);
 CREATE INDEX IF NOT EXISTS ix_events_campaign ON events (campaign_id, type, at);
 CREATE INDEX IF NOT EXISTS ix_enroll_campaign ON enrollments (campaign_id, status);
 CREATE INDEX IF NOT EXISTS ix_tasks_status ON tasks (status);
 """
+
+
+# Columns added after the first release; applied to existing databases on connect.
+MIGRATIONS = [
+    ("campaigns", "sender", "TEXT"),                               # senders.account; NULL = default mailbox
+    ("campaigns", "track_opens", "INTEGER NOT NULL DEFAULT 1"),
+    ("campaigns", "track_clicks", "INTEGER NOT NULL DEFAULT 1"),
+    ("enrollments", "sender", "TEXT"),                             # mailbox that started the thread
+    ("leads", "dnc", "INTEGER NOT NULL DEFAULT 0"),                # do not contact (unsubscribed)
+    ("campaigns", "li_engage", "INTEGER NOT NULL DEFAULT 1"),      # like/comment on recent posts during the sequence
+]
 
 
 def utcnow() -> datetime:
@@ -121,6 +172,9 @@ def connect(path: Path = DB_PATH) -> sqlite3.Connection:
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA journal_mode = WAL")
     conn.executescript(SCHEMA)
+    for table, col, decl in MIGRATIONS:
+        if col not in {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
     return conn
 
 

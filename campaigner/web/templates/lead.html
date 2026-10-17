@@ -5,10 +5,11 @@
 {% set LABELS = {
   "enrolled": "Enrolled", "sent": "Email sent", "task_created": "Task queued", "task_done": "Done",
   "task_skipped": "Task skipped", "step_skipped": "Step skipped", "connected": "Connected on LinkedIn",
-  "reply": "Replied", "bounce": "Bounced", "stopped": "Stopped", "error": "Error"} %}
+  "reply": "Replied", "bounce": "Bounced", "stopped": "Stopped", "error": "Error",
+  "open": "Opened email", "click": "Clicked link", "unsubscribe": "Unsubscribed"} %}
 <header class="head">
   <div>
-    <h1>{{ lead_name(l) }} {% if l.li_state != "none" %}{{ pill(l.li_state) }}{% endif %}</h1>
+    <h1>{{ lead_name(l) }} {% if l.li_state != "none" %}{{ pill(l.li_state) }}{% endif %}{% if l.dnc %} <span class="pill critical">do not contact</span>{% endif %}</h1>
     <p class="sub">{{ l.title }}{% if l.title and l.company %} · {% endif %}{{ l.company }}</p>
   </div>
   <div class="actions">
@@ -16,6 +17,7 @@
     {% if l.li_state != "connected" and l.linkedin_url %}<button class="btn" data-lead-act="connected" data-lead="{{ l.id }}">Mark connected</button>{% endif %}
     <button class="btn" data-lead-act="replied" data-channel="linkedin" data-lead="{{ l.id }}" data-ask="Mark as replied on LinkedIn? This stops all their sequences.">Replied on LinkedIn</button>
     <button class="btn" data-lead-act="replied" data-channel="email" data-lead="{{ l.id }}" data-ask="Mark as replied by email? This stops all their sequences.">Replied by email</button>
+    {% if not l.dnc %}<button class="btn danger" data-lead-act="dnc" data-lead="{{ l.id }}" data-ask="Mark do-not-contact? Stops every campaign now and for future imports.">Do not contact</button>{% endif %}
     <button class="btn danger" data-lead-act="stop_all" data-lead="{{ l.id }}" data-ask="Stop every campaign for this lead?">Stop all</button>
   </div>
 </header>
@@ -26,12 +28,12 @@
     {% if events %}
     <ul class="tl">
       {% for ev in events %}
-        {% set ic = "good" if ev.type in ("reply", "connected") else ("critical" if ev.type in ("bounce", "error") else ("email" if ev.channel == "email" else ("linkedin" if ev.channel else ""))) %}
+        {% set ic = "good" if ev.type in ("reply", "connected") else ("critical" if ev.type in ("bounce", "error", "unsubscribe") else ("email" if ev.channel == "email" else ("linkedin" if ev.channel else ""))) %}
         <li>
           <span class="ic {{ ic }}"></span>
           <div>
             {{ LABELS.get(ev.type, ev.type) }}
-            {% if ev.channel and ev.type not in ("reply", "connected") %} · {{ chip(ev.channel) }}{% endif %}
+            {% if ev.channel and ev.type not in ("reply", "connected", "open", "click", "unsubscribe") %} · {{ chip(ev.channel) }}{% endif %}
             {% if ev.type == "reply" %} via {{ ev.channel }}{% endif %}
             {% if ev.step_pos is not none %}<span class="meta"> · step {{ ev.step_pos + 1 }}</span>{% endif %}
             {% if ev.campaign %}<span class="meta"> · {{ ev.campaign }}</span>{% endif %}

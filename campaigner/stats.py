@@ -104,3 +104,79 @@ def campaign_rows(conn) -> list[dict]:
           (SELECT COUNT(*) FROM tasks t JOIN enrollments e ON e.id = t.enrollment_id
              WHERE e.campaign_id = c.id AND t.status = 'open') tasks_open
         FROM campaigns c ORDER BY c.status = 'active' DESC, c.id DESC""")
+
+
+# ---------- email performance & deliverability ----------
+
+def _pct(n, d):
+    return round(100 * n / d, 1) if d else None
+
+
+def email_stats(conn, *, campaign_id: int | None = None, sender: str | None = None, since: datetime | None = None) -> dict:
+    """Unique-per-lead email metrics. Rates exclude scanner/prefetch hits and use only tracked sends as the base."""
+    where, args = ["1 = 1"], []
+    if campaign_id:
+        where.append("campaign_id = ?"); args.append(campaign_id)
+    if sender:
+        where.append("sender = ?"); args.append(sender)
+    if since:
+        where.append("sent_at >= ?"); args.append(iso(since))
+    w = " AND ".join(where)
+    r = rows(conn, f"""
+        SELECT COUNT(*) sent, COUNT(DISTINCT lead_id) leads,
+          COUNT(DISTINCT CASE WHEN (tracked & 1) > 0 THEN lead_id END) open_base,
+          COUNT(DISTINCT CASE WHEN (tracked & 2) > 0 THEN lead_id END) click_base,
+          COUNT(DISTINCT CASE WHEN (tracked & 1) > 0 AND opened_at IS NOT NULL THEN lead_id END) opened,
+          COUNT(DISTINCT CASE WHEN clicked_at IS NOT NULL THEN lead_id END) clicked,
+          COALESCE(SUM(machine_events), 0) machine
+        FROM sends WHERE {w}""", *args)[0]
+    emailed = f"SELECT enrollment_id FROM sends WHERE {w}"
+    bounced = scalar(conn, f"SELECT COUNT(*) FROM enrollments WHERE status = 'bounced' AND id IN ({emailed})", *args)
+    replied = scalar(conn, f"SELECT COUNT(*) FROM enrollments WHERE status = 'replied' AND id IN ({emailed})", *args)
+    unsub = scalar(conn, f"""SELECT COUNT(DISTINCT lead_id) FROM events WHERE type = 'unsubscribe'
+                             AND lead_id IN (SELECT lead_id FROM sends WHERE {w})""", *args)
+    delivered = max(r["leads"] - bounced, 0)
+    return {
+        **r, "bounced": bounced, "delivered": delivered, "replied": replied, "unsubscribed": unsub,
+        "delivery_rate": _pct(delivered, r["leads"]),
+        "bounce_rate": _pct(bounced, r["leads"]),
+        "open_rate": _pct(r["opened"], max(r["open_base"] - bounced, 0)) if r["open_base"] else None,
+        "click_rate": _pct(r["clicked"], max(r["click_base"] - bounced, 0)) if r["click_base"] else None,
+        "click_to_open": _pct(r["clicked"], r["opened"]) if r["open_base"] and r["click_base"] else None,
+        "reply_rate": _pct(replied, delivered),
+        "unsub_rate": _pct(unsub, delivered),
+    }
+
+
+def step_email_stats(conn, campaign_id: int) -> dict[int, dict]:
+    out = {}
+    for r in rows(conn, """
+        SELECT step_pos, COUNT(*) sent,
+          SUM((tracked & 1) > 0) open_base, SUM((tracked & 1) > 0 AND opened_at IS NOT NULL) opened,
+          SUM((tracked & 2) > 0) click_base, SUM(clicked_at IS NOT NULL) clicked
+        FROM sends WHERE campaign_id = ? GROUP BY step_pos""", campaign_id):
+        out[r["step_pos"]] = {**r, "open_rate": _pct(r["opened"], r["open_base"]) if r["open_base"] else None,
+                              "click_rate": _pct(r["clicked"], r["click_base"]) if r["click_base"] else None}
+    return out
+
+
+def bounce_health(rate: float | None, sent: int) -> str:
+    """Status tone for a bounce rate. Under ~20 sends the rate is noise."""
+    if rate is None or sent < 20:
+        return "muted"
+    return "critical" if rate >= 5 else "warning" if rate >= 2 else "good"
+
+
+def sender_rows(conn, tz) -> list[dict]:
+    now = utcnow()
+    today = now.astimezone(tz).replace(hour=0, minute=0, second=0, microsecond=0)
+    out = []
+    for s in rows(conn, "SELECT * FROM senders ORDER BY created_at, account"):
+        st = email_stats(conn, sender=s["account"], since=now - timedelta(days=30))
+        out.append({
+            **s, "stats": st,
+            "today": scalar(conn, "SELECT COUNT(*) FROM sends WHERE sender = ? AND sent_at >= ?", s["account"], iso(today)),
+            "campaigns": rows(conn, "SELECT id, name, status FROM campaigns WHERE sender = ? ORDER BY id DESC", s["account"]),
+            "health": bounce_health(st["bounce_rate"], st["sent"]),
+        })
+    return out

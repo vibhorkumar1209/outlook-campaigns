@@ -4,11 +4,15 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from campaigner import db, engine, importer
+from campaigner import db, engine, importer, stats
 from campaigner.db import iso, one, rows, scalar
+from campaigner.graph import AuthError
+from campaigner.render import email_html
+from campaigner.tracking import Tracker
 
 MON = datetime(2026, 10, 19, 10, 0, tzinfo=timezone.utc)
 ME = "me@co.com"
+OTHER = "sales@co.com"
 STEPS = [
     ("li_connect", 0, None, "Hi {{ first_name }}"),
     ("email", 1, "Hi {{ company }}", "Hello {{ first_name }}"),
@@ -24,17 +28,17 @@ def mail(sender, subject="Re: Hi", cid=None, at=MON, preview="", headers=()):
 
 
 class FakeGraph:
-    def __init__(self):
-        self.sent, self.inbox = [], []
+    def __init__(self, me=ME):
+        self.me, self.sent, self.inbox = me, [], []
 
     def my_address(self):
-        return ME
+        return self.me
 
     def send_new(self, to, name, subject, html):
         self.sent.append(("new", to, subject, html))
-        return f"conv-{len(self.sent)}"
+        return f"conv-{self.me}-{len(self.sent)}"
 
-    def send_in_thread(self, cid, to, name, html, fallback):
+    def send_in_thread(self, cid, to, name, html, fallback, strip_pixels=None):
         self.sent.append(("thread", to, fallback, html))
         return cid
 
@@ -52,7 +56,11 @@ class Base(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.conn = db.connect(Path(self.tmp.name) / "t.db")
-        self.g = FakeGraph()
+        self.graphs = {ME: FakeGraph(ME), OTHER: FakeGraph(OTHER)}
+        self.g = self.graphs[ME]
+        for i, acct in enumerate(self.graphs):  # ME is the default sender (registered first)
+            self.conn.execute("INSERT INTO senders (account, email, created_at) VALUES (?, ?, ?)",
+                              (acct, acct, iso(MON + timedelta(seconds=i))))
         self.logs = []
         self.cid = self.campaign()
         importer.import_rows(self.conn, [
@@ -76,8 +84,14 @@ class Base(unittest.TestCase):
                               (cid, i, ch, delay, subj, body))
         return cid
 
-    def tick(self, at, graph=...):
-        engine.tick(self.conn, self.g if graph is ... else graph, now=at, sleep=lambda s: None, log=self.logs.append)
+    def factory(self, acct):
+        if acct not in self.graphs:
+            raise AuthError(f"{acct} is not signed in.")
+        return self.graphs[acct]
+
+    def tick(self, at, graph=..., tracker=None):
+        factory = self.factory if graph is ... else (None if graph is None else (lambda a: graph))
+        engine.tick(self.conn, factory, tracker=tracker, now=at, sleep=lambda s: None, log=self.logs.append)
 
     def enr(self, email):
         return one(self.conn, "SELECT e.* FROM enrollments e JOIN leads l ON l.id = e.lead_id "
@@ -86,9 +100,11 @@ class Base(unittest.TestCase):
     def conv(self, email):
         return self.enr(email)["conversation_id"]
 
-    def task(self, email):
+    def task(self, email, channel=None):
+        """Open sequence task (or open task of a given channel, e.g. li_engage)."""
         return one(self.conn, """SELECT t.* FROM tasks t JOIN enrollments e ON e.id = t.enrollment_id
-                                 JOIN leads l ON l.id = e.lead_id WHERE l.email = ? AND t.status = 'open'""", email)
+                                 JOIN leads l ON l.id = e.lead_id WHERE l.email = ? AND t.status = 'open'
+                                 AND (? IS NULL AND t.channel != 'li_engage' OR t.channel = ?)""", email, channel, channel)
 
 
 class ImportTest(Base):
@@ -208,6 +224,258 @@ class FlowTest(Base):
         self.conn.execute("UPDATE campaigns SET status = 'paused'")
         self.tick(MON)
         self.assertIsNone(self.task("jane@x.com"))
+
+
+class MailboxTest(Base):
+    EMAIL_ONLY = [("email", 0, "Hi {{ company }}", "Hello {{ first_name }}"), ("email", 2, None, "Bump")]
+
+    def other_campaign(self, sender=OTHER, **kw):
+        cid = self.campaign(self.EMAIL_ONLY, name="sales", sender=sender, **kw)
+        for l in rows(self.conn, "SELECT id FROM leads"):
+            self.conn.execute("INSERT INTO enrollments (campaign_id, lead_id, enrolled_at) VALUES (?, ?, ?)",
+                              (cid, l["id"], iso(MON)))
+        return cid
+
+    def test_campaign_sends_from_its_mailbox_and_threads_stay_put(self):
+        self.conn.execute("UPDATE campaigns SET status = 'paused' WHERE id = ?", (self.cid,))
+        cid = self.other_campaign()
+        self.tick(MON)
+        self.assertEqual({s[1] for s in self.graphs[OTHER].sent}, {"jane@x.com", "bob@x.com"})
+        self.assertEqual(self.g.sent, [])
+        self.assertEqual(scalar(self.conn, "SELECT COUNT(*) FROM sends WHERE sender = ?", OTHER), 2)
+        # Switching the campaign's sender doesn't move existing threads.
+        self.conn.execute("UPDATE campaigns SET sender = ? WHERE id = ?", (ME, cid))
+        self.tick(MON + timedelta(days=2))
+        self.assertEqual([s[0] for s in self.graphs[OTHER].sent[2:]], ["thread", "thread"])
+        self.assertEqual(self.g.sent, [])
+
+    def test_reply_checked_in_the_sending_mailbox(self):
+        self.conn.execute("UPDATE campaigns SET status = 'paused' WHERE id = ?", (self.cid,))
+        cid = self.other_campaign()
+        self.tick(MON)
+        e = one(self.conn, "SELECT e.* FROM enrollments e JOIN leads l ON l.id = e.lead_id "
+                           "WHERE l.email = 'bob@x.com' AND e.campaign_id = ?", cid)
+        self.graphs[OTHER].inbox.append(mail("bob@x.com", cid=e["conversation_id"], at=MON + timedelta(hours=1)))
+        self.tick(MON + timedelta(hours=2))
+        self.assertEqual(one(self.conn, "SELECT status FROM enrollments WHERE id = ?", e["id"])["status"], "replied")
+
+    def test_signed_out_mailbox_holds_only_its_campaign(self):
+        del self.graphs[OTHER]
+        self.other_campaign()
+        self.tick(MON)
+        self.tick(MON + timedelta(days=1))
+        self.assertEqual(len(self.g.sent), 1)  # main campaign: bob's email (jane waits on her connect task)
+        self.assertEqual(scalar(self.conn, "SELECT COUNT(*) FROM sends WHERE sender = ?", OTHER), 0)
+        self.assertTrue(any("not signed in" in l for l in self.logs))
+
+    def test_mailbox_daily_cap_spans_campaigns(self):
+        self.conn.execute("UPDATE senders SET daily_cap = 1 WHERE account = ?", (OTHER,))
+        self.other_campaign()
+        self.other_campaign()
+        self.tick(MON)
+        self.assertEqual(len(self.graphs[OTHER].sent), 1)
+        self.tick(MON + timedelta(days=1))
+        self.assertEqual(len(self.graphs[OTHER].sent), 2)
+
+
+class FakeTracker(Tracker):
+    def __init__(self, down=False):
+        super().__init__("https://links.co.com", "key", "secret")
+        self.events, self.down = [], down
+
+    def pull(self, since):
+        return [e for e in self.events if e["id"] > since]
+
+    def health(self):
+        return "unreachable" if self.down else None
+
+    def hit(self, type, sid, at, ua="Mozilla/5.0", url=None, head=0):
+        self.events.append({"id": len(self.events) + 1, "type": type, "sid": sid, "url": url, "ua": ua, "head": head,
+                            "ts": int(at.timestamp() * 1000)})
+
+
+class TrackingTest(Base):
+    STEPS = [("email", 0, "Hi {{ company }}", "See https://example.com/case.\n\n[Opt out]({{ unsubscribe_url }})"),
+             ("email", 2, None, "Bump")]
+
+    def setUp(self):
+        super().setUp()
+        self.conn.execute("UPDATE campaigns SET status = 'paused' WHERE id = ?", (self.cid,))
+        self.cid = self.campaign(self.STEPS, name="tracked")
+        for l in rows(self.conn, "SELECT id FROM leads"):
+            self.conn.execute("INSERT INTO enrollments (campaign_id, lead_id, enrolled_at) VALUES (?, ?, ?)",
+                              (self.cid, l["id"], iso(MON)))
+        self.t = FakeTracker()
+
+    def sid(self, email):
+        return one(self.conn, """SELECT s.id FROM sends s JOIN leads l ON l.id = s.lead_id
+                                 WHERE l.email = ? AND s.campaign_id = ? ORDER BY s.sent_at LIMIT 1""", email, self.cid)["id"]
+
+    def test_links_pixel_and_unsubscribe_are_tracked(self):
+        self.tick(MON, tracker=self.t)
+        html = next(s[3] for s in self.g.sent if s[1] == "jane@x.com")
+        sid = self.sid("jane@x.com")
+        self.assertIn(self.t.open_url(sid), html)
+        self.assertIn(f'href="{self.t.click_url(sid, "https://example.com/case")}"', html)
+        self.assertIn(">https://example.com/case</a>.", html)  # sentence period stays outside the link
+        self.assertIn(f'href="{self.t.unsub_url(sid)}">Opt out</a>', html)  # not wrapped in a click redirect
+
+    def test_events_update_metrics_and_filter_machines(self):
+        self.tick(MON, tracker=self.t)
+        jane, bob = self.sid("jane@x.com"), self.sid("bob@x.com")
+        self.t.hit("open", jane, MON + timedelta(seconds=5))                     # scanner: too soon
+        self.t.hit("click", bob, MON + timedelta(hours=1), ua="Mimecast")        # scanner: UA
+        self.t.hit("open", jane, MON + timedelta(hours=1))
+        self.t.hit("open", jane, MON + timedelta(hours=2))
+        self.t.hit("click", bob, MON + timedelta(hours=3), url="https://example.com/case")
+        self.tick(MON + timedelta(hours=4), tracker=self.t)
+        j, b = (one(self.conn, "SELECT * FROM sends WHERE id = ?", x) for x in (jane, bob))
+        self.assertEqual((j["opens"], j["machine_events"], j["clicked_at"]), (2, 1, None))
+        self.assertEqual((b["clicks"], b["machine_events"]), (1, 1))
+        self.assertIsNotNone(b["opened_at"])  # click implies open
+        em = stats.email_stats(self.conn, campaign_id=self.cid)
+        self.assertEqual((em["sent"], em["opened"], em["clicked"], em["open_rate"], em["click_rate"]), (2, 2, 1, 100.0, 50.0))
+        kinds = [e["type"] for e in rows(self.conn, "SELECT type FROM events WHERE type IN ('open', 'click') ORDER BY id")]
+        self.assertEqual(kinds, ["open", "click"])  # first open only, every click
+
+    def test_unsubscribe_stops_everything(self):
+        self.tick(MON, tracker=self.t)
+        self.t.hit("unsubscribe", self.sid("bob@x.com"), MON + timedelta(hours=1))
+        self.tick(MON + timedelta(days=3), tracker=self.t)
+        self.assertEqual(one(self.conn, "SELECT dnc FROM leads WHERE email = 'bob@x.com'")["dnc"], 1)
+        self.assertEqual({s[1] for s in self.g.sent if s[0] == "thread"}, {"jane@x.com"})
+        self.assertEqual(stats.email_stats(self.conn, campaign_id=self.cid)["unsubscribed"], 1)
+        # Re-enrolling elsewhere doesn't resurrect them.
+        other = self.campaign(self.STEPS, name="again")
+        lead = one(self.conn, "SELECT id FROM leads WHERE email = 'bob@x.com'")["id"]
+        self.conn.execute("INSERT INTO enrollments (campaign_id, lead_id, enrolled_at) VALUES (?, ?, ?)", (other, lead, iso(MON)))
+        self.tick(MON + timedelta(days=3, hours=1), tracker=self.t)
+        self.assertEqual(one(self.conn, "SELECT status FROM enrollments WHERE campaign_id = ?", other)["status"], "stopped")
+
+    def test_tracker_down_sends_plain_links(self):
+        self.tick(MON, tracker=FakeTracker(down=True))
+        html = self.g.sent[0][3]
+        self.assertNotIn("links.co.com", html)
+        self.assertIn('href="https://example.com/case"', html)
+        self.assertIn("mailto:", html)
+
+    def test_tracking_off_per_campaign(self):
+        self.conn.execute("UPDATE campaigns SET track_opens = 0, track_clicks = 0 WHERE id = ?", (self.cid,))
+        self.tick(MON, tracker=self.t)
+        html = self.g.sent[0][3]
+        self.assertNotIn("/o/", html)
+        self.assertNotIn("/c/", html)
+        self.assertIn(self.t.unsub_url(self.sid(self.g.sent[0][1])), html)  # opt-out link still works
+
+
+class EngageTest(Base):
+    def engage(self, email="jane@x.com"):
+        return self.task(email, "li_engage")
+
+    def start(self):
+        self.tick(MON)
+        engine.complete_task(self.conn, self.task("jane@x.com")["id"], "done", now=MON)  # invite sent
+
+    def test_weekly_engage_task_after_invite_or_email(self):
+        self.tick(MON)
+        self.assertIsNone(self.engage())                 # nothing sent to jane yet
+        engine.complete_task(self.conn, self.task("jane@x.com")["id"], "done", now=MON)
+        self.tick(MON + timedelta(hours=1))
+        t = self.engage()
+        self.assertIsNotNone(t)
+        self.assertEqual((t["step_pos"], t["body"]), (-1, ""))
+        engine.complete_task(self.conn, t["id"], "done", "Sharp point on vendor sprawl.", now=MON + timedelta(hours=2),
+                             engage={"post_url": "https://www.linkedin.com/posts/jane-1", "liked": 1, "commented": 1})
+        self.tick(MON + timedelta(days=3))
+        self.assertIsNone(self.engage())                 # cadence: not again within 7 days
+        self.tick(MON + timedelta(days=7, hours=2))
+        self.assertIsNotNone(self.engage())
+        self.assertIsNone(self.engage("bob@x.com"))      # emailed, but no LinkedIn URL
+
+    def test_engage_does_not_block_or_advance_sequence(self):
+        self.start()
+        self.tick(MON + timedelta(hours=1))              # engage task opens
+        self.tick(MON + timedelta(days=1))               # email step still goes out despite the open engage task
+        self.assertIn("jane@x.com", {s[1] for s in self.g.sent})
+        before = self.enr("jane@x.com")["step_pos"]
+        engine.complete_task(self.conn, self.engage()["id"], "skip", now=MON + timedelta(days=1))
+        self.assertEqual(self.enr("jane@x.com")["step_pos"], before)
+
+    def test_repeat_post_rejected_and_nothing_ticked_rejected(self):
+        self.start()
+        self.tick(MON + timedelta(hours=1))
+        url = "https://www.linkedin.com/posts/jane-1"
+        engine.complete_task(self.conn, self.engage()["id"], "done", now=MON, engage={"post_url": url, "liked": 1})
+        self.tick(MON + timedelta(days=8))
+        t = self.engage()
+        with self.assertRaises(ValueError):
+            engine.complete_task(self.conn, t["id"], "done", now=MON + timedelta(days=8), engage={"post_url": url, "liked": 1})
+        with self.assertRaises(ValueError):
+            engine.complete_task(self.conn, t["id"], "done", now=MON + timedelta(days=8), engage={})
+        self.assertEqual(self.engage()["id"], t["id"])  # still open after rejected attempts
+
+    def test_reply_stops_engagement(self):
+        self.start()
+        self.tick(MON + timedelta(hours=1))
+        self.assertIsNotNone(self.engage())
+        self.g.inbox.append(mail("messages-noreply@linkedin.com", "Jane Doe sent you a new message", at=MON + timedelta(hours=2)))
+        self.tick(MON + timedelta(hours=3))
+        self.assertIsNone(self.engage())
+        self.tick(MON + timedelta(days=10))
+        self.assertIsNone(self.engage())
+
+    def test_toggle_off_and_dnc(self):
+        self.conn.execute("UPDATE campaigns SET li_engage = 0")
+        self.start()
+        self.tick(MON + timedelta(hours=1))
+        self.assertIsNone(self.engage())
+        self.conn.execute("UPDATE campaigns SET li_engage = 1")
+        self.conn.execute("UPDATE leads SET dnc = 1 WHERE email = 'jane@x.com'")
+        self.tick(MON + timedelta(hours=2))
+        self.assertIsNone(self.engage())
+
+    def test_one_engage_per_person_across_campaigns(self):
+        other = self.campaign(name="other")
+        lead = self.enr("jane@x.com")["lead_id"]
+        self.conn.execute("INSERT INTO enrollments (campaign_id, lead_id, status, step_pos, enrolled_at, last_step_at) "
+                          "VALUES (?, ?, 'active', 0, ?, ?)", (other, lead, iso(MON), iso(MON)))
+        self.start()
+        self.tick(MON + timedelta(hours=1))
+        n = scalar(self.conn, "SELECT COUNT(*) FROM tasks WHERE channel = 'li_engage' AND status = 'open'")
+        self.assertEqual(n, 1)
+
+
+class DraftTest(unittest.TestCase):
+    class FakeClient:
+        def __init__(self, text="Good point on X.", stop="end_turn"):
+            self.calls, outer = [], self
+            class Msgs:
+                def create(self_inner, **kw):
+                    outer.calls.append(kw)
+                    block = type("B", (), {"type": "text", "text": text})()
+                    return type("R", (), {"stop_reason": stop, "content": [block]})()
+            self.beta = type("Beta", (), {"messages": Msgs()})()
+
+    def test_draft(self):
+        from campaigner.ai import DraftError, draft_comment
+        c = self.FakeClient()
+        out = draft_comment("We cut cloud spend 30% by...", {"first_name": "Jane", "company": "Acme"}, "I run IT ops", client=c)
+        self.assertEqual(out, "Good point on X.")
+        kw = c.calls[0]
+        self.assertEqual((kw["model"], kw["fallbacks"]), ("claude-opus-5-5", "default"))
+        self.assertIn("<post>\nWe cut cloud spend", kw["messages"][0]["content"])
+        with self.assertRaises(DraftError):
+            draft_comment("  ", {}, client=c)
+        with self.assertRaises(DraftError):
+            draft_comment("post", {}, client=self.FakeClient(stop="refusal"))
+
+
+class RenderTest(unittest.TestCase):
+    def test_links(self):
+        h = email_html("Read [the guide](https://a.com/x?y=1&z=2), or https://b.com.", "", {})
+        self.assertIn('<a href="https://a.com/x?y=1&amp;z=2">the guide</a>', h)
+        self.assertIn('<a href="https://b.com">https://b.com</a>.', h)
+        self.assertIn('&lt;b&gt;', email_html("{{ x }}", "", {"x": "<b>"}))
 
 
 class ClassifyTest(unittest.TestCase):

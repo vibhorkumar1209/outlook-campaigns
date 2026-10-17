@@ -27,8 +27,43 @@ def load_env() -> None:
 
 def cmd_login(a):
     from .graph import login
+    from .runner import add_sender
 
-    print(f"Signed in as {login(device_code=a.device_code)}")
+    print(f"Connected mailbox {add_sender(login(device_code=a.device_code))}. Run again to add another.")
+
+
+def cmd_tracker_setup(a):
+    """Generate the shared tracking secrets into .env (once) and print the Cloudflare deploy steps."""
+    import secrets
+
+    env = ROOT / ".env"
+    text = env.read_text() if env.exists() else ""
+    added = []
+    for k in ("OC_TRACK_KEY", "OC_TRACK_SECRET"):
+        if f"{k}=" not in text:
+            text += ("" if text.endswith("\n") or not text else "\n") + f"{k}={secrets.token_urlsafe(32)}\n"
+            added.append(k)
+    env.write_text(text)
+    env.chmod(0o600)
+    print(f"{'Added ' + ', '.join(added) + ' to' if added else 'Kept existing values in'} {env}\n")
+    print(f"""Deploy the tracker (one time, needs a free Cloudflare account; your domain must be on Cloudflare):
+
+  cd "{ROOT / 'tracker'}"
+  npm install
+  npx wrangler login
+  npx wrangler d1 create outreach-tracker        # paste the database_id into wrangler.toml
+  npx wrangler d1 execute outreach-tracker --remote --file=schema.sql
+  grep '^OC_TRACK_SECRET=' ../.env | cut -d= -f2- | npx wrangler secret put SIGNING_SECRET
+  grep '^OC_TRACK_KEY=' ../.env | cut -d= -f2- | npx wrangler secret put API_KEY
+  # in wrangler.toml, uncomment routes and set your subdomain, e.g. links.yourdomain.com
+  npx wrangler deploy
+
+Only after the deploy works, add this line to .env and restart ./oc serve:
+
+  OC_TRACK_URL=https://{a.domain or '<your tracking subdomain>'}
+
+(Tracking stays off until then, so no email ever carries links to a tracker that isn't live.)
+Settings → Open & click tracking should show "working".""")
 
 
 def cmd_serve(a):
@@ -91,11 +126,13 @@ def cmd_demo(a):
               ("Mei", "Lin", "Initech", "VP Infrastructure"), ("Tom", "Berg", "Umbrella", "IT Director"),
               ("Ana", "Silva", "Hooli", "CIO"), ("Sam", "Okafor", "Stark Ind", "Head of Platform")]
     for i, (f, l, co, t) in enumerate(people):
-        lid = conn.execute(
+        email = f"{f.lower()}.{l.lower()}@example.com"
+        cur = conn.execute(
             "INSERT OR IGNORE INTO leads (email, linkedin_url, first_name, last_name, company, title, created_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (f"{f.lower()}.{l.lower()}@example.com", f"https://www.linkedin.com/in/{f.lower()}-{l.lower()}-demo",
-             f, l, co, t, iso(now))).lastrowid or db.scalar(conn, "SELECT id FROM leads WHERE first_name = ? AND last_name = ?", f, l)
+            (email, f"https://www.linkedin.com/in/{f.lower()}-{l.lower()}-demo", f, l, co, t, iso(now)))
+        # lastrowid is stale after an ignored insert, so look the lead up when it already existed.
+        lid = cur.lastrowid if cur.rowcount else db.scalar(conn, "SELECT id FROM leads WHERE email = ?", email)
         conn.execute("INSERT OR IGNORE INTO enrollments (campaign_id, lead_id, enrolled_at) VALUES (?, ?, ?)",
                      (cid, lid, iso(now - timedelta(days=6))))
         e = db.one(conn, "SELECT * FROM enrollments WHERE campaign_id = ? AND lead_id = ?", cid, lid)
@@ -105,8 +142,19 @@ def cmd_demo(a):
         conn.execute("UPDATE leads SET li_state = ? WHERE id = ?", ("connected" if i % 2 else "invited", lid))
         conn.execute("UPDATE enrollments SET step_pos = 0, status = 'active', last_step_at = ? WHERE id = ?", (iso(at), e["id"]))
         if i < 4:
-            event(conn, lid, "sent", enrollment=e, channel="email", step_pos=1, detail=f"{co} + quick idea",
-                  at=at + timedelta(days=1))
+            sent_at = at + timedelta(days=1)
+            event(conn, lid, "sent", enrollment=e, channel="email", step_pos=1, detail=f"{co} + quick idea", at=sent_at)
+            conn.execute("""INSERT INTO sends (id, enrollment_id, campaign_id, lead_id, step_pos, sender, subject, tracked,
+                              sent_at, opened_at, opens, clicked_at, clicks, machine_events) VALUES (?,?,?,?,?,?,?,3,?,?,?,?,?,?)""",
+                         (f"demo{cid}x{i}", e["id"], cid, lid, 1, "demo@example.com", f"{co} + quick idea", iso(sent_at),
+                          iso(sent_at + timedelta(hours=2)) if i < 3 else None, 2 if i < 3 else 0,
+                          iso(sent_at + timedelta(hours=3)) if i == 0 else None, 1 if i == 0 else 0, 1))
+            if i < 3:
+                event(conn, lid, "open", enrollment=e, channel="email", step_pos=1, detail=f"{co} + quick idea",
+                      at=sent_at + timedelta(hours=2))
+            if i == 0:
+                event(conn, lid, "click", enrollment=e, channel="email", step_pos=1, detail="https://example.com/case-study",
+                      at=sent_at + timedelta(hours=3))
             conn.execute("UPDATE enrollments SET step_pos = 1 WHERE id = ?", (e["id"],))
         if i == 1:
             engine.mark_replied(conn, lid, "linkedin", now - timedelta(days=1), detail="(demo)")
@@ -140,6 +188,10 @@ def main() -> None:
     s = sub.add_parser("tick", help="one run now: check replies, queue LinkedIn tasks, send due emails")
     s.add_argument("--dry-run", action="store_true", help="log emails instead of sending")
     s.set_defaults(fn=cmd_tick)
+
+    s = sub.add_parser("tracker-setup", help="generate tracking secrets into .env and print Cloudflare deploy steps")
+    s.add_argument("--domain", help="tracking subdomain, e.g. links.yourcompany.com")
+    s.set_defaults(fn=cmd_tracker_setup)
 
     s = sub.add_parser("demo", help="seed a draft demo campaign (example.com leads, never sends)")
     s.set_defaults(fn=cmd_demo)

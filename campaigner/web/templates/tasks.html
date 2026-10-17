@@ -30,21 +30,45 @@
       </div>
       <div class="task-tags">
         {{ chip(t.channel) }}
-        <span class="meta">{{ t.campaign }} · step {{ t.step_pos + 1 }}/{{ t.n_steps }} · {{ t.created_at | ago }}</span>
+        <span class="meta">{{ t.campaign }}{% if t.step_pos >= 0 %} · step {{ t.step_pos + 1 }}/{{ t.n_steps }}{% else %} · weekly touch{% endif %} · {{ t.created_at | ago }}</span>
       </div>
     </div>
-    {% if t.channel != "li_view" %}
+    {% if t.channel == "li_engage" %}
+      <div class="meta">Like (and ideally comment on) one of their posts from <b>after {{ since.strftime("%b %d, %Y") }}</b> that you haven't engaged with. If they haven't posted since then, click <i>No recent posts</i>.</div>
+      {% if t.engaged %}
+        <div class="meta">Already engaged:
+          {% for g in t.engaged %}{% if g.post_url %}<a href="{{ g.post_url }}" target="_blank" rel="noopener">{{ g.at | local("%b %d") }}</a>{% else %}{{ g.at | local("%b %d") }}{% endif %}{{ ", " if not loop.last }}{% endfor %}
+        </div>
+      {% endif %}
+      <input class="post-url" placeholder="Post URL (optional; prevents repeats)" aria-label="Post URL">
+      <textarea class="post-text" rows="3" placeholder="Paste the post's text here to draft a comment" aria-label="Post text"></textarea>
+      <textarea class="task-body" rows="3" placeholder="Your comment (optional)" aria-label="Comment"></textarea>
+      <div class="days">
+        <label><input type="checkbox" class="did-like" checked> Liked</label>
+        <label><input type="checkbox" class="did-comment"> Commented</label>
+      </div>
+    {% elif t.channel != "li_view" %}
       <textarea class="task-body" rows="4" aria-label="Message text">{{ t.body }}</textarea>
       {% if t.channel == "li_connect" %}<div class="count" data-count></div>{% endif %}
     {% else %}
       <div class="meta">Visit their profile so it shows up in their "who viewed" list.</div>
     {% endif %}
     <div class="task-actions">
+    {% if t.channel == "li_engage" %}
+      <button class="btn primary" data-act="posts" data-posts="{{ t.posts_url }}">Open their recent posts</button>
+      {% if ai_ready %}<button class="btn" data-act="draft">Draft comment</button>
+      {% else %}<button class="btn" disabled title="Add ANTHROPIC_API_KEY to .env to enable">Draft comment</button>{% endif %}
+      <button class="btn" data-act="copy">Copy comment</button>
+      <button class="btn" data-act="done">Done</button>
+      <button class="btn ghost" data-act="skip">No recent posts</button>
+      <button class="btn ghost" data-act="replied">They replied</button>
+    {% else %}
       <button class="btn primary" data-act="open">{{ "Open profile" if t.channel == "li_view" else "Copy & open profile" }}</button>
       <button class="btn" data-act="done">Done</button>
       <button class="btn ghost" data-act="skip">Skip</button>
       {% if t.channel == "li_connect" %}<button class="btn ghost" data-act="connected">Already connected</button>{% endif %}
       <button class="btn ghost" data-act="replied">They replied</button>
+    {% endif %}
     </div>
   </article>
 {% endfor %}

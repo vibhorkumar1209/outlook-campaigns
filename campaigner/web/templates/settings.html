@@ -5,22 +5,43 @@
 <div class="grid2">
   <div class="stack-y">
     <section class="card">
-      <div class="card-head"><h2>Outlook</h2></div>
-      {% if account %}
-        <p><span class="dot on"></span>Connected as <b>{{ account }}</b>. Email goes out from this mailbox and lands in your Sent Items.</p>
-        <button class="btn" id="login">Reconnect</button>
-      {% elif not client_id %}
-        <p>Add <code>OC_CLIENT_ID</code> and <code>OC_TENANT_ID</code> to <code>outlook-campaigns/.env</code>, then restart the dashboard. See README → <i>Register an app in Entra ID</i>.</p>
+      <div class="card-head"><h2>Mailboxes</h2><a href="/senders">manage →</a></div>
+      <p>{{ n_connected }} connected. Add, reconnect and check deliverability on the <a href="/senders">Senders</a> page.</p>
+    </section>
+
+    <section class="card">
+      <div class="card-head"><h2>Open &amp; click tracking</h2></div>
+      {% if not tracker %}
+        <p><span class="pill muted">not set up</span> Emails go out without pixels or tracked links. Reply and bounce tracking still work.</p>
+        <p class="meta">To turn it on, deploy the Cloudflare Worker in <code>tracker/</code> and set <code>OC_TRACK_URL</code>, <code>OC_TRACK_KEY</code> and <code>OC_TRACK_SECRET</code> in <code>.env</code>. Then restart. Run <code>./oc tracker-setup</code> for the exact steps.</p>
+      {% elif tracker_error %}
+        <p><span class="pill critical">problem</span> {{ tracker.base }}: {{ tracker_error }}</p>
+        <p class="meta">Emails still send; open/click links are already signed and will record once the worker answers.</p>
       {% else %}
-        <p>Not connected. Clicking opens a Microsoft sign-in in your browser.</p>
-        <button class="btn primary" id="login">Connect Outlook</button>
+        <p><span class="pill good">working</span> {{ tracker.base }}</p>
+        <p class="meta">Events pulled up to #{{ track_cursor }}. Per campaign on/off: campaign → Settings.</p>
       {% endif %}
-      <p class="meta" id="login-state">{% if login_state.error %}Last attempt failed: {{ login_state.error }}{% endif %}</p>
+    </section>
+
+    <section class="card">
+      <div class="card-head"><h2>LinkedIn engagement</h2></div>
+      <p class="meta">For leads whose invite or first email has gone out, the queue gets a <i>Like + comment</i> task for one of their recent posts. It stops when they reply on any channel, and campaigns can turn it off in their Settings tab.</p>
+      <form method="post" action="/settings/engagement">
+        <div class="form-grid">
+          <label class="f">One touch per person every (days)<input type="number" min="1" max="60" name="engage_every_days" value="{{ eng.engage_every_days }}"></label>
+          <label class="f">Only posts from the last (months)<input type="number" min="1" max="12" name="engage_lookback_months" value="{{ eng.engage_lookback_months }}"></label>
+        </div>
+        <label class="f" style="margin-top:12px">About you, for comment drafts (role, what you know well, tone)
+          <textarea name="comment_voice" rows="3" placeholder="e.g. I advise mid-size companies on IT spend. Direct, practical, no jargon.">{{ voice }}</textarea>
+        </label>
+        <p class="meta">Drafts: {% if ai_ready %}<span class="pill good">Claude ready</span>{% else %}<span class="pill muted">off</span> add <code>ANTHROPIC_API_KEY</code> to <code>.env</code> and restart{% endif %}. You always review and post the comment yourself.</p>
+        <button class="btn">Save</button>
+      </form>
     </section>
 
     <section class="card">
       <div class="card-head"><h2>LinkedIn detection</h2></div>
-      <p>Accepts and replies are read from LinkedIn's notification emails in this mailbox. In LinkedIn → Settings → Communications → Email, keep these on:</p>
+      <p>Accepts and replies are read from LinkedIn's notification emails (choose the inbox on <a href="/senders">Senders</a>). In LinkedIn → Settings → Communications → Email, keep these on:</p>
       <ul class="meta"><li>Invitations: <i>invitation accepted</i></li><li>Messages: <i>new messages</i></li></ul>
       <p class="meta">Detection matches the lead's full name in the notification. If it misses one, use <i>Mark connected</i> or <i>They replied</i>.</p>
     </section>
@@ -41,18 +62,6 @@
 {% endblock %}
 {% block scripts %}
 <script>
-  const login = document.getElementById("login");
-  login && login.addEventListener("click", async () => {
-    try { await api("/api/login"); $("#login-state").textContent = "Waiting for the Microsoft sign-in in your browser…"; poll(); }
-    catch (e) { toast(e.message, true); }
-  });
-  async function poll() {
-    const s = await (await fetch("/api/state")).json();
-    $("#log").textContent = s.logs.join("\n") || "No runs yet in this session.";
-    if (s.login.state === "waiting") return setTimeout(poll, 1500);
-    if (s.login.state === "done") location.reload();
-    if (s.login.state === "failed") $("#login-state").textContent = "Sign-in failed: " + s.login.error;
-  }
   setInterval(async () => {
     const s = await (await fetch("/api/state")).json();
     $("#log").textContent = s.logs.join("\n") || "No runs yet in this session.";

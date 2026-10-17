@@ -10,12 +10,14 @@
   </div>
 </header>
 
-<section class="tiles">
+<section class="tiles four">
   {{ tile("Live campaigns", o.active_campaigns) }}
   {{ tile("In sequence", o.in_sequence, "leads not finished") }}
   {{ tile("Emails today", o.emails_today) }}
   {% set tasks_sub %}<a href="/tasks">open queue →</a>{% endset %}
   {{ tile("LinkedIn to do", o.tasks_open, tasks_sub) }}
+  {{ tile("Open rate · 30d", pct(em.open_rate), em.opened ~ " people · estimate") }}
+  {{ tile("Click rate · 30d", pct(em.click_rate), em.clicked ~ " people") }}
   {{ tile("Replies · 7d", o.replies_week) }}
   {{ tile("Reply rate", (o.reply_rate ~ "%") if o.reply_rate is not none else "–", "of contacted leads") }}
 </section>
@@ -55,7 +57,7 @@
     <div class="card-head"><h2>Campaigns</h2><a href="/campaigns">all →</a></div>
     {% if campaigns %}
     <div class="tbl-wrap"><table class="t">
-      <thead><tr><th>Name</th><th>Status</th><th class="num">Leads</th><th class="num">Contacted</th><th class="num">Replied</th><th class="num">Queue</th></tr></thead>
+      <thead><tr><th>Name</th><th>Status</th><th class="num">Leads</th><th class="num">Contacted</th><th class="num">Open</th><th class="num">Click</th><th class="num">Replied</th><th class="num">Queue</th></tr></thead>
       <tbody>
       {% for c in campaigns[:8] %}
         <tr>
@@ -63,6 +65,8 @@
           <td>{{ pill(c.status) }}</td>
           <td class="num">{{ c.enrolled }}</td>
           <td class="num">{{ c.contacted }}</td>
+          <td class="num">{{ pct(c.email.open_rate) }}</td>
+          <td class="num">{{ pct(c.email.click_rate) }}</td>
           <td class="num">{{ c.replied }}{% if c.contacted %} <span class="meta">{{ (100 * c.replied / c.contacted) | round | int }}%</span>{% endif %}</td>
           <td class="num">{% if c.tasks_open %}<a href="/tasks?campaign={{ c.id }}">{{ c.tasks_open }}</a>{% else %}0{% endif %}</td>
         </tr>

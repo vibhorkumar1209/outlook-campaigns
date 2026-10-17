@@ -14,10 +14,12 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from jinja2 import TemplateError, TemplateSyntaxError
 
-from .. import db, engine, importer, stats
+from .. import ai, db, domain_health, engine, importer, stats
 from ..db import iso, one, parse, rows, scalar, utcnow
 from ..render import ENV, email_html, lead_context, render_text
+from ..graph import logout
 from ..runner import Runner
+from ..tracking import Tracker
 
 HERE = Path(__file__).parent
 PORT = int(os.environ.get("OC_PORT", "8765"))
@@ -25,7 +27,8 @@ HOSTS = {f"127.0.0.1:{PORT}", f"localhost:{PORT}"}
 STATUS_TONE = {
     "active": "info", "open": "info", "pending": "muted", "done": "muted", "draft": "muted",
     "replied": "good", "connected": "good", "paused": "warning", "stopped": "warning", "invited": "info",
-    "bounced": "critical", "error": "critical", "none": "muted",
+    "bounced": "critical", "error": "critical", "none": "muted", "good": "good", "warning": "warning",
+    "critical": "critical", "muted": "muted", "unsubscribed": "warning",
 }
 SAMPLE_LEAD = {"first_name": "Jane", "last_name": "Doe", "company": "Acme Corp", "title": "Head of IT",
                "email": "jane@example.com", "linkedin_url": "https://www.linkedin.com/in/janedoe", "data": "{}"}
@@ -75,7 +78,8 @@ def _local(s: str | None, fmt: str = "%b %d %H:%M") -> str:
 templates.env.filters.update(ago=_ago, local=_local)
 templates.env.globals.update(
     tone=lambda s: STATUS_TONE.get(s, "muted"),
-    channel_label=lambda c: engine.CHANNELS.get(c, c),
+    channel_label=lambda c: engine.TASK_LABELS.get(c, c),
+    pct=lambda v: "–" if v is None else (f"{v:g}%"),
     CHANNELS=engine.CHANNELS, CONDITIONS=engine.CONDITIONS, FIELDS=importer.FIELDS,
 )
 
@@ -101,9 +105,18 @@ def _start():
         runner.start_loop(int(os.environ.get("OC_TICK_MINUTES", "10")))
 
 
+def connected_senders(conn) -> list[dict]:
+    """Senders with a live token in the cache, flagged; unconnected ones need a re-sign-in."""
+    live = set(runner.accounts())
+    return [{**s, "connected": s["account"] in live} for s in rows(conn, "SELECT * FROM senders ORDER BY created_at")]
+
+
 def page(request: Request, name: str, conn, **ctx):
+    senders = connected_senders(conn)
     base = {
-        "account": runner.account(),
+        "senders_nav": senders,
+        "account": next((s["email"] for s in senders if s["connected"]), None),
+        "n_connected": sum(s["connected"] for s in senders),
         "last_tick": db.get_setting(conn, "last_tick"),
         "open_tasks": scalar(conn, OPEN_TASKS_SQL),
         "path": request.url.path,
@@ -134,8 +147,11 @@ def overview(request: Request):
     tz = local_tz()
     act = stats.activity(conn, tz)
     peak = max([d["email"] + d["linkedin"] for d in act] + [1])
-    return page(request, "overview.html", conn, o=stats.overview(conn, tz), act=act, peak=peak,
-                campaigns=stats.campaign_rows(conn), replies=stats.recent_replies(conn))
+    camps = stats.campaign_rows(conn)
+    for c in camps:
+        c["email"] = stats.email_stats(conn, campaign_id=c["id"])
+    return page(request, "overview.html", conn, o=stats.overview(conn, tz), act=act, peak=peak, campaigns=camps,
+                replies=stats.recent_replies(conn), em=stats.email_stats(conn, since=utcnow() - timedelta(days=30)))
 
 
 # ---------- LinkedIn queue ----------
@@ -154,10 +170,17 @@ def tasks(request: Request, campaign: int | None = None):
         sql += " AND c.id = ?"
         args = (campaign,)
     items = rows(conn, sql + " ORDER BY t.created_at, t.id", *args)
+    eng = engine.engage_settings(conn)
+    since = (utcnow() - timedelta(days=round(30.4 * eng["engage_lookback_months"]))).astimezone(local_tz())
+    for t in items:
+        if t["channel"] == engine.ENGAGE:
+            t["posts_url"] = t["linkedin_url"].rstrip("/") + "/recent-activity/all/"
+            t["engaged"] = rows(conn, "SELECT * FROM engagements WHERE lead_id = ? ORDER BY at DESC LIMIT 10", t["lead_id"])
     done_today = scalar(conn, "SELECT COUNT(*) FROM events WHERE type = 'task_done' AND at >= ?",
                         iso(utcnow().astimezone(local_tz()).replace(hour=0, minute=0, second=0)))
     camps = rows(conn, "SELECT id, name FROM campaigns WHERE status = 'active' ORDER BY name")
-    return page(request, "tasks.html", conn, tasks=items, campaigns=camps, campaign=campaign, done_today=done_today)
+    return page(request, "tasks.html", conn, tasks=items, campaigns=camps, campaign=campaign, done_today=done_today,
+                since=since, ai_ready=bool(os.environ.get("ANTHROPIC_API_KEY")))
 
 
 @app.post("/api/tasks/{task_id}")
@@ -167,10 +190,28 @@ async def task_action(task_id: int, request: Request):
         raise HTTPException(400, "bad action")
     conn = db.connect()
     try:
-        engine.complete_task(conn, task_id, body["action"], body.get("body"))
+        engine.complete_task(conn, task_id, body["action"], body.get("body"), engage=body.get("engage"))
     except ValueError as e:
         raise HTTPException(409, str(e))
     return {"ok": True, "open": scalar(conn, OPEN_TASKS_SQL)}
+
+
+@app.post("/api/tasks/{task_id}/draft")
+async def task_draft(task_id: int, request: Request):
+    p = await request.json()
+    conn = db.connect()
+    lead = one(conn, """SELECT l.* FROM tasks t JOIN enrollments e ON e.id = t.enrollment_id
+                        JOIN leads l ON l.id = e.lead_id WHERE t.id = ?""", task_id)
+    if not lead:
+        raise HTTPException(404)
+    try:
+        # Runs in FastAPI's threadpool (sync SDK call inside an async route would block the loop).
+        from starlette.concurrency import run_in_threadpool
+        comment = await run_in_threadpool(ai.draft_comment, p.get("post") or "", lead,
+                                          db.get_setting(conn, "comment_voice", ""))
+    except ai.DraftError as e:
+        raise HTTPException(422, str(e))
+    return {"comment": comment}
 
 
 # ---------- campaigns ----------
@@ -178,13 +219,17 @@ async def task_action(task_id: int, request: Request):
 @app.get("/campaigns")
 def campaigns(request: Request):
     conn = db.connect()
-    return page(request, "campaigns.html", conn, campaigns=stats.campaign_rows(conn))
+    camps = stats.campaign_rows(conn)
+    for c in camps:
+        c["email"] = stats.email_stats(conn, campaign_id=c["id"])
+    return page(request, "campaigns.html", conn, campaigns=camps)
 
 
 @app.post("/campaigns")
 def create_campaign(name: str = Form(...)):
     conn = db.connect()
-    cur = conn.execute("INSERT INTO campaigns (name, created_at) VALUES (?, ?)", (name.strip() or "Untitled", iso(utcnow())))
+    cur = conn.execute("INSERT INTO campaigns (name, sender, created_at) VALUES (?, ?, ?)",
+                       (name.strip() or "Untitled", engine.default_sender(conn), iso(utcnow())))
     _save_steps(conn, cur.lastrowid, _validate_steps(DEFAULT_SEQUENCE)[0])
     return back(f"/campaigns/{cur.lastrowid}", tab="sequence", msg="Campaign created with a starter sequence. Edit it, import leads, then activate.")
 
@@ -195,12 +240,20 @@ def campaign(request: Request, cid: int, tab: str = "overview", status: str | No
     c = get_campaign(conn, cid)
     steps = rows(conn, "SELECT * FROM steps WHERE campaign_id = ? ORDER BY pos", cid)
     has_li = any(s["channel"] in engine.LI for s in steps)
-    ctx = {"c": c, "tab": tab, "steps": steps, "counts": stats.status_counts(conn, cid)}
+    sender = one(conn, "SELECT * FROM senders WHERE account = ?", c["sender"] or engine.default_sender(conn))
+    ctx = {"c": c, "tab": tab, "steps": steps, "counts": stats.status_counts(conn, cid), "sender": sender,
+           "tracker": Tracker.from_env()}
     if tab == "overview":
-        ctx.update(funnel=stats.funnel(conn, cid, has_li), step_stats=stats.step_stats(conn, cid, steps))
+        ctx.update(funnel=stats.funnel(conn, cid, has_li), step_stats=stats.step_stats(conn, cid, steps),
+                   em=stats.email_stats(conn, campaign_id=cid), step_em=stats.step_email_stats(conn, cid),
+                   has_email=any(s["channel"] == "email" for s in steps))
     elif tab == "sequence":
-        ctx["preview_leads"] = rows(conn, """SELECT l.id, l.first_name, l.last_name, l.company FROM leads l
+        leads = rows(conn, """SELECT l.id, l.first_name, l.last_name, l.company FROM leads l
             JOIN enrollments e ON e.lead_id = l.id WHERE e.campaign_id = ? ORDER BY e.id LIMIT 50""", cid)
+        ctx["preview_leads"] = [{"id": l["id"], "label": " · ".join(x for x in (
+            f"{l['first_name']} {l['last_name']}".strip(), l["company"]) if x)} for l in leads]
+        # Steps carry their live counts so they stay attached when nodes are reordered in the builder.
+        ctx["seq_steps"] = stats.step_stats(conn, cid, steps)
     elif tab == "leads":
         sql = """SELECT e.*, l.first_name, l.last_name, l.company, l.title, l.email, l.linkedin_url, l.li_state
                  FROM enrollments e JOIN leads l ON l.id = e.lead_id WHERE e.campaign_id = ?"""
@@ -213,7 +266,8 @@ def campaign(request: Request, cid: int, tab: str = "overview", status: str | No
         tz = engine.tz_of(c)
         start = parse(c["start_at"])
         ctx.update(start_local=start.astimezone(tz).strftime("%Y-%m-%dT%H:%M") if start else "",
-                   days=c["window_days"].split(","), zones=sorted(available_timezones()))
+                   days=c["window_days"].split(","), zones=sorted(available_timezones()),
+                   senders=connected_senders(conn))
     return page(request, "campaign.html", conn, **ctx)
 
 
@@ -221,7 +275,8 @@ def campaign(request: Request, cid: int, tab: str = "overview", status: str | No
 def campaign_settings(cid: int, name: str = Form(...), timezone: str = Form(""), start_at: str = Form(""),
                       window_days: list[str] = Form([]), window_start: str = Form("09:30"), window_end: str = Form("17:00"),
                       email_daily_cap: int = Form(40), li_daily_cap: int = Form(20), gap_min: int = Form(45),
-                      gap_max: int = Form(120), signature: str = Form("")):
+                      gap_max: int = Form(120), signature: str = Form(""), sender: str = Form(""),
+                      track_opens: str = Form(""), track_clicks: str = Form(""), li_engage: str = Form("")):
     conn = db.connect()
     get_campaign(conn, cid)
     url = f"/campaigns/{cid}"
@@ -232,14 +287,17 @@ def campaign_settings(cid: int, name: str = Form(...), timezone: str = Form(""),
         return back(url, tab="settings", err="Pick at least one send day")
     if window_start >= window_end:
         return back(url, tab="settings", err="Send window must end after it starts")
+    if sender and not one(conn, "SELECT 1 FROM senders WHERE account = ?", sender):
+        return back(url, tab="settings", err="Unknown mailbox")
     tz = ZoneInfo(timezone) if timezone else local_tz()
     start = iso(datetime.fromisoformat(start_at).replace(tzinfo=tz)) if start_at else None
     gap_min, gap_max = max(0, gap_min), max(gap_min, gap_max)
     conn.execute("""UPDATE campaigns SET name = ?, timezone = ?, start_at = ?, window_days = ?, window_start = ?,
-                    window_end = ?, email_daily_cap = ?, li_daily_cap = ?, gap_min = ?, gap_max = ?, signature = ?
-                    WHERE id = ?""",
+                    window_end = ?, email_daily_cap = ?, li_daily_cap = ?, gap_min = ?, gap_max = ?, signature = ?,
+                    sender = ?, track_opens = ?, track_clicks = ?, li_engage = ? WHERE id = ?""",
                  (name.strip() or "Untitled", timezone or None, start, ",".join(window_days), window_start, window_end,
-                  max(0, email_daily_cap), max(0, li_daily_cap), gap_min, gap_max, signature, cid))
+                  max(0, email_daily_cap), max(0, li_daily_cap), gap_min, gap_max, signature, sender or None,
+                  1 if track_opens else 0, 1 if track_clicks else 0, 1 if li_engage else 0, cid))
     return back(url, tab="settings", msg="Saved")
 
 
@@ -255,6 +313,10 @@ def campaign_status(cid: int, status: str = Form(...)):
             return back(url, err="Add at least one step first")
         if not scalar(conn, "SELECT COUNT(*) FROM enrollments WHERE campaign_id = ?", cid):
             return back(url, err="Import leads into this campaign first")
+        c = get_campaign(conn, cid)
+        has_email = scalar(conn, "SELECT COUNT(*) FROM steps WHERE campaign_id = ? AND channel = 'email'", cid)
+        if has_email and not (c["sender"] or engine.default_sender(conn)):
+            return back(url, err="Connect a mailbox on the Senders page first; this sequence has email steps")
     conn.execute("UPDATE campaigns SET status = ? WHERE id = ?", (status, cid))
     if status == "active":
         runner.run_async()
@@ -337,6 +399,8 @@ async def preview(request: Request):
     c = get_campaign(conn, int(p["campaign_id"]))
     lead = one(conn, "SELECT * FROM leads WHERE id = ?", p.get("lead_id")) if p.get("lead_id") else None
     ctx = lead_context(lead or SAMPLE_LEAD)
+    tracker = Tracker.from_env()
+    ctx["unsubscribe_url"] = tracker.unsub_url("preview") if tracker else "mailto:you?subject=Unsubscribe"
     st = p.get("step") or {}
     try:
         if st.get("channel") == "email":
@@ -400,6 +464,9 @@ async def lead_action(lid: int, request: Request):
             raise HTTPException(409, "lead is not in an open sequence")
     elif act == "connected":
         engine.set_connected(conn, lid, now, source="marked manually")
+    elif act == "dnc":
+        if not engine.unsubscribe(conn, lid, now, detail="marked do-not-contact"):
+            raise HTTPException(409, "already do-not-contact")
     elif act == "stop_all":
         for e in rows(conn, "SELECT id FROM enrollments WHERE lead_id = ?", lid):
             engine.stop_enrollment(conn, e["id"], now=now)
@@ -469,14 +536,78 @@ async def import_commit(request: Request):
     return page(request, "import_done.html", conn, s=summary, c=c, filename=up["filename"])
 
 
+# ---------- senders / deliverability ----------
+
+@app.get("/senders")
+def senders(request: Request, refresh: str | None = None):
+    conn = db.connect()
+    live = set(runner.accounts())
+    items = stats.sender_rows(conn, local_tz())
+    for s in items:
+        s["connected"] = s["account"] in live
+        s["domain"] = s["email"].split("@")[-1]
+    health = {}
+    for d in sorted({s["domain"] for s in items}):
+        try:
+            health[d] = domain_health.cached(conn, d, refresh=refresh == d)
+        except Exception as e:  # offline: show the reason instead of failing the page
+            health[d] = {"checked_at": None, "results": [{"check": "DNS", "status": "warning", "detail": str(e)}]}
+    return page(request, "senders.html", conn, senders=items, health=health,
+                li_mailbox=db.get_setting(conn, "li_mailbox") or engine.default_sender(conn),
+                login_state=runner.login_state, client_id=bool(os.environ.get("OC_CLIENT_ID")))
+
+
+@app.post("/senders/{account}/cap")
+def sender_cap(account: str, daily_cap: int = Form(...)):
+    conn = db.connect()
+    conn.execute("UPDATE senders SET daily_cap = ? WHERE account = ?", (max(0, daily_cap), account))
+    return back("/senders", msg=f"Daily cap for {account} set to {max(0, daily_cap)}")
+
+
+@app.post("/senders/li-mailbox")
+def sender_li_mailbox(account: str = Form(...)):
+    conn = db.connect()
+    if not one(conn, "SELECT 1 FROM senders WHERE account = ?", account):
+        return back("/senders", err="Unknown mailbox")
+    db.set_setting(conn, "li_mailbox", account)
+    db.set_setting(conn, "li_cursor", None)  # rescan recent LinkedIn mails in the new inbox
+    return back("/senders", msg=f"LinkedIn notifications are read from {account}")
+
+
+@app.post("/senders/{account}/disconnect")
+def sender_disconnect(account: str):
+    conn = db.connect()
+    in_use = scalar(conn, "SELECT COUNT(*) FROM campaigns WHERE sender = ? AND status = 'active'", account)
+    try:
+        logout(account)
+    except Exception:
+        pass
+    return back("/senders", msg=f"Signed out {account}." + (f" {in_use} live campaign(s) use it; their emails wait until "
+                                                           "you reconnect or pick another sender." if in_use else ""))
+
+
 # ---------- settings / runner ----------
 
 @app.get("/settings")
 def settings(request: Request):
     conn = db.connect()
+    tracker = Tracker.from_env()
     return page(request, "settings.html", conn, logs=list(runner.logs)[-120:], busy=runner.busy,
-                login_state=runner.login_state, client_id=bool(os.environ.get("OC_CLIENT_ID")),
+                eng=engine.engage_settings(conn), voice=db.get_setting(conn, "comment_voice", ""),
+                ai_ready=bool(os.environ.get("ANTHROPIC_API_KEY")),
+                tracker=tracker, tracker_error=tracker.health() if tracker else None,
+                track_cursor=db.get_setting(conn, "track_cursor", 0),
                 tick_minutes=os.environ.get("OC_TICK_MINUTES", "10"))
+
+
+@app.post("/settings/engagement")
+def settings_engagement(engage_every_days: int = Form(7), engage_lookback_months: int = Form(6),
+                        comment_voice: str = Form("")):
+    conn = db.connect()
+    db.set_setting(conn, "engage_every_days", min(max(engage_every_days, 1), 60))
+    db.set_setting(conn, "engage_lookback_months", min(max(engage_lookback_months, 1), 12))
+    db.set_setting(conn, "comment_voice", comment_voice.strip()[:1000])
+    return back("/settings", msg="Engagement settings saved")
 
 
 @app.post("/api/run")
@@ -495,5 +626,4 @@ def start_login():
 
 @app.get("/api/state")
 def state():
-    return {"busy": runner.busy, "login": runner.login_state, "account": runner.account(),
-            "logs": list(runner.logs)[-120:]}
+    return {"busy": runner.busy, "login": runner.login_state, "logs": list(runner.logs)[-120:]}

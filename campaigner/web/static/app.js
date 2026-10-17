@@ -62,6 +62,31 @@ $$(".task").forEach((card) => {
     const btn = e.target.closest("[data-act]");
     if (!btn) return;
     const act = btn.dataset.act, ta = $(".task-body", card);
+    if (act === "posts") {
+      window.open(btn.dataset.posts, "_blank", "noopener");
+      return;
+    }
+    if (act === "copy") {
+      if (!ta.value.trim()) return toast("No comment to copy yet", true);
+      await navigator.clipboard.writeText(ta.value);
+      $(".did-comment", card).checked = true;
+      const url = $(".post-url", card).value.trim();
+      if (/^https:\/\/(www\.)?linkedin\.com\//.test(url)) window.open(url, "_blank", "noopener");
+      return toast("Copied. Paste it under the post.");
+    }
+    if (act === "draft") {
+      btn.disabled = true;
+      const label = btn.textContent;
+      btn.textContent = "Drafting…";
+      try {
+        const r = await api(`/api/tasks/${card.dataset.task}/draft`, { post: $(".post-text", card).value });
+        ta.value = r.comment;
+        ta.focus();
+      } catch (err) { toast(err.message, true); }
+      btn.textContent = label;
+      btn.disabled = false;
+      return;
+    }
     if (act === "open") {
       if (ta && ta.value) {
         try { await navigator.clipboard.writeText(ta.value); toast("Copied. Paste it in LinkedIn."); }
@@ -74,7 +99,12 @@ $$(".task").forEach((card) => {
     }
     $$("button", card).forEach((b) => (b.disabled = true));
     try {
-      const r = await api(`/api/tasks/${card.dataset.task}`, { action: act, body: ta ? ta.value : null });
+      const engage = $(".did-like", card) ? {
+        post_url: $(".post-url", card).value.trim(),
+        liked: $(".did-like", card).checked,
+        commented: $(".did-comment", card).checked,
+      } : null;
+      const r = await api(`/api/tasks/${card.dataset.task}`, { action: act, body: ta ? ta.value : null, engage });
       card.classList.add("gone");
       setTimeout(() => card.remove(), 250);
       const badge = $("#nav-tasks .badge");

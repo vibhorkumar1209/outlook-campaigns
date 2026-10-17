@@ -1,4 +1,4 @@
-"""Microsoft Graph client for one signed-in M365 user (delegated auth)."""
+"""Microsoft Graph client. Several M365 users can be signed in at once; each Graph instance acts as one of them."""
 from __future__ import annotations
 
 import os
@@ -13,7 +13,7 @@ from msal_extensions import PersistedTokenCache, build_encrypted_persistence
 
 GRAPH = "https://graph.microsoft.com/v1.0"
 SCOPES = ["Mail.Send", "Mail.ReadWrite", "User.Read"]
-# Encrypted at rest: macOS Keychain under the hood.
+# Encrypted at rest: macOS Keychain under the hood. Holds every signed-in mailbox.
 CACHE_PATH = os.path.expanduser("~/.outlook-campaigns/token_cache.bin")
 MSG_FIELDS = "id,conversationId,from,subject,receivedDateTime,isDraft,internetMessageHeaders"
 RETRY_STATUS = {429, 502, 503, 504}
@@ -43,6 +43,7 @@ def _app() -> msal.PublicClientApplication:
 
 
 def login(device_code: bool = False) -> str:
+    """Sign in one more mailbox (the Microsoft page lets you pick or add an account). Returns its sign-in name."""
     app = _app()
     if device_code:
         flow = app.initiate_device_flow(scopes=SCOPES)
@@ -54,24 +55,32 @@ def login(device_code: bool = False) -> str:
         result = app.acquire_token_interactive(SCOPES, prompt="select_account")
     if "access_token" not in result:
         raise AuthError(result.get("error_description", "login failed"))
-    return result.get("id_token_claims", {}).get("preferred_username", "?")
+    return result.get("id_token_claims", {}).get("preferred_username", "?").lower()
 
 
-def signed_in_user() -> str | None:
-    """Cached account name, no network. None if never signed in."""
+def accounts() -> list[str]:
+    """Signed-in sign-in names, from the local cache (no network after first use)."""
     try:
-        accounts = _app().get_accounts()
+        return [a["username"].lower() for a in _app().get_accounts()]
     except AuthError:
-        return None
-    return accounts[0]["username"] if accounts else None
+        return []
 
 
-def _token() -> str:
+def logout(account: str) -> None:
     app = _app()
-    accounts = app.get_accounts()
-    result = app.acquire_token_silent(SCOPES, account=accounts[0]) if accounts else None
+    for a in app.get_accounts():
+        if a["username"].lower() == account.lower():
+            app.remove_account(a)
+
+
+def _token(account: str | None = None) -> str:
+    app = _app()
+    accs = app.get_accounts()
+    if account:
+        accs = [a for a in accs if a["username"].lower() == account.lower()]
+    result = app.acquire_token_silent(SCOPES, account=accs[0]) if accs else None
     if not result or "access_token" not in result:
-        raise AuthError("Not signed in. Run: ./oc login")
+        raise AuthError(f"{account or 'Outlook'} is not signed in (or needs to sign in again).")
     return result["access_token"]
 
 
@@ -96,14 +105,16 @@ def _insert_top(doc: str, html: str) -> str:
 
 
 class Graph:
-    def __init__(self):
-        _token()  # fail fast if not signed in
+    def __init__(self, account: str | None = None):
+        self.account = account
+        _token(account)  # fail fast if not signed in
         self.s = requests.Session()
+        self._me = None
 
     def _req(self, method: str, url: str, **kw):
         url = url if url.startswith("http") else GRAPH + url
         # Token fetched per call: silent refresh keeps long throttled runs alive past the 1h expiry.
-        headers = {"Authorization": f"Bearer {_token()}", **kw.pop("headers", {})}
+        headers = {"Authorization": f"Bearer {_token(self.account)}", **kw.pop("headers", {})}
         for attempt in range(6):
             r = self.s.request(method, url, headers=headers, timeout=30, **kw)
             if r.status_code in RETRY_STATUS:
@@ -122,9 +133,16 @@ class Graph:
             url, q = page.get("@odata.nextLink"), None
         return out
 
+    def profile(self) -> dict:
+        """{'email', 'name', 'account'}: the address mail goes out from."""
+        if self._me is None:
+            me = self._req("GET", "/me", params={"$select": "mail,userPrincipalName,displayName"})
+            self._me = {"email": (me.get("mail") or me["userPrincipalName"]).lower(),
+                        "name": me.get("displayName") or "", "account": me["userPrincipalName"].lower()}
+        return self._me
+
     def my_address(self) -> str:
-        me = self._req("GET", "/me", params={"$select": "mail,userPrincipalName"})
-        return (me.get("mail") or me["userPrincipalName"]).lower()
+        return self.profile()["email"]
 
     def _send_draft(self, draft_id: str) -> None:
         try:
@@ -146,8 +164,11 @@ class Graph:
         self._send_draft(draft["id"])
         return draft["conversationId"]
 
-    def send_in_thread(self, conversation_id: str, to_email: str, to_name: str, html: str, fallback_subject: str) -> str:
-        """Reply on top of our last sent message in the thread, so follow-ups stack like a human's would."""
+    def send_in_thread(self, conversation_id: str, to_email: str, to_name: str, html: str, fallback_subject: str,
+                       strip_pixels: str | None = None) -> str:
+        """Reply on top of our last sent message in the thread, so follow-ups stack like a human's would.
+        strip_pixels: tracker base URL; earlier open pixels are removed from the quoted text so they
+        don't fire again (and misattribute opens) when the follow-up is read."""
         sent = self._list(
             "/me/mailFolders/sentitems/messages",
             filter=f"conversationId eq '{_q(conversation_id)}'",
@@ -158,8 +179,11 @@ class Graph:
         last = max(sent, key=lambda m: m.get("sentDateTime") or "")
         draft = self._req("POST", f"/me/messages/{last['id']}/createReply",
                           headers={"Prefer": 'outlook.body-content-type="html"'})
+        quoted = draft["body"]["content"]
+        if strip_pixels:
+            quoted = re.sub(r"<img[^>]*" + re.escape(strip_pixels) + r"/o/[^>]*>", "", quoted, flags=re.I)
         self._req("PATCH", f"/me/messages/{draft['id']}", json={
-            "body": {"contentType": "HTML", "content": _insert_top(draft["body"]["content"], html)},
+            "body": {"contentType": "HTML", "content": _insert_top(quoted, html)},
             "toRecipients": [_rcpt(to_email, to_name)],
             "ccRecipients": [],
         })

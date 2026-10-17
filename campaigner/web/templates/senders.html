@@ -1,0 +1,115 @@
+{% extends "base.html" %}
+{% from "_macros.html" import pill, tile %}
+{% block title %}Senders{% endblock %}
+{% block main %}
+<header class="head">
+  <div>
+    <h1>Senders &amp; deliverability</h1>
+    <p class="sub">Each campaign sends from one mailbox. Last 30 days per mailbox. Keep bounce rate under 2%.</p>
+  </div>
+  <div class="actions">
+    {% if client_id %}
+      <button class="btn primary" id="login">+ Connect a mailbox</button>
+    {% else %}
+      <span class="meta">Add OC_CLIENT_ID / OC_TENANT_ID to .env and restart first (README → Entra ID).</span>
+    {% endif %}
+  </div>
+</header>
+<p class="meta" id="login-state">
+  {% if login_state.state == "failed" %}Last sign-in failed: {{ login_state.error }}{% endif %}
+</p>
+
+{% if not senders %}
+  <div class="empty">No mailboxes yet. Click <b>Connect a mailbox</b>. On the Microsoft page, pick or add the account you want to send from. Repeat for each address.</div>
+{% endif %}
+
+{% for s in senders %}
+<section class="card">
+  <div class="card-head">
+    <div>
+      <h1 style="font-size:16px">{{ s.email }}
+        {% if s.connected %}<span class="pill good">connected</span>{% else %}<span class="pill critical">sign in again</span>{% endif %}
+        <span class="pill {{ s.health }}">{{ {"good": "healthy", "warning": "watch bounces", "critical": "high bounces", "muted": "not enough data"}[s.health] }}</span>
+      </h1>
+      <div class="meta">{{ s.name }}{% if s.account != s.email %} · signs in as {{ s.account }}{% endif %}
+        · used by {% for c in s.campaigns %}<a href="/campaigns/{{ c.id }}">{{ c.name }}</a>{{ ", " if not loop.last }}{% else %}no campaigns{% endfor %}</div>
+    </div>
+    <div class="actions">
+      <form method="post" action="/senders/{{ s.account }}/cap" class="actions">
+        <label class="meta" for="cap-{{ loop.index }}">Daily cap</label>
+        <input id="cap-{{ loop.index }}" type="number" min="0" name="daily_cap" value="{{ s.daily_cap }}" style="width:80px">
+        <button class="btn sm">Set</button>
+      </form>
+      {% if not s.connected %}<button class="btn sm primary" data-login>Reconnect</button>{% endif %}
+      <form method="post" action="/senders/{{ s.account }}/disconnect" data-confirm="Sign out {{ s.email }}? Campaigns using it pause their emails until you reconnect.">
+        <button class="btn sm danger">Sign out</button>
+      </form>
+    </div>
+  </div>
+  {% set st = s.stats %}
+  <section class="tiles four">
+    {{ tile("Today", s.today ~ " / " ~ s.daily_cap, "sent / cap") }}
+    {{ tile("Sent · 30d", st.sent, st.leads ~ " people") }}
+    {{ tile("Delivered", pct(st.delivery_rate), st.bounced ~ " bounced") }}
+    {{ tile("Bounce rate", pct(st.bounce_rate), "under 2% is healthy") }}
+    {{ tile("Open rate", pct(st.open_rate), "unique, est.") }}
+    {{ tile("Click rate", pct(st.click_rate), st.clicked ~ " people") }}
+    {{ tile("Reply rate", pct(st.reply_rate), st.replied ~ " replied") }}
+    {{ tile("Unsubscribed", st.unsubscribed, pct(st.unsub_rate)) }}
+  </section>
+  {% set h = health.get(s.domain) %}
+  {% if h %}
+  <div class="card-head" style="margin:6px 0 8px">
+    <h2>{{ s.domain }} · authentication</h2>
+    <a class="meta" href="?refresh={{ s.domain }}">checked {{ h.checked_at | ago }} · recheck</a>
+  </div>
+  <div class="tbl-wrap"><table class="t"><tbody>
+    {% for r in h.results %}
+      <tr><td style="width:80px">{{ r.check }}</td><td style="width:110px"><span class="pill {{ r.status }}">{{ {"good": "ok", "warning": "check", "critical": "fix"}[r.status] }}</span></td><td class="meta">{{ r.detail }}</td></tr>
+    {% endfor %}
+  </tbody></table></div>
+  {% endif %}
+</section>
+{% endfor %}
+
+{% if senders %}
+<section class="card">
+  <div class="card-head"><h2>LinkedIn notifications</h2></div>
+  <form method="post" action="/senders/li-mailbox" class="actions">
+    <span>Read LinkedIn accept and reply emails from</span>
+    <select name="account" style="width:auto">
+      {% for s in senders %}<option value="{{ s.account }}" {{ 'selected' if s.account == li_mailbox }}>{{ s.email }}</option>{% endfor %}
+    </select>
+    <button class="btn sm">Save</button>
+  </form>
+  <p class="meta">Pick the inbox your LinkedIn account sends notifications to.</p>
+</section>
+
+<section class="card">
+  <div class="card-head"><h2>How these numbers work</h2></div>
+  <ul class="meta">
+    <li><b>Delivered</b> = people emailed minus hard bounces. Mailbox providers don't tell senders about inbox vs spam placement, so nothing here can measure that.</li>
+    <li><b>Open rate</b> is an estimate. Apple Mail preloads images, which inflates it. Outlook blocks images by default, which deflates it. Hits within 60s of sending, or from known scanners, are excluded.</li>
+    <li><b>Clicks</b> are more reliable. Security scanners (Safe Links, Mimecast) are filtered the same way. A click also counts as an open.</li>
+    <li>Rates are per unique person, over sends that had tracking on.</li>
+  </ul>
+</section>
+{% endif %}
+{% endblock %}
+{% block scripts %}
+<script>
+  $$("#login, [data-login]").forEach((b) => b.addEventListener("click", async () => {
+    try {
+      await api("/api/login");
+      $("#login-state").textContent = "Complete the Microsoft sign-in in your browser. Pick the mailbox to add (\"Use another account\" for a new one).";
+      poll();
+    } catch (e) { toast(e.message, true); }
+  }));
+  async function poll() {
+    const s = await (await fetch("/api/state")).json();
+    if (s.login.state === "waiting") return setTimeout(poll, 1500);
+    if (s.login.state === "done") location.reload();
+    if (s.login.state === "failed") $("#login-state").textContent = "Sign-in failed: " + s.login.error;
+  }
+</script>
+{% endblock %}
