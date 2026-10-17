@@ -32,6 +32,40 @@ def cmd_login(a):
     print(f"Connected mailbox {add_sender(login(device_code=a.device_code))}. Run again to add another.")
 
 
+def cmd_linkedin_login(a):
+    from . import db, linkedin_bot
+
+    with linkedin_bot.PROFILE_LOCK:
+        d = linkedin_bot.ChromeDriver(headless=False)
+        d.open()
+        try:
+            print("A Chrome window opened on LinkedIn. Sign in there yourself (waiting up to 10 minutes)...", flush=True)
+            ok = d.login_interactive()
+        finally:
+            d.close()
+    conn = db.connect()
+    db.set_setting(conn, "li_bot_signed_in", ok)
+    if ok:
+        linkedin_bot.resume(conn)
+    print("Signed in. Turn the bot on in Settings → LinkedIn automation." if ok else "Not signed in (timed out).")
+
+
+def cmd_linkedin_check(a):
+    """Read-only: open a profile in the bot's window and report what the bot can find. Clicks nothing."""
+    import json
+    from . import linkedin_bot
+
+    with linkedin_bot.PROFILE_LOCK:
+        d = linkedin_bot.ChromeDriver(headless=False)
+        d.open()
+        try:
+            print(json.dumps(d.check(a.profile_url), indent=2))
+        except linkedin_bot.BlockedError as e:
+            sys.exit(f"blocked: {e}. Run ./oc linkedin-login")
+        finally:
+            d.close()
+
+
 def cmd_tracker_setup(a):
     """Generate the shared tracking secrets into .env (once) and print the Cloudflare deploy steps."""
     import secrets
@@ -188,6 +222,13 @@ def main() -> None:
     s = sub.add_parser("tick", help="one run now: check replies, queue LinkedIn tasks, send due emails")
     s.add_argument("--dry-run", action="store_true", help="log emails instead of sending")
     s.set_defaults(fn=cmd_tick)
+
+    s = sub.add_parser("linkedin-login", help="sign the LinkedIn bot's Chrome profile in (you type your password)")
+    s.set_defaults(fn=cmd_linkedin_login)
+
+    s = sub.add_parser("linkedin-check", help="read-only test of the bot on one profile (clicks nothing)")
+    s.add_argument("profile_url")
+    s.set_defaults(fn=cmd_linkedin_check)
 
     s = sub.add_parser("tracker-setup", help="generate tracking secrets into .env and print Cloudflare deploy steps")
     s.add_argument("--domain", help="tracking subdomain, e.g. links.yourcompany.com")

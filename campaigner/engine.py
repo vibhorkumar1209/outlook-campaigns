@@ -162,7 +162,8 @@ def stop_enrollment(conn, enrollment_id: int, note: str = "stopped manually", no
     event(conn, e["lead_id"], "stopped", enrollment=e, detail=note, at=now)
 
 
-def _complete_engage(conn, t: dict, e: dict, action: str, comment: str | None, engage: dict, now: datetime) -> None:
+def _complete_engage(conn, t: dict, e: dict, action: str, comment: str | None, engage: dict, now: datetime,
+                     actor: str = "you") -> None:
     """Engage tasks never move the sequence; they only record what you did."""
     if action == "connected":
         set_connected(conn, e["lead_id"], now, source="marked from queue")
@@ -182,10 +183,10 @@ def _complete_engage(conn, t: dict, e: dict, action: str, comment: str | None, e
         detail = did + (f" · {url}" if url else "") + (f"\n{comment}" if commented and comment else "")
         conn.execute("UPDATE tasks SET status = 'done', body = COALESCE(?, body), done_at = ? WHERE id = ?",
                      (comment, iso(now), t["id"]))
-        event(conn, e["lead_id"], "task_done", enrollment=e, channel=ENGAGE, detail=detail[:600], at=now)
+        event(conn, e["lead_id"], "task_done", enrollment=e, channel=ENGAGE, detail=_by(actor, detail[:600]), at=now)
     else:
         conn.execute("UPDATE tasks SET status = 'skipped', done_at = ? WHERE id = ?", (iso(now), t["id"]))
-        event(conn, e["lead_id"], "task_skipped", enrollment=e, channel=ENGAGE, detail="no recent posts", at=now)
+        event(conn, e["lead_id"], "task_skipped", enrollment=e, channel=ENGAGE, detail=_by(actor, "no recent posts"), at=now)
 
 
 def _advance(conn, e: dict, k: int, now: datetime) -> None:
@@ -195,7 +196,7 @@ def _advance(conn, e: dict, k: int, now: datetime) -> None:
 
 
 def complete_task(conn, task_id: int, action: str, body: str | None = None, now: datetime | None = None,
-                  engage: dict | None = None) -> None:
+                  engage: dict | None = None, actor: str = "you") -> None:
     """action: done | skip | connected (lead already connected) | replied (they answered on LinkedIn).
     engage: for Engage tasks, {"post_url", "liked", "commented"}; body is the comment."""
     now = now or utcnow()
@@ -207,7 +208,7 @@ def complete_task(conn, task_id: int, action: str, body: str | None = None, now:
         mark_replied(conn, e["lead_id"], "linkedin", now, enrollment=e, detail="marked from queue")
         return
     if t["channel"] == ENGAGE:
-        _complete_engage(conn, t, e, action, body, engage or {}, now)
+        _complete_engage(conn, t, e, action, body, engage or {}, now, actor)
         return
     if action == "connected":
         set_connected(conn, e["lead_id"], now, source="marked from queue")
@@ -219,7 +220,11 @@ def complete_task(conn, task_id: int, action: str, body: str | None = None, now:
     _advance(conn, e, t["step_pos"], now)
     event(conn, e["lead_id"], "task_done" if status == "done" else "task_skipped", enrollment=e,
           channel=t["channel"], step_pos=t["step_pos"],
-          detail=(body or t["body"])[:300] if status == "done" else action, at=now)
+          detail=_by(actor, (body or t["body"])[:300] if status == "done" else action), at=now)
+
+
+def _by(actor: str, detail: str | None) -> str | None:
+    return f"by bot · {detail}" if actor == "bot" else detail
 
 
 # ---------- mailboxes ----------

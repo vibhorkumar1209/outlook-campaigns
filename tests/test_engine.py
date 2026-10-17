@@ -4,7 +4,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from campaigner import db, engine, importer, stats
+from campaigner import db, engine, importer, linkedin_bot, stats
 from campaigner.db import iso, one, rows, scalar
 from campaigner.graph import AuthError
 from campaigner.render import email_html
@@ -468,6 +468,141 @@ class DraftTest(unittest.TestCase):
             draft_comment("  ", {}, client=c)
         with self.assertRaises(DraftError):
             draft_comment("post", {}, client=self.FakeClient(stop="refusal"))
+
+
+class FakeDriver:
+    def __init__(self, posts=(), connect="sent", message="sent", blocked=False):
+        self.calls, self.posts, self.connect_result, self.message_result, self.blocked = [], list(posts), connect, message, blocked
+
+    def _gate(self):
+        if self.blocked:
+            raise linkedin_bot.BlockedError("LinkedIn showed a security check")
+
+    def open(self): self.calls.append("open")
+    def close(self): self.calls.append("close")
+
+    def view(self, url):
+        self._gate(); self.calls.append(("view", url))
+        return linkedin_bot.Profile(degree="2nd", pending=False)
+
+    def connect(self, url, note):
+        self._gate(); self.calls.append(("connect", url, note)); return self.connect_result
+
+    def message(self, url, text):
+        self._gate(); self.calls.append(("message", url, text)); return self.message_result
+
+    def recent_posts(self, url):
+        self._gate(); self.calls.append(("posts", url)); return self.posts
+
+    def like(self, post): self.calls.append(("like", post.url))
+    def comment(self, post, text): self.calls.append(("comment", post.url, text))
+
+
+class BotTest(Base):
+    def setUp(self):
+        super().setUp()
+        db.set_setting(self.conn, "li_mode", "bot")
+        db.set_setting(self.conn, "li_bot_hours", ["00:00", "23:59"])
+        db.set_setting(self.conn, "li_bot_days", "mon,tue,wed,thu,fri,sat,sun")
+        self.drivers = []
+
+    def bot(self, driver=None, at=MON, draft=None):
+        d = driver or FakeDriver()
+        self.drivers.append(d)
+        linkedin_bot.run(self.conn, lambda: d, now=at, log=self.logs.append, sleep=lambda s: None, draft=draft)
+        return d
+
+    def test_assisted_mode_never_opens_browser(self):
+        db.set_setting(self.conn, "li_mode", "assisted")
+        self.tick(MON)
+        self.assertEqual(self.bot().calls, [])
+        self.assertIsNotNone(self.task("jane@x.com"))
+
+    def test_connect_with_note(self):
+        self.tick(MON)
+        d = self.bot()
+        self.assertIn(("connect", "https://www.linkedin.com/in/janedoe", "Hi Jane"), d.calls)
+        self.assertIsNone(self.task("jane@x.com"))
+        self.assertEqual(one(self.conn, "SELECT li_state FROM leads WHERE email = 'jane@x.com'")["li_state"], "invited")
+        self.assertEqual(self.enr("jane@x.com")["step_pos"], 0)
+        ev = one(self.conn, "SELECT detail FROM events WHERE type = 'task_done' ORDER BY id DESC LIMIT 1")
+        self.assertTrue(ev["detail"].startswith("by bot"))
+
+    def test_already_connected(self):
+        self.tick(MON)
+        self.bot(FakeDriver(connect="already_connected"))
+        self.assertEqual(one(self.conn, "SELECT li_state FROM leads WHERE email = 'jane@x.com'")["li_state"], "connected")
+        self.assertEqual(scalar(self.conn, "SELECT COUNT(*) FROM bot_actions WHERE action = 'connect'"), 0)  # no invite spent
+
+    def test_failures_fall_back_to_you(self):
+        self.conn.execute("UPDATE steps SET channel = 'li_message', condition = 'always' WHERE pos = 0")
+        self.conn.execute("UPDATE leads SET li_state = 'connected'")
+        self.tick(MON)
+        for _ in range(3):
+            self.bot(FakeDriver(message="not_connected"))
+        t = self.task("jane@x.com")
+        self.assertEqual((t["bot_attempts"], t["bot_note"]), (2, "not a 1st-degree connection yet"))
+        self.assertEqual(self.drivers[2].calls, [])  # third run had nothing left to try
+
+    def test_block_pauses_until_resumed(self):
+        self.tick(MON)
+        self.bot(FakeDriver(blocked=True))
+        self.assertIn("security check", db.get_setting(self.conn, "li_bot_paused")["reason"])
+        self.assertEqual(self.bot().calls, [])
+        self.assertIsNotNone(self.task("jane@x.com"))  # still there for you
+        linkedin_bot.resume(self.conn)
+        self.bot()
+        self.assertIsNone(self.task("jane@x.com"))
+
+    def test_caps_and_hours(self):
+        self.tick(MON)
+        db.set_setting(self.conn, "li_bot_caps", {"connect": 0})
+        self.assertEqual(self.bot().calls, [])
+        db.set_setting(self.conn, "li_bot_caps", {"connect": 15})
+        db.set_setting(self.conn, "li_bot_days", "sat")  # MON is outside
+        self.assertEqual(self.bot().calls, [])
+
+    def engage_task(self):
+        self.tick(MON)
+        self.bot()                                   # invite sent -> eligible for engagement
+        self.tick(MON + timedelta(hours=1))
+        return self.task("jane@x.com", "li_engage")
+
+    def test_like_then_approved_comment(self):
+        t = self.engage_task()
+        Post = linkedin_bot.Post
+        self.conn.execute("INSERT INTO engagements (lead_id, post_url, liked, at) VALUES (?, 'https://li/p/new', 1, ?)",
+                          (self.enr("jane@x.com")["lead_id"], iso(MON)))
+        d = FakeDriver(posts=[Post("a", "https://li/p/old", 300, "old", False),
+                              Post("b", "https://li/p/mid", 10, "We cut SaaS spend 22%.", False),
+                              Post("c", "https://li/p/new", 2, "already done", False)])
+        self.bot(d, at=MON + timedelta(hours=2), draft=lambda text, lead: f"Draft about: {text[:12]}")
+        self.assertIn(("like", "https://li/p/mid"), d.calls)
+        t = one(self.conn, "SELECT * FROM tasks WHERE id = ?", t["id"])
+        self.assertEqual((t["status"], t["comment_status"], t["body"]), ("open", "needs_approval", "Draft about: We cut SaaS "))
+        self.assertEqual(self.bot(at=MON + timedelta(hours=3)).calls, [])  # waits for you; nothing else due
+        self.conn.execute("UPDATE tasks SET body = 'Edited comment', comment_status = 'approved' WHERE id = ?", (t["id"],))
+        d2 = self.bot(at=MON + timedelta(hours=4))
+        self.assertIn(("comment", "https://li/p/mid", "Edited comment"), d2.calls)
+        g = one(self.conn, "SELECT * FROM engagements WHERE task_id = ?", t["id"])
+        self.assertEqual((g["post_url"], g["liked"], g["commented"], g["comment"]), ("https://li/p/mid", 1, 1, "Edited comment"))
+
+    def test_no_posts_in_window_and_expiry(self):
+        t = self.engage_task()
+        self.bot(FakeDriver(posts=[linkedin_bot.Post("a", "https://li/p/old", 400, "old", False)]), at=MON + timedelta(hours=2))
+        self.assertEqual(one(self.conn, "SELECT status FROM tasks WHERE id = ?", t["id"])["status"], "skipped")
+        # A draft nobody approves expires into a like-only engagement.
+        self.tick(MON + timedelta(days=8))
+        t2 = self.task("jane@x.com", "li_engage")
+        self.bot(FakeDriver(posts=[linkedin_bot.Post("b", "https://li/p/x", 1, "text", True)]), at=MON + timedelta(days=8))
+        self.bot(at=MON + timedelta(days=12))
+        g = one(self.conn, "SELECT * FROM engagements WHERE task_id = ?", t2["id"])
+        self.assertEqual((g["liked"], g["commented"]), (1, 0))
+
+    def test_parse_age(self):
+        P = linkedin_bot.parse_age_days
+        self.assertEqual([P("3h •"), P("2d • Edited"), P("1w"), P("5mo •"), P("1yr"), P("Just now")],
+                         [3 / 24, 2, 7, 5 * 30.4, 365, None])
 
 
 class RenderTest(unittest.TestCase):

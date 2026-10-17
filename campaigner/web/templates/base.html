@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{% block title %}Outreach{% endblock %} · Outreach</title>
-<link rel="stylesheet" href="/static/app.css">
+<link rel="stylesheet" href="{{ asset('app.css') }}">
 </head>
 <body>
 <div class="shell">
@@ -31,13 +31,16 @@
     {% elif senders_nav | rejectattr("connected") | list and path != "/senders" %}
       <div class="banner">{{ (senders_nav | rejectattr("connected") | map(attribute="email") | join(", ")) }} needs to sign in again. Its emails wait. <a href="/senders">Reconnect →</a></div>
     {% endif %}
+    {% if li_bot.mode == "bot" and li_bot.paused and path != "/settings" %}
+      <div class="banner">LinkedIn bot paused: {{ li_bot.paused.reason }}. LinkedIn tasks are back in your manual queue. <a href="/settings#linkedin-bot">Resolve and resume →</a></div>
+    {% endif %}
     {% if msg %}<div class="flash">{{ msg }}</div>{% endif %}
     {% if err %}<div class="flash err">{{ err }}</div>{% endif %}
     {% block main %}{% endblock %}
   </main>
 </div>
 <div id="tip" class="tip" hidden></div>
-<script src="/static/app.js"></script>
+<script src="{{ asset('app.js') }}"></script>
 {% block scripts %}{% endblock %}
 </body>
 </html>

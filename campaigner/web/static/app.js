@@ -62,6 +62,23 @@ $$(".task").forEach((card) => {
     const btn = e.target.closest("[data-act]");
     if (!btn) return;
     const act = btn.dataset.act, ta = $(".task-body", card);
+    if (act === "approve" || act === "likeonly") {
+      $$("button", card).forEach((b) => (b.disabled = true));
+      try {
+        const r = act === "approve"
+          ? await api(`/api/tasks/${card.dataset.task}/approve`, { comment: ta.value })
+          : await api(`/api/tasks/${card.dataset.task}`, { action: "done", engage: { post_url: card.dataset.post, liked: true } });
+        card.classList.add("gone");
+        setTimeout(() => card.remove(), 250);
+        const badge = $("#nav-tasks .badge");
+        if (badge) badge.textContent = r.open;
+        if (act === "approve") toast("Approved. The bot posts it on its next run.");
+      } catch (err) {
+        toast(err.message, true);
+        $$("button", card).forEach((b) => (b.disabled = false));
+      }
+      return;
+    }
     if (act === "posts") {
       window.open(btn.dataset.posts, "_blank", "noopener");
       return;

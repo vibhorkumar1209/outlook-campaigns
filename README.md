@@ -15,20 +15,17 @@ It runs on your Mac only (`127.0.0.1`). The data lives in `data/app.db`. It leav
 
 ## Setup
 
-### 1. Register an app in Entra ID (5 min; IT may need to do this)
+### 1. Outlook sign-in: nothing to register
 
-1. https://entra.microsoft.com → **App registrations** → **New registration**. Name it `Outlook Campaigns`, choose *this organizational directory only*, then **Register**.
-2. **Authentication** → **Add a platform** → **Mobile and desktop applications** → add `http://localhost`. Under *Advanced settings*, set **Allow public client flows = Yes**.
-3. **API permissions** → Microsoft Graph → **Delegated**: add `Mail.Send` and `Mail.ReadWrite`. If your tenant blocks user consent, an admin must click **Grant admin consent**.
-4. Copy the *Application (client) ID* and *Directory (tenant) ID* from **Overview**.
+The app signs in through Microsoft's own public app, "Microsoft Graph Command Line Tools" (the one Microsoft's Graph PowerShell uses). You just sign in and accept two permissions: send mail and read mail.
 
-```bash
-cp .env.example .env   # paste both IDs
-```
+- Sign-ins show under that app's name in your company's Microsoft 365 logs.
+- If your company blocks that app or requires admin approval, either ask IT to approve it, or register your own app (*App registrations* → new, *Mobile and desktop* platform with `http://localhost`, public client flows on, delegated `Mail.Send` + `Mail.ReadWrite`) and put its IDs in `.env` as `OC_CLIENT_ID` / `OC_TENANT_ID`.
 
 ### 2. Install and run
 
 ```bash
+cp .env.example .env
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 ./oc serve                 # http://127.0.0.1:8765
 ```
@@ -70,6 +67,28 @@ Tracking is per campaign (Settings tab: opens and clicks separately). If the wor
 ### 5. Comment drafts (optional)
 
 Add `ANTHROPIC_API_KEY=...` to `.env` (from platform.claude.com) and restart. Drafts use Claude Opus 5.5 with Anthropic's server-side fallback on, so if a draft request is declined it's re-run on a fallback model. In **Settings → LinkedIn engagement**, describe yourself (role, expertise, tone) so drafts sound like you, and adjust the cadence (default every 7 days) and post window (default 6 months). Without a key, Engage tasks still work; you write the comments yourself.
+
+### 6. LinkedIn bot (optional)
+
+By default you do the LinkedIn steps yourself from the queue. In **bot** mode, a dedicated Chrome window (your installed Google Chrome, with a separate profile) does them:
+- profile views;
+- invites, with your personalized note (or without one if your free account can't add notes);
+- messages to 1st-degree connections;
+- likes on a post from the last 6 months, chosen by the bot;
+- comments, only after you approve them: the bot likes the post and Claude drafts a comment. You approve or edit it on the queue card, and the bot posts it on its next run. Drafts nobody approves expire after 3 days and count as like-only.
+
+Turning it on:
+1. **Settings → LinkedIn automation → Sign in to LinkedIn**, or run `./oc linkedin-login`. A Chrome window opens on LinkedIn; you sign in there yourself. The app never sees your password.
+2. Optionally test one profile read-only (it clicks nothing): `./oc linkedin-check https://www.linkedin.com/in/someone`
+3. Choose **Bot does them**, check the daily caps and hours, then save.
+
+Guardrails:
+- **Daily caps** per action (default 40 views, 15 invites, 20 messages, 25 likes, 8 comments), plus a 7-day invite cap (80; LinkedIn's own limit is about 100).
+- 45–120s between actions, at most 12 actions per run, and only during bot hours (default 09:00–18:00 weekdays).
+- **It never solves CAPTCHAs or security checks.** On a login wall, checkpoint or verification page, the bot pauses, the tasks show up in your manual queue, and a banner explains why. Clear it yourself in the bot's window, then click **Resume**.
+- If an action fails twice (button missing, dialog changed), that task is left to you with the reason.
+
+**Read this first:** this automates your LinkedIn account, which LinkedIn's User Agreement prohibits. Accounts it catches automating can be restricted or banned. LinkedIn also changes its pages often; when it does, actions fail into the manual queue until the selectors in `campaigner/linkedin_bot.py` (`ChromeDriver`) are updated. `./oc linkedin-check` shows what still matches. The Mac must be awake, and a Chrome window appears while the bot works.
 
 ## Workflow
 
@@ -116,6 +135,8 @@ Waits count from the previous step being done or skipped. The first step counts 
 ./oc install / uninstall                              launchd: start at login, keep alive
 ./oc login [--device-code]                            connect a mailbox (repeat per mailbox)
 ./oc tracker-setup [--domain links.you.com]           tracking secrets + Cloudflare deploy steps
+./oc linkedin-login                                   sign the LinkedIn bot's Chrome profile in
+./oc linkedin-check <profile-url>                     read-only test of the bot on one profile
 ./oc tick [--dry-run]                                 one run now
 ./oc demo                                             seed a draft demo campaign
 ```

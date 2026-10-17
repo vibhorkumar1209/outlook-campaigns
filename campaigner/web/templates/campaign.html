@@ -199,4 +199,4 @@
   </form>
 {% endif %}
 {% endblock %}
-{% block scripts %}{% if tab == "sequence" %}<script src="/static/seq.js"></script>{% endif %}{% endblock %}
+{% block scripts %}{% if tab == "sequence" %}<script src="{{ asset('seq.js') }}"></script>{% endif %}{% endblock %}

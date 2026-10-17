@@ -133,6 +133,17 @@ CREATE TABLE IF NOT EXISTS engagements (
     at TEXT NOT NULL
 );
 
+-- Every action the LinkedIn bot takes; drives its daily/weekly caps.
+CREATE TABLE IF NOT EXISTS bot_actions (
+    id INTEGER PRIMARY KEY,
+    action TEXT NOT NULL,                           -- view|connect|message|like|comment
+    task_id INTEGER,
+    lead_id INTEGER,
+    ok INTEGER NOT NULL,
+    detail TEXT,
+    at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS ix_sends_campaign ON sends (campaign_id, step_pos);
 CREATE INDEX IF NOT EXISTS ix_sends_sender ON sends (sender, sent_at);
 CREATE INDEX IF NOT EXISTS ix_events_lead ON events (lead_id, at);
@@ -150,6 +161,12 @@ MIGRATIONS = [
     ("enrollments", "sender", "TEXT"),                             # mailbox that started the thread
     ("leads", "dnc", "INTEGER NOT NULL DEFAULT 0"),                # do not contact (unsubscribed)
     ("campaigns", "li_engage", "INTEGER NOT NULL DEFAULT 1"),      # like/comment on recent posts during the sequence
+    ("tasks", "bot_attempts", "INTEGER NOT NULL DEFAULT 0"),       # LinkedIn bot tries; at the limit it's left to you
+    ("tasks", "bot_note", "TEXT"),
+    ("tasks", "post_url", "TEXT"),                                 # engage: the post the bot picked
+    ("tasks", "post_text", "TEXT"),
+    ("tasks", "bot_liked", "INTEGER NOT NULL DEFAULT 0"),
+    ("tasks", "comment_status", "TEXT NOT NULL DEFAULT ''"),       # ''|needs_approval|approved
 ]
 
 

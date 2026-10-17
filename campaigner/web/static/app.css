@@ -82,7 +82,7 @@ main { padding: 24px 28px 60px; max-width: 1240px; width: 100%; min-width: 0; }
 input, select, textarea { font: inherit; color: var(--text); background: #07141d; border: 1px solid var(--line); border-radius: 6px; padding: 6px 9px; width: 100%; }
 input:focus, select:focus, textarea:focus { outline: 2px solid rgba(52,145,232,.5); outline-offset: 0; border-color: var(--brand); }
 textarea { resize: vertical; line-height: 1.55; }
-input[type=checkbox] { width: auto; accent-color: var(--brand); }
+input[type=checkbox], input[type=radio] { width: auto; accent-color: var(--brand); }
 label.f { display: flex; flex-direction: column; gap: 4px; color: var(--text-2); font-size: 12px; }
 .form-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 12px; }
 .days { display: flex; gap: 10px; flex-wrap: wrap; color: var(--text); }
@@ -157,6 +157,8 @@ details.tv summary { color: var(--muted); cursor: pointer; font-size: 12px; marg
 .count { font-size: 11px; color: var(--muted); text-align: right; margin-top: -6px; }
 .count.warn { color: var(--warning); }
 .task-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+
+.post-quote { margin: 0; padding: 8px 12px; border-left: 3px solid var(--linkedin); background: var(--panel-2); color: var(--text-2); font-size: 12px; white-space: pre-wrap; max-height: 160px; overflow: auto; }
 
 /* sequence builder: flowchart canvas + inspector */
 .builder-bar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 10px; }

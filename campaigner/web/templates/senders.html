@@ -8,11 +8,7 @@
     <p class="sub">Each campaign sends from one mailbox. Last 30 days per mailbox. Keep bounce rate under 2%.</p>
   </div>
   <div class="actions">
-    {% if client_id %}
-      <button class="btn primary" id="login">+ Connect a mailbox</button>
-    {% else %}
-      <span class="meta">Add OC_CLIENT_ID / OC_TENANT_ID to .env and restart first (README → Entra ID).</span>
-    {% endif %}
+    <button class="btn primary" id="login">+ Connect a mailbox</button>
   </div>
 </header>
 <p class="meta" id="login-state">
@@ -20,7 +16,7 @@
 </p>
 
 {% if not senders %}
-  <div class="empty">No mailboxes yet. Click <b>Connect a mailbox</b>. On the Microsoft page, pick or add the account you want to send from. Repeat for each address.</div>
+  <div class="empty">No mailboxes yet. Click <b>Connect a mailbox</b>, sign in with the work account to send from, and accept the permissions (send mail, read mail). Repeat for each address.<br><span class="meta">The sign-in page names the app "Microsoft Graph Command Line Tools". That's Microsoft's own app, so you don't need to register one. If your company requires admin approval, ask IT to approve it or set your own app ID in .env.</span></div>
 {% endif %}
 
 {% for s in senders %}

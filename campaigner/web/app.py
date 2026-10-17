@@ -14,7 +14,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from jinja2 import TemplateError, TemplateSyntaxError
 
-from .. import ai, db, domain_health, engine, importer, stats
+from .. import ai, db, domain_health, engine, importer, linkedin_bot, stats
 from ..db import iso, one, parse, rows, scalar, utcnow
 from ..render import ENV, email_html, lead_context, render_text
 from ..graph import logout
@@ -80,6 +80,8 @@ templates.env.globals.update(
     tone=lambda s: STATUS_TONE.get(s, "muted"),
     channel_label=lambda c: engine.TASK_LABELS.get(c, c),
     pct=lambda v: "–" if v is None else (f"{v:g}%"),
+    # Versioned static URLs so browsers pick up CSS/JS changes immediately.
+    asset=lambda name: f"/static/{name}?v={int((HERE / 'static' / name).stat().st_mtime)}",
     CHANNELS=engine.CHANNELS, CONDITIONS=engine.CONDITIONS, FIELDS=importer.FIELDS,
 )
 
@@ -117,6 +119,7 @@ def page(request: Request, name: str, conn, **ctx):
         "senders_nav": senders,
         "account": next((s["email"] for s in senders if s["connected"]), None),
         "n_connected": sum(s["connected"] for s in senders),
+        "li_bot": linkedin_bot.status(conn),
         "last_tick": db.get_setting(conn, "last_tick"),
         "open_tasks": scalar(conn, OPEN_TASKS_SQL),
         "path": request.url.path,
@@ -179,6 +182,10 @@ def tasks(request: Request, campaign: int | None = None):
     done_today = scalar(conn, "SELECT COUNT(*) FROM events WHERE type = 'task_done' AND at >= ?",
                         iso(utcnow().astimezone(local_tz()).replace(hour=0, minute=0, second=0)))
     camps = rows(conn, "SELECT id, name FROM campaigns WHERE status = 'active' ORDER BY name")
+    bot = linkedin_bot.settings(conn)
+    for t in items:
+        t["bot_will"] = (bot["li_mode"] == "bot" and t["bot_attempts"] < linkedin_bot.MAX_ATTEMPTS
+                         and t["comment_status"] != "needs_approval")
     return page(request, "tasks.html", conn, tasks=items, campaigns=camps, campaign=campaign, done_today=done_today,
                 since=since, ai_ready=bool(os.environ.get("ANTHROPIC_API_KEY")))
 
@@ -193,6 +200,20 @@ async def task_action(task_id: int, request: Request):
         engine.complete_task(conn, task_id, body["action"], body.get("body"), engage=body.get("engage"))
     except ValueError as e:
         raise HTTPException(409, str(e))
+    return {"ok": True, "open": scalar(conn, OPEN_TASKS_SQL)}
+
+
+@app.post("/api/tasks/{task_id}/approve")
+async def task_approve(task_id: int, request: Request):
+    """Approve the bot's comment draft (edited or not); the bot posts it on its next run."""
+    comment = ((await request.json()).get("comment") or "").strip()
+    if not comment:
+        raise HTTPException(422, "Write a comment first, or use Like only")
+    conn = db.connect()
+    cur = conn.execute("UPDATE tasks SET body = ?, comment_status = 'approved' WHERE id = ? AND status = 'open' "
+                       "AND comment_status = 'needs_approval'", (comment, task_id))
+    if not cur.rowcount:
+        raise HTTPException(409, "task already handled")
     return {"ok": True, "open": scalar(conn, OPEN_TASKS_SQL)}
 
 
@@ -554,7 +575,7 @@ def senders(request: Request, refresh: str | None = None):
             health[d] = {"checked_at": None, "results": [{"check": "DNS", "status": "warning", "detail": str(e)}]}
     return page(request, "senders.html", conn, senders=items, health=health,
                 li_mailbox=db.get_setting(conn, "li_mailbox") or engine.default_sender(conn),
-                login_state=runner.login_state, client_id=bool(os.environ.get("OC_CLIENT_ID")))
+                login_state=runner.login_state)
 
 
 @app.post("/senders/{account}/cap")
@@ -594,6 +615,8 @@ def settings(request: Request):
     tracker = Tracker.from_env()
     return page(request, "settings.html", conn, logs=list(runner.logs)[-120:], busy=runner.busy,
                 eng=engine.engage_settings(conn), voice=db.get_setting(conn, "comment_voice", ""),
+                bot=linkedin_bot.settings(conn), bot_status=linkedin_bot.status(conn),
+                bot_used=linkedin_bot.used_today(conn, utcnow()), li_login_state=runner.li_login_state,
                 ai_ready=bool(os.environ.get("ANTHROPIC_API_KEY")),
                 tracker=tracker, tracker_error=tracker.health() if tracker else None,
                 track_cursor=db.get_setting(conn, "track_cursor", 0),
@@ -610,6 +633,38 @@ def settings_engagement(engage_every_days: int = Form(7), engage_lookback_months
     return back("/settings", msg="Engagement settings saved")
 
 
+@app.post("/settings/linkedin-bot")
+async def settings_linkedin_bot(request: Request):
+    f = await request.form()
+    conn = db.connect()
+    num = lambda k, d, hi: min(max(int(f.get(k) or d), 0), hi)  # noqa: E731
+    db.set_setting(conn, "li_mode", "bot" if f.get("li_mode") == "bot" else "assisted")
+    db.set_setting(conn, "li_bot_caps", {a: num(f"cap_{a}", 0, 200) for a in ("view", "connect", "message", "like", "comment")})
+    db.set_setting(conn, "li_bot_week_invites", num("week_invites", 80, 100))
+    gmin = num("gap_min", 45, 3600)
+    db.set_setting(conn, "li_bot_gap", [gmin, max(gmin, num("gap_max", 120, 3600))])
+    start, end = str(f.get("hours_start") or "09:00"), str(f.get("hours_end") or "18:00")
+    if start >= end:
+        return back("/settings", err="Bot hours must end after they start")
+    db.set_setting(conn, "li_bot_hours", [start, end])
+    days = [d for d in f.getlist("days") if d in engine.DAYS]
+    db.set_setting(conn, "li_bot_days", ",".join(days) or "mon,tue,wed,thu,fri")
+    return back("/settings", msg="LinkedIn bot settings saved")
+
+
+@app.post("/api/linkedin/login")
+def linkedin_login():
+    runner.start_li_login()
+    return {"ok": True}
+
+
+@app.post("/api/linkedin/resume")
+def linkedin_resume():
+    linkedin_bot.resume(db.connect())
+    runner.run_async()
+    return {"ok": True}
+
+
 @app.post("/api/run")
 def run_now():
     runner.run_async()
@@ -618,12 +673,11 @@ def run_now():
 
 @app.post("/api/login")
 def start_login():
-    if not os.environ.get("OC_CLIENT_ID"):
-        raise HTTPException(400, "OC_CLIENT_ID missing in .env, see README")
     runner.start_login()
     return {"ok": True}
 
 
 @app.get("/api/state")
 def state():
-    return {"busy": runner.busy, "login": runner.login_state, "logs": list(runner.logs)[-120:]}
+    return {"busy": runner.busy, "login": runner.login_state, "li_login": runner.li_login_state,
+            "logs": list(runner.logs)[-120:]}

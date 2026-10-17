@@ -27,16 +27,28 @@ class GraphError(RuntimeError):
     pass
 
 
+# Microsoft's own public client ("Microsoft Graph Command Line Tools", used by Graph PowerShell), so no app
+# registration is needed. Sign-ins show under that name in the org's logs; set OC_CLIENT_ID to use your own app.
+DEFAULT_CLIENT_ID = "14d82eec-204b-4c2f-b7e8-296a70dab67e"
+PLACEHOLDER_ID = "00000000-0000-0000-0000-000000000000"
+
+
+def _env_id(name: str) -> str | None:
+    v = os.environ.get(name, "").strip()
+    return v if v and v != PLACEHOLDER_ID else None
+
+
+def client_id() -> str:
+    return _env_id("OC_CLIENT_ID") or DEFAULT_CLIENT_ID
+
+
 # One instance per process: construction does network authority discovery.
 @lru_cache(maxsize=1)
 def _app() -> msal.PublicClientApplication:
-    client_id = os.environ.get("OC_CLIENT_ID")
-    if not client_id:
-        raise AuthError("OC_CLIENT_ID not set. Put it in outlook-campaigns/.env (see README).")
-    tenant = os.environ.get("OC_TENANT_ID", "organizations")
+    tenant = _env_id("OC_TENANT_ID") or "organizations"
     os.makedirs(os.path.dirname(CACHE_PATH), exist_ok=True)
     return msal.PublicClientApplication(
-        client_id,
+        client_id(),
         authority=f"https://login.microsoftonline.com/{tenant}",
         token_cache=PersistedTokenCache(build_encrypted_persistence(CACHE_PATH)),
     )
