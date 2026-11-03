@@ -1,0 +1,128 @@
+{% extends "base.html" %}
+{% block title %}Settings{% endblock %}
+{% block main %}
+<header class="head"><div><h1>Settings</h1></div></header>
+<div class="grid2">
+  <div class="stack-y">
+    <section class="card">
+      <div class="card-head"><h2>Mailboxes</h2><a href="/senders">manage →</a></div>
+      <p>{{ n_connected }} connected. Add, reconnect and check deliverability on the <a href="/senders">Senders</a> page.</p>
+    </section>
+
+    <section class="card">
+      <div class="card-head"><h2>Open &amp; click tracking</h2></div>
+      {% if not tracker %}
+        <p><span class="pill muted">not set up</span> Emails go out without pixels or tracked links. Reply and bounce tracking still work.</p>
+        <p class="meta">To turn it on, deploy the Cloudflare Worker in <code>tracker/</code> and set <code>OC_TRACK_URL</code>, <code>OC_TRACK_KEY</code> and <code>OC_TRACK_SECRET</code> in <code>.env</code>. Then restart. Run <code>./oc tracker-setup</code> for the exact steps.</p>
+      {% elif tracker_error %}
+        <p><span class="pill critical">problem</span> {{ tracker.base }}: {{ tracker_error }}</p>
+        <p class="meta">Emails still send; open/click links are already signed and will record once the worker answers.</p>
+      {% else %}
+        <p><span class="pill good">working</span> {{ tracker.base }}</p>
+        <p class="meta">Events pulled up to #{{ track_cursor }}. Per campaign on/off: campaign → Settings.</p>
+      {% endif %}
+    </section>
+
+    <section class="card" id="linkedin-bot">
+      <div class="card-head"><h2>LinkedIn automation</h2>
+        {% if bot.li_mode == "bot" %}{% if bot_status.paused %}<span class="pill critical">paused</span>{% else %}<span class="pill good">bot on</span>{% endif %}{% else %}<span class="pill muted">assisted</span>{% endif %}
+      </div>
+      {% if bot_status.paused %}
+        <div class="flash err">Paused: {{ bot_status.paused.reason }} ({{ bot_status.paused.at | ago }}). Open the bot's window with <b>Sign in to LinkedIn</b>, clear whatever LinkedIn is asking for yourself, then resume.
+          <div style="margin-top:8px"><button class="btn sm primary" id="li-resume">Resume bot</button></div></div>
+      {% endif %}
+      <p class="meta">In <b>bot</b> mode a dedicated Chrome window does the LinkedIn queue for you: profile views, invites with notes, messages to connections, and likes. Comments are drafted and wait for your approval. The bot never sees your password and never solves security checks; if LinkedIn asks for one, it pauses and the tasks come back to you. This automates your account against LinkedIn's terms, and LinkedIn may restrict accounts it catches. Keep the caps low.</p>
+      <p>
+        <button class="btn" id="li-login">{{ "Re-open LinkedIn sign-in" if bot_status.signed_in else "Sign in to LinkedIn" }}</button>
+        <span class="meta" id="li-login-state">{% if bot_status.signed_in %}Bot profile signed in.{% else %}Opens a Chrome window: sign in there yourself (one time).{% endif %}
+          {% if li_login_state.state == "failed" %} Last attempt failed: {{ li_login_state.error }}{% endif %}</span>
+      </p>
+      <form method="post" action="/settings/linkedin-bot">
+        <div class="days" style="margin-bottom:12px">
+          <label><input type="radio" name="li_mode" value="assisted" {{ 'checked' if bot.li_mode != 'bot' }}> Assisted (you do LinkedIn steps)</label>
+          <label><input type="radio" name="li_mode" value="bot" {{ 'checked' if bot.li_mode == 'bot' }}> Bot does them</label>
+        </div>
+        <div class="meta" style="margin-bottom:6px">Daily caps (0 turns an action off). Used today:
+          {% for a in ["view", "connect", "message", "like", "comment"] %}{{ a }} {{ bot_used.get(a, 0) }}{{ " · " if not loop.last }}{% endfor %}</div>
+        <div class="form-grid">
+          <label class="f">Profile views<input type="number" min="0" max="200" name="cap_view" value="{{ bot.li_bot_caps.view }}"></label>
+          <label class="f">Invites<input type="number" min="0" max="200" name="cap_connect" value="{{ bot.li_bot_caps.connect }}"></label>
+          <label class="f">Messages<input type="number" min="0" max="200" name="cap_message" value="{{ bot.li_bot_caps.message }}"></label>
+          <label class="f">Likes<input type="number" min="0" max="200" name="cap_like" value="{{ bot.li_bot_caps.like }}"></label>
+          <label class="f">Comments (approved)<input type="number" min="0" max="200" name="cap_comment" value="{{ bot.li_bot_caps.comment }}"></label>
+          <label class="f">Invites per 7 days (LinkedIn allows ~100)<input type="number" min="0" max="100" name="week_invites" value="{{ bot.li_bot_week_invites }}"></label>
+          <label class="f">Gap between actions, min s<input type="number" min="0" name="gap_min" value="{{ bot.li_bot_gap[0] }}"></label>
+          <label class="f">Gap between actions, max s<input type="number" min="0" name="gap_max" value="{{ bot.li_bot_gap[1] }}"></label>
+          <label class="f">Bot hours start<input type="time" name="hours_start" value="{{ bot.li_bot_hours[0] }}"></label>
+          <label class="f">Bot hours end<input type="time" name="hours_end" value="{{ bot.li_bot_hours[1] }}"></label>
+        </div>
+        <div class="days" style="margin:12px 0">
+          {% for d in ["mon", "tue", "wed", "thu", "fri", "sat", "sun"] %}
+            <label><input type="checkbox" name="days" value="{{ d }}" {{ 'checked' if d in bot.li_bot_days }}> {{ d }}</label>
+          {% endfor %}
+        </div>
+        <button class="btn">Save</button>
+      </form>
+    </section>
+
+    <section class="card">
+      <div class="card-head"><h2>LinkedIn engagement</h2></div>
+      <p class="meta">For leads whose invite or first email has gone out, the queue gets a <i>Like + comment</i> task for one of their recent posts. It stops when they reply on any channel, and campaigns can turn it off in their Settings tab.</p>
+      <form method="post" action="/settings/engagement">
+        <div class="form-grid">
+          <label class="f">One touch per person every (days)<input type="number" min="1" max="60" name="engage_every_days" value="{{ eng.engage_every_days }}"></label>
+          <label class="f">Only posts from the last (months)<input type="number" min="1" max="12" name="engage_lookback_months" value="{{ eng.engage_lookback_months }}"></label>
+        </div>
+        <label class="f" style="margin-top:12px">About you, for comment drafts (role, what you know well, tone)
+          <textarea name="comment_voice" rows="3" placeholder="e.g. I advise mid-size companies on IT spend. Direct, practical, no jargon.">{{ voice }}</textarea>
+        </label>
+        <p class="meta">Drafts: {% if ai_ready %}<span class="pill good">Claude ready</span>{% else %}<span class="pill muted">off</span> add <code>ANTHROPIC_API_KEY</code> to <code>.env</code> and restart{% endif %}. You always review and post the comment yourself.</p>
+        <button class="btn">Save</button>
+      </form>
+    </section>
+
+    <section class="card">
+      <div class="card-head"><h2>LinkedIn detection</h2></div>
+      <p>Accepts and replies are read from LinkedIn's notification emails (choose the inbox on <a href="/senders">Senders</a>). In LinkedIn → Settings → Communications → Email, keep these on:</p>
+      <ul class="meta"><li>Invitations: <i>invitation accepted</i></li><li>Messages: <i>new messages</i></li></ul>
+      <p class="meta">Detection matches the lead's full name in the notification. If it misses one, use <i>Mark connected</i> or <i>They replied</i>.</p>
+    </section>
+
+    <section class="card">
+      <div class="card-head"><h2>Scheduler</h2></div>
+      <p>The dashboard runs everything every {{ tick_minutes }} min while it's open. To start it at login and keep it running:</p>
+      <pre class="log">./oc install</pre>
+      <p class="meta">Emails respect each campaign's send window and caps. The Mac has to be awake.</p>
+    </section>
+  </div>
+
+  <section class="card">
+    <div class="card-head"><h2>Run log</h2><div class="actions"><button class="btn" data-run>Run now</button></div></div>
+    <pre class="log" id="log">{{ logs | join("\n") or "No runs yet in this session." }}</pre>
+  </section>
+</div>
+{% endblock %}
+{% block scripts %}
+<script>
+  $("#li-resume")?.addEventListener("click", async () => {
+    try { await api("/api/linkedin/resume"); location.reload(); } catch (e) { toast(e.message, true); }
+  });
+  $("#li-login")?.addEventListener("click", async () => {
+    try {
+      await api("/api/linkedin/login");
+      $("#li-login-state").textContent = "A Chrome window opened on LinkedIn. Sign in there; this page updates when you're in.";
+      pollLi();
+    } catch (e) { toast(e.message, true); }
+  });
+  async function pollLi() {
+    const s = await (await fetch("/api/state")).json();
+    if (s.li_login.state === "waiting") return setTimeout(pollLi, 2000);
+    if (s.li_login.state === "done") location.reload();
+    if (s.li_login.state === "failed") $("#li-login-state").textContent = "Sign-in failed: " + s.li_login.error;
+  }
+  setInterval(async () => {
+    const s = await (await fetch("/api/state")).json();
+    $("#log").textContent = s.logs.join("\n") || "No runs yet in this session.";
+  }, 5000);
+</script>
+{% endblock %}

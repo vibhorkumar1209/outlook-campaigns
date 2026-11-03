@@ -1,0 +1,80 @@
+{% extends "base.html" %}
+{% from "_macros.html" import pill, chip, lead_name %}
+{% block title %}{{ lead_name(l) }}{% endblock %}
+{% block main %}
+{% set LABELS = {
+  "enrolled": "Enrolled", "sent": "Email sent", "task_created": "Task queued", "task_done": "Done",
+  "task_skipped": "Task skipped", "step_skipped": "Step skipped", "connected": "Connected on LinkedIn",
+  "reply": "Replied", "bounce": "Bounced", "stopped": "Stopped", "error": "Error",
+  "open": "Opened email", "click": "Clicked link", "unsubscribe": "Unsubscribed"} %}
+<header class="head">
+  <div>
+    <h1>{{ lead_name(l) }} {% if l.li_state != "none" %}{{ pill(l.li_state) }}{% endif %}{% if l.dnc %} <span class="pill critical">do not contact</span>{% endif %}</h1>
+    <p class="sub">{{ l.title }}{% if l.title and l.company %} · {% endif %}{{ l.company }}</p>
+  </div>
+  <div class="actions">
+    {% if l.linkedin_url %}<a class="btn" href="{{ l.linkedin_url }}" target="_blank" rel="noopener">LinkedIn ↗</a>{% endif %}
+    {% if l.li_state != "connected" and l.linkedin_url %}<button class="btn" data-lead-act="connected" data-lead="{{ l.id }}">Mark connected</button>{% endif %}
+    <button class="btn" data-lead-act="replied" data-channel="linkedin" data-lead="{{ l.id }}" data-ask="Mark as replied on LinkedIn? This stops all their sequences.">Replied on LinkedIn</button>
+    <button class="btn" data-lead-act="replied" data-channel="email" data-lead="{{ l.id }}" data-ask="Mark as replied by email? This stops all their sequences.">Replied by email</button>
+    {% if not l.dnc %}<button class="btn danger" data-lead-act="dnc" data-lead="{{ l.id }}" data-ask="Mark do-not-contact? Stops every campaign now and for future imports.">Do not contact</button>{% endif %}
+    <button class="btn danger" data-lead-act="stop_all" data-lead="{{ l.id }}" data-ask="Stop every campaign for this lead?">Stop all</button>
+  </div>
+</header>
+
+<div class="grid2">
+  <section class="card">
+    <div class="card-head"><h2>Timeline</h2></div>
+    {% if events %}
+    <ul class="tl">
+      {% for ev in events %}
+        {% set ic = "good" if ev.type in ("reply", "connected") else ("critical" if ev.type in ("bounce", "error", "unsubscribe") else ("email" if ev.channel == "email" else ("linkedin" if ev.channel else ""))) %}
+        <li>
+          <span class="ic {{ ic }}"></span>
+          <div>
+            {{ LABELS.get(ev.type, ev.type) }}
+            {% if ev.channel and ev.type not in ("reply", "connected", "open", "click", "unsubscribe") %} · {{ chip(ev.channel) }}{% endif %}
+            {% if ev.type == "reply" %} via {{ ev.channel }}{% endif %}
+            {% if ev.step_pos is not none %}<span class="meta"> · step {{ ev.step_pos + 1 }}</span>{% endif %}
+            {% if ev.campaign %}<span class="meta"> · {{ ev.campaign }}</span>{% endif %}
+            {% if ev.detail %}<div class="detail">{{ ev.detail }}</div>{% endif %}
+          </div>
+          <span class="meta" title="{{ ev.at | local('%Y-%m-%d %H:%M') }}">{{ ev.at | local }}</span>
+        </li>
+      {% endfor %}
+    </ul>
+    {% else %}<div class="empty">Nothing yet.</div>{% endif %}
+  </section>
+
+  <div class="stack-y">
+    <section class="card">
+      <div class="card-head"><h2>Campaigns</h2></div>
+      {% if enrollments %}
+      <table class="t"><tbody>
+        {% for e in enrollments %}
+          <tr>
+            <td><a href="/campaigns/{{ e.campaign_id }}">{{ e.campaign }}</a><div class="meta">step {{ e.step_pos + 1 if e.step_pos >= 0 else 0 }}/{{ e.n_steps }}{% if e.note %} · {{ e.note }}{% endif %}</div></td>
+            <td>{{ pill(e.status) }}</td>
+            <td>{% if e.status in ("pending", "active", "done") %}<button class="btn sm ghost" data-stop="{{ e.id }}">Stop</button>{% endif %}</td>
+          </tr>
+        {% endfor %}
+      </tbody></table>
+      {% else %}<div class="empty">Not in any campaign.</div>{% endif %}
+    </section>
+
+    <section class="card">
+      <div class="card-head"><h2>Details</h2></div>
+      <div class="stack-y" style="gap:10px">
+        <label class="f">Email<input id="lead-email" value="{{ l.email or '' }}"></label>
+        <label class="f">LinkedIn URL<input id="lead-li" value="{{ l.linkedin_url or '' }}" placeholder="https://www.linkedin.com/in/..."></label>
+        <div><button class="btn" data-lead-act="update" data-lead="{{ l.id }}">Save</button></div>
+      </div>
+      {% if extras %}
+      <dl class="kv" style="margin-top:14px">
+        {% for k, v in extras.items() %}<dt>{{ k }}</dt><dd>{{ v }}</dd>{% endfor %}
+      </dl>
+      {% endif %}
+    </section>
+  </div>
+</div>
+{% endblock %}

@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% block title %}Map columns{% endblock %}
+{% block main %}
+<header class="head"><div><h1>Map columns</h1><p class="sub">{{ filename }} · {{ total }} rows. Guesses are pre-filled; check them.</p></div></header>
+<form method="post" action="/import/commit">
+  <input type="hidden" name="token" value="{{ token }}">
+  <section class="card">
+    <div class="form-grid">
+      {% for f, label in FIELDS.items() %}
+        <label class="f">{{ label }}
+          <select name="map_{{ f }}">
+            <option value="">(none)</option>
+            {% for h in headers %}<option value="{{ h }}" {{ 'selected' if mapping[f] == h }}>{{ h }}</option>{% endfor %}
+          </select>
+        </label>
+      {% endfor %}
+    </div>
+    <p class="meta">Full name is split into first and last when those aren't mapped.</p>
+  </section>
+
+  <section class="card">
+    <div class="card-head"><h2>First rows</h2></div>
+    <div class="tbl-wrap"><table class="t">
+      <thead><tr>{% for h in headers %}<th>{{ h }}</th>{% endfor %}</tr></thead>
+      <tbody>{% for r in sample %}<tr>{% for h in headers %}<td>{{ r[h] }}</td>{% endfor %}</tr>{% endfor %}</tbody>
+    </table></div>
+  </section>
+
+  <section class="card">
+    <div class="form-grid">
+      <label class="f">Enroll into
+        <select name="campaign_id" onchange="document.getElementById('newc').hidden = this.value !== 'new'">
+          <option value="new" {{ 'selected' if not campaign_id }}>New campaign…</option>
+          {% for c in campaigns %}<option value="{{ c.id }}" {{ 'selected' if campaign_id == c.id }}>{{ c.name }} ({{ c.status }})</option>{% endfor %}
+          <option value="">Don't enroll, just save leads</option>
+        </select>
+      </label>
+      <label class="f" id="newc" {{ 'hidden' if campaign_id }}>New campaign name<input name="new_campaign" placeholder="{{ filename.rsplit('.', 1)[0] }}"></label>
+    </div>
+    <p class="meta">Enrolling into a live campaign starts those leads on the next run.</p>
+    <button class="btn primary">Import {{ total }} rows</button>
+  </section>
+</form>
+{% endblock %}

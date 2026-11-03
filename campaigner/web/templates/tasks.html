@@ -1,0 +1,89 @@
+{% extends "base.html" %}
+{% from "_macros.html" import chip, lead_name %}
+{% block title %}LinkedIn queue{% endblock %}
+{% block main %}
+<header class="head">
+  <div>
+    <h1>LinkedIn queue <span class="meta">· <span id="tasks-left">{{ tasks | length }}</span> open · {{ done_today }} done today</span></h1>
+    <p class="sub">Copy &amp; open → paste in LinkedIn → send → Done. Invite accepts and replies are picked up from LinkedIn's notification emails.</p>
+  </div>
+  <form class="actions" method="get">
+    <select name="campaign" onchange="this.form.submit()">
+      <option value="">All live campaigns</option>
+      {% for c in campaigns %}<option value="{{ c.id }}" {{ 'selected' if campaign == c.id }}>{{ c.name }}</option>{% endfor %}
+    </select>
+  </form>
+</header>
+
+{% if not tasks %}
+  <div class="empty">Queue empty. Tasks show up here when a live sequence reaches a LinkedIn step.</div>
+{% endif %}
+
+<div class="tasks">
+{% for t in tasks %}
+  <article class="task card" data-task="{{ t.id }}" data-url="{{ t.linkedin_url }}" data-post="{{ t.post_url or '' }}">
+    <div class="task-head">
+      <div class="avatar">{{ (t.first_name[:1] ~ t.last_name[:1]) | upper or "?" }}</div>
+      <div class="who">
+        <a href="/leads/{{ t.lead_id }}" class="name">{{ lead_name(t) }}</a>
+        <div class="meta">{{ t.title }}{% if t.title and t.company %} · {% endif %}{{ t.company }}</div>
+      </div>
+      <div class="task-tags">
+        {{ chip(t.channel) }}
+        <span class="meta">{{ t.campaign }}{% if t.step_pos >= 0 %} · step {{ t.step_pos + 1 }}/{{ t.n_steps }}{% else %} · weekly touch{% endif %} · {{ t.created_at | ago }}</span>
+      </div>
+    </div>
+    {% if t.bot_will %}
+      <div class="meta"><span class="pill info">bot will do this</span> on its next run within bot hours. You can still do it yourself below.</div>
+    {% elif t.bot_attempts >= 2 %}
+      <div class="meta"><span class="pill warning">bot couldn't</span> {{ t.bot_note }}. Over to you.</div>
+    {% endif %}
+    {% if t.comment_status == "needs_approval" %}
+      <div class="meta">The bot liked this post{% if t.post_url %} (<a href="{{ t.post_url }}" target="_blank" rel="noopener">open</a>){% endif %}. Approve a comment and it posts it next run; unapproved drafts expire after 3 days.</div>
+      {% if t.post_text %}<blockquote class="post-quote">{{ t.post_text[:600] }}{% if t.post_text | length > 600 %}…{% endif %}</blockquote>{% endif %}
+      <textarea class="task-body" rows="3" placeholder="Write the comment to post" aria-label="Comment">{{ t.body }}</textarea>
+    {% elif t.channel == "li_engage" %}
+      <div class="meta">Like (and ideally comment on) one of their posts from <b>after {{ since.strftime("%b %d, %Y") }}</b> that you haven't engaged with. If they haven't posted since then, click <i>No recent posts</i>.</div>
+      {% if t.engaged %}
+        <div class="meta">Already engaged:
+          {% for g in t.engaged %}{% if g.post_url %}<a href="{{ g.post_url }}" target="_blank" rel="noopener">{{ g.at | local("%b %d") }}</a>{% else %}{{ g.at | local("%b %d") }}{% endif %}{{ ", " if not loop.last }}{% endfor %}
+        </div>
+      {% endif %}
+      <input class="post-url" placeholder="Post URL (optional; prevents repeats)" aria-label="Post URL">
+      <textarea class="post-text" rows="3" placeholder="Paste the post's text here to draft a comment" aria-label="Post text"></textarea>
+      <textarea class="task-body" rows="3" placeholder="Your comment (optional)" aria-label="Comment"></textarea>
+      <div class="days">
+        <label><input type="checkbox" class="did-like" checked> Liked</label>
+        <label><input type="checkbox" class="did-comment"> Commented</label>
+      </div>
+    {% elif t.channel != "li_view" %}
+      <textarea class="task-body" rows="4" aria-label="Message text">{{ t.body }}</textarea>
+      {% if t.channel == "li_connect" %}<div class="count" data-count></div>{% endif %}
+    {% else %}
+      <div class="meta">Visit their profile so it shows up in their "who viewed" list.</div>
+    {% endif %}
+    <div class="task-actions">
+    {% if t.comment_status == "needs_approval" %}
+      <button class="btn primary" data-act="approve">Approve comment</button>
+      <button class="btn" data-act="likeonly">Like only</button>
+      <button class="btn ghost" data-act="replied">They replied</button>
+    {% elif t.channel == "li_engage" %}
+      <button class="btn primary" data-act="posts" data-posts="{{ t.posts_url }}">Open their recent posts</button>
+      {% if ai_ready %}<button class="btn" data-act="draft">Draft comment</button>
+      {% else %}<button class="btn" disabled title="Add ANTHROPIC_API_KEY to .env to enable">Draft comment</button>{% endif %}
+      <button class="btn" data-act="copy">Copy comment</button>
+      <button class="btn" data-act="done">Done</button>
+      <button class="btn ghost" data-act="skip">No recent posts</button>
+      <button class="btn ghost" data-act="replied">They replied</button>
+    {% else %}
+      <button class="btn primary" data-act="open">{{ "Open profile" if t.channel == "li_view" else "Copy & open profile" }}</button>
+      <button class="btn" data-act="done">Done</button>
+      <button class="btn ghost" data-act="skip">Skip</button>
+      {% if t.channel == "li_connect" %}<button class="btn ghost" data-act="connected">Already connected</button>{% endif %}
+      <button class="btn ghost" data-act="replied">They replied</button>
+    {% endif %}
+    </div>
+  </article>
+{% endfor %}
+</div>
+{% endblock %}

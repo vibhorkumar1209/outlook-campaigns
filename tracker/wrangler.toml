@@ -1,0 +1,15 @@
+name = "outreach-tracker"
+main = "src/index.js"
+compatibility_date = "2025-09-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "outreach-tracker"
+database_id = "REPLACE_WITH_DATABASE_ID"   # from: npx wrangler d1 create outreach-tracker
+
+# Drop events older than 180 days, nightly.
+[triggers]
+crons = ["0 3 * * *"]
+
+# Your tracking subdomain. The domain must be on Cloudflare (README → Tracking).
+# routes = [{ pattern = "links.yourdomain.com", custom_domain = true }]

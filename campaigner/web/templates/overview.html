@@ -1,0 +1,99 @@
+{% extends "base.html" %}
+{% from "_macros.html" import pill, tile, lead_name %}
+{% block title %}Overview{% endblock %}
+{% block main %}
+<header class="head">
+  <div><h1>Overview</h1><p class="sub">Email through Outlook, LinkedIn through your queue. A reply on either channel stops the lead.</p></div>
+  <div class="actions">
+    <button class="btn" data-run>Run now</button>
+    <a class="btn primary" href="/campaigns">New campaign</a>
+  </div>
+</header>
+
+<section class="tiles four">
+  {{ tile("Live campaigns", o.active_campaigns) }}
+  {{ tile("In sequence", o.in_sequence, "leads not finished") }}
+  {{ tile("Emails today", o.emails_today) }}
+  {% set tasks_sub %}<a href="/tasks">open queue →</a>{% endset %}
+  {{ tile("LinkedIn to do", o.tasks_open, tasks_sub) }}
+  {{ tile("Open rate · 30d", pct(em.open_rate), em.opened ~ " people · estimate") }}
+  {{ tile("Click rate · 30d", pct(em.click_rate), em.clicked ~ " people") }}
+  {{ tile("Replies · 7d", o.replies_week) }}
+  {{ tile("Reply rate", (o.reply_rate ~ "%") if o.reply_rate is not none else "–", "of contacted leads") }}
+</section>
+
+<section class="card">
+  <div class="card-head">
+    <h2>Activity · last 14 days</h2>
+    <div class="legend"><span><i class="sw email"></i>Emails sent</span><span><i class="sw linkedin"></i>LinkedIn actions</span></div>
+  </div>
+  <div class="bars" role="img" aria-label="Daily emails sent and LinkedIn actions over the last 14 days">
+    <div class="gl" style="top:0"><span>{{ peak }}</span></div>
+    {% if peak > 1 %}<div class="gl" style="top:calc((100% - 22px) / 2)"><span>{{ (peak / 2) | round(1) | replace(".0", "") }}</span></div>{% endif %}
+    <div class="base"></div>
+    {% for d in act %}
+      {% set total = d.email + d.linkedin %}
+      <div class="col" data-tip="{{ d.day.strftime('%a %b %d') }} · email {{ d.email }} · LinkedIn {{ d.linkedin }} · replies {{ d.replies }}">
+        {% if total %}
+        <div class="stack" style="height: {{ (100 * total / peak) | round(1) }}%">
+          {% if d.linkedin %}<div class="seg linkedin" style="flex: {{ d.linkedin }}"></div>{% endif %}
+          {% if d.email %}<div class="seg email" style="flex: {{ d.email }}"></div>{% endif %}
+        </div>
+        {% endif %}
+        <div class="x">{{ d.day.day }}</div>
+      </div>
+    {% endfor %}
+  </div>
+  <details class="tv"><summary>Table view</summary>
+    <div class="tbl-wrap"><table class="t">
+      <thead><tr><th>Day</th><th class="num">Emails</th><th class="num">LinkedIn</th><th class="num">Replies</th></tr></thead>
+      <tbody>{% for d in act | reverse %}<tr><td>{{ d.day.strftime('%a %b %d') }}</td><td class="num">{{ d.email }}</td><td class="num">{{ d.linkedin }}</td><td class="num">{{ d.replies }}</td></tr>{% endfor %}</tbody>
+    </table></div>
+  </details>
+</section>
+
+<div class="grid2" style="margin-top:16px">
+  <section class="card">
+    <div class="card-head"><h2>Campaigns</h2><a href="/campaigns">all →</a></div>
+    {% if campaigns %}
+    <div class="tbl-wrap"><table class="t">
+      <thead><tr><th>Name</th><th>Status</th><th class="num">Leads</th><th class="num">Contacted</th><th class="num">Open</th><th class="num">Click</th><th class="num">Replied</th><th class="num">Queue</th></tr></thead>
+      <tbody>
+      {% for c in campaigns[:8] %}
+        <tr>
+          <td><a href="/campaigns/{{ c.id }}">{{ c.name }}</a></td>
+          <td>{{ pill(c.status) }}</td>
+          <td class="num">{{ c.enrolled }}</td>
+          <td class="num">{{ c.contacted }}</td>
+          <td class="num">{{ pct(c.email.open_rate) }}</td>
+          <td class="num">{{ pct(c.email.click_rate) }}</td>
+          <td class="num">{{ c.replied }}{% if c.contacted %} <span class="meta">{{ (100 * c.replied / c.contacted) | round | int }}%</span>{% endif %}</td>
+          <td class="num">{% if c.tasks_open %}<a href="/tasks?campaign={{ c.id }}">{{ c.tasks_open }}</a>{% else %}0{% endif %}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table></div>
+    {% else %}
+      <div class="empty">No campaigns yet. <a href="/campaigns">Create one</a>, or <a href="/import">import leads</a> first.</div>
+    {% endif %}
+  </section>
+
+  <section class="card">
+    <div class="card-head"><h2>Recent replies</h2></div>
+    {% if replies %}
+    <ul class="tl">
+      {% for r in replies %}
+        <li>
+          <span class="ic {{ 'email' if r.channel == 'email' else 'linkedin' }}"></span>
+          <div><a href="/leads/{{ r.lead_id }}">{{ lead_name(r) }}</a> <span class="meta">{{ r.company }}</span>
+            <div class="detail">via {{ r.channel }} · {{ r.campaign or "" }}{% if r.detail %} · {{ r.detail }}{% endif %}</div></div>
+          <span class="meta">{{ r.at | ago }}</span>
+        </li>
+      {% endfor %}
+    </ul>
+    {% else %}
+      <div class="empty">No replies yet.</div>
+    {% endif %}
+  </section>
+</div>
+{% endblock %}

@@ -1,0 +1,15 @@
+{% macro pill(status) -%}
+<span class="pill {{ tone(status) }}">{{ status }}</span>
+{%- endmacro %}
+
+{% macro chip(channel) -%}
+<span class="chip {{ 'email' if channel == 'email' else 'linkedin' }}">{{ channel_label(channel) }}</span>
+{%- endmacro %}
+
+{% macro lead_name(l) -%}
+{{ ((l.first_name or "") ~ " " ~ (l.last_name or "")).strip() or l.email or "(no name)" }}
+{%- endmacro %}
+
+{% macro tile(label, value, sub="") -%}
+<div class="tile"><div class="k">{{ label }}</div><div class="v">{{ value }}</div><div class="s">{{ sub }}</div></div>
+{%- endmacro %}

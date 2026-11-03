@@ -1,0 +1,202 @@
+{% extends "base.html" %}
+{% from "_macros.html" import pill, chip, lead_name, tile %}
+{% block title %}{{ c.name }}{% endblock %}
+{% block main %}
+<header class="head">
+  <div>
+    <h1>{{ c.name }} {{ pill(c.status) }}</h1>
+    <p class="sub">from {% if sender %}<a href="/senders">{{ sender.email }}</a>{% else %}<a href="/senders">no mailbox yet</a>{% endif %} · {{ steps | length }} steps · {{ counts.values() | sum }} leads · sends {{ c.window_days.replace(",", " ") }} {{ c.window_start }}–{{ c.window_end }}{% if c.timezone %} {{ c.timezone }}{% endif %}</p>
+  </div>
+  <div class="actions">
+    {% if c.status != "active" %}
+      <form method="post" action="/campaigns/{{ c.id }}/status" data-confirm="Go live? Emails will send from your Outlook and LinkedIn tasks will start queueing.">
+        <input type="hidden" name="status" value="active"><button class="btn primary">{{ "Resume" if c.status == "paused" else "Activate" }}</button>
+      </form>
+    {% else %}
+      <form method="post" action="/campaigns/{{ c.id }}/status"><input type="hidden" name="status" value="paused"><button class="btn">Pause</button></form>
+    {% endif %}
+    {% if c.status == "paused" %}
+      <form method="post" action="/campaigns/{{ c.id }}/status"><input type="hidden" name="status" value="draft"><button class="btn ghost">Back to draft</button></form>
+    {% endif %}
+    <a class="btn" href="/import?campaign={{ c.id }}">Import leads</a>
+  </div>
+</header>
+
+<nav class="tabs">
+  {% for t, label in [("overview", "Overview"), ("sequence", "Sequence"), ("leads", "Leads"), ("settings", "Settings")] %}
+    <a href="?tab={{ t }}" class="{{ 'on' if tab == t }}">{{ label }}{% if t == "leads" %} <span class="meta">{{ counts.values() | sum }}</span>{% endif %}</a>
+  {% endfor %}
+</nav>
+
+{% if tab == "overview" %}
+  {% if has_email %}
+  <section class="card">
+    <div class="card-head">
+      <h2>Email performance</h2>
+      <span class="meta">unique people{% if not tracker %} · open/click tracking not set up (<a href="/settings">Settings</a>){% elif not (c.track_opens or c.track_clicks) %} · tracking off for this campaign{% endif %}{% if em.machine %} · {{ em.machine }} scanner hits excluded{% endif %}</span>
+    </div>
+    <section class="tiles four" style="margin:0">
+      {{ tile("Sent", em.sent, em.leads ~ " people") }}
+      {{ tile("Delivered", pct(em.delivery_rate), em.delivered ~ " people") }}
+      {{ tile("Bounced", pct(em.bounce_rate), em.bounced ~ " people") }}
+      {{ tile("Opened", pct(em.open_rate), em.opened ~ " people · estimate") }}
+      {{ tile("Clicked", pct(em.click_rate), em.clicked ~ " people") }}
+      {{ tile("Click-to-open", pct(em.click_to_open)) }}
+      {{ tile("Replied", pct(em.reply_rate), em.replied ~ " people") }}
+      {{ tile("Unsubscribed", em.unsubscribed, pct(em.unsub_rate)) }}
+    </section>
+  </section>
+  {% endif %}
+  <div class="grid2" style="margin-top:16px">
+    <section class="card">
+      <div class="card-head"><h2>Funnel</h2><span class="meta">% of enrolled</span></div>
+      <div class="funnel">
+        {% set top = funnel[0].n or 1 %}
+        {% for s in funnel %}
+          <div class="frow" data-tip="{{ s.label }}: {{ s.n }} leads ({{ s.pct }}% of enrolled)">
+            <span class="lbl">{{ s.label }}</span>
+            <div class="track"><div class="bar" style="width: {{ (100 * s.n / top) | round(1) }}%"></div></div>
+            <span class="val">{{ s.n }} <small>{{ s.pct }}%</small></span>
+          </div>
+        {% endfor %}
+      </div>
+    </section>
+    <section class="card">
+      <div class="card-head"><h2>Lead status</h2></div>
+      {% if counts %}
+      <div class="tbl-wrap"><table class="t"><tbody>
+        {% for s in ["pending", "active", "done", "replied", "bounced", "stopped", "error"] if counts.get(s) %}
+          <tr><td>{{ pill(s) }}</td><td class="num"><a href="?tab=leads&status={{ s }}">{{ counts[s] }}</a></td></tr>
+        {% endfor %}
+      </tbody></table></div>
+      {% else %}<div class="empty">No leads. <a href="/import?campaign={{ c.id }}">Import some</a>.</div>{% endif %}
+    </section>
+  </div>
+  <section class="card" style="margin-top:16px">
+    <div class="card-head"><h2>By step</h2><span class="meta">Replies count against the last step done before the reply · <a href="?tab=sequence">open the flow →</a></span></div>
+    <div class="tbl-wrap"><table class="t">
+      <thead><tr><th>#</th><th>Step</th><th>When</th><th class="num">Done</th><th class="num">Queued</th><th class="num">Up next</th><th class="num">Skipped</th><th class="num">Opened</th><th class="num">Clicked</th><th class="num">Replies</th><th class="num">Reply rate</th></tr></thead>
+      <tbody>
+      {% for s in step_stats %}
+        <tr>
+          <td class="meta">{{ s.pos + 1 }}</td>
+          <td>{{ chip(s.channel) }}{% if s.subject %} <span class="meta">{{ s.subject }}</span>{% endif %}{% if s.condition != "always" %} <span class="meta">· {{ CONDITIONS[s.condition] | lower }}</span>{% endif %}</td>
+          <td class="meta">+{{ s.delay_days | round(1) | replace(".0", "") }}d</td>
+          <td class="num">{{ s.done }}</td>
+          <td class="num">{{ s.queued if s.channel != "email" else "–" }}</td>
+          <td class="num">{{ s.waiting }}</td>
+          <td class="num">{{ s.skipped }}</td>
+          {% set se = step_em.get(s.pos) %}
+          <td class="num">{{ pct(se.open_rate) if se else "–" }}</td>
+          <td class="num">{{ pct(se.click_rate) if se else "–" }}</td>
+          <td class="num">{{ s.replies }}</td>
+          <td class="num">{{ (s.rate ~ "%") if s.rate is not none else "–" }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table></div>
+  </section>
+
+{% elif tab == "sequence" %}
+  {% if c.status == "active" %}<div class="banner">This campaign is live. Edits apply to upcoming steps. Leads keep their step number, so reordering changes which step they're on.</div>{% endif %}
+  <div id="seq" class="builder" data-campaign="{{ c.id }}" data-channels='{{ CHANNELS | tojson }}' data-conditions='{{ CONDITIONS | tojson }}'
+       data-vars='{{ ["first_name", "last_name", "name", "company", "title", "unsubscribe_url"] | tojson }}'
+       data-leads='{{ preview_leads | tojson }}' data-engage="{{ 1 if c.li_engage else 0 }}"
+       data-enrolled="{{ counts.values() | sum }}" data-pending="{{ counts.get('pending', 0) }}">
+    <div class="builder-bar">
+      <div class="legend">
+        <span><i class="sw email"></i>Email</span>
+        <span><i class="sw linkedin"></i>LinkedIn</span>
+        <span><i class="lg-diamond"></i>Condition</span>
+        {% if c.li_engage %}<span><i class="lg-lane"></i>Parallel track</span>{% endif %}
+        <span class="exit-pill">Exits anytime: reply · bounce · unsubscribe</span>
+      </div>
+      <span id="seq-dirty" class="meta"></span>
+      <button class="btn" id="seq-save">Save sequence</button>
+    </div>
+    <ul id="seq-errors" class="errors"></ul>
+    <div class="builder-main">
+      <div class="canvas"><div id="flow" class="flow" aria-label="Sequence flowchart"></div></div>
+      <aside class="card inspector" id="inspector" aria-live="polite"></aside>
+    </div>
+  </div>
+  <script id="seq-data" type="application/json">{{ seq_steps | tojson }}</script>
+
+{% elif tab == "leads" %}
+  <div class="filters">
+    <a href="?tab=leads" class="{{ 'on' if not status }}">all {{ counts.values() | sum }}</a>
+    {% for s, n in counts.items() %}<a href="?tab=leads&status={{ s }}" class="{{ 'on' if status == s }}">{{ s }} {{ n }}</a>{% endfor %}
+  </div>
+  {% if enrollments %}
+  <section class="card"><div class="tbl-wrap"><table class="t">
+    <thead><tr><th>Lead</th><th>Company</th><th>Status</th><th>Step</th><th>LinkedIn</th><th>Last step</th><th>Note</th><th></th></tr></thead>
+    <tbody>
+    {% for e in enrollments %}
+      <tr>
+        <td><a href="/leads/{{ e.lead_id }}">{{ lead_name(e) }}</a><div class="meta">{{ e.email or "no email" }}</div></td>
+        <td>{{ e.company }}<div class="meta">{{ e.title }}</div></td>
+        <td>{{ pill(e.status) }}</td>
+        <td>
+          {% if e.step_pos >= 0 and e.step_pos < steps | length %}{{ e.step_pos + 1 }}/{{ steps | length }} {{ chip(steps[e.step_pos].channel) }}{% else %}<span class="meta">not started</span>{% endif %}
+        </td>
+        <td>{% if e.linkedin_url %}<a href="{{ e.linkedin_url }}" target="_blank" rel="noopener">profile</a> {{ pill(e.li_state) if e.li_state != "none" }}{% else %}<span class="meta">–</span>{% endif %}</td>
+        <td class="meta">{{ e.last_step_at | ago }}</td>
+        <td class="meta">{{ e.note or "" }}</td>
+        <td>{% if e.status in ("pending", "active", "done") %}<button class="btn sm ghost" data-stop="{{ e.id }}">Stop</button>{% endif %}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table></div></section>
+  {% else %}
+    <div class="empty">No leads{% if status %} with status {{ status }}{% endif %}. <a href="/import?campaign={{ c.id }}">Import leads</a></div>
+  {% endif %}
+
+{% elif tab == "settings" %}
+  <form class="card" method="post" action="/campaigns/{{ c.id }}/settings">
+    <div class="form-grid">
+      <label class="f">Name<input name="name" value="{{ c.name }}" required></label>
+      <label class="f">Send from
+        <select name="sender">
+          {% for s in senders %}<option value="{{ s.account }}" {{ 'selected' if (c.sender or (senders[0].account if senders)) == s.account }}>{{ s.email }}{{ "" if s.connected else " (sign in again)" }}</option>{% endfor %}
+          {% if not senders %}<option value="">No mailbox connected yet</option>{% endif %}
+        </select>
+      </label>
+      <label class="f">Timezone (blank = this Mac)
+        <input name="timezone" value="{{ c.timezone or '' }}" list="zones" placeholder="e.g. Asia/Kolkata">
+        <datalist id="zones">{% for z in zones %}<option value="{{ z }}">{% endfor %}</datalist>
+      </label>
+      <label class="f">Start no earlier than (blank = immediately)<input type="datetime-local" name="start_at" value="{{ start_local }}"></label>
+      <label class="f">Send window start<input type="time" name="window_start" value="{{ c.window_start }}"></label>
+      <label class="f">Send window end<input type="time" name="window_end" value="{{ c.window_end }}"></label>
+      <label class="f">Emails per day<input type="number" min="0" name="email_daily_cap" value="{{ c.email_daily_cap }}"></label>
+      <label class="f">LinkedIn tasks per day<input type="number" min="0" name="li_daily_cap" value="{{ c.li_daily_cap }}"></label>
+      <label class="f">Gap between emails, min seconds<input type="number" min="0" name="gap_min" value="{{ c.gap_min }}"></label>
+      <label class="f">Gap between emails, max seconds<input type="number" min="0" name="gap_max" value="{{ c.gap_max }}"></label>
+    </div>
+    <div style="margin-top:14px">
+      <div class="meta" style="margin-bottom:6px">Email send days (LinkedIn tasks queue any day)</div>
+      <div class="days">
+        {% for d in ["mon", "tue", "wed", "thu", "fri", "sat", "sun"] %}
+          <label><input type="checkbox" name="window_days" value="{{ d }}" {{ 'checked' if d in days }}> {{ d }}</label>
+        {% endfor %}
+      </div>
+    </div>
+    <div style="margin-top:14px" class="days">
+      <label><input type="checkbox" name="track_opens" value="1" {{ 'checked' if c.track_opens }} {{ 'disabled' if not tracker }}> Track opens (pixel)</label>
+      <label><input type="checkbox" name="track_clicks" value="1" {{ 'checked' if c.track_clicks }} {{ 'disabled' if not tracker }}> Track clicks (link redirect)</label>
+      <label><input type="checkbox" name="li_engage" value="1" {{ 'checked' if c.li_engage }}> Weekly like + comment on their LinkedIn posts while in sequence</label>
+    </div>
+    <p class="meta">{% if not tracker %}Tracking isn't set up yet: see Settings → Tracking. {% endif %}Changing the sender only affects new threads. Leads already emailed keep getting follow-ups from the mailbox that started their thread. For cold outreach, turning tracking off can improve inbox placement.</p>
+    <label class="f" style="margin-top:14px">Email signature (plain text, appended to every email; Graph doesn't add your Outlook signature)
+      <textarea name="signature" rows="4">{{ c.signature }}</textarea>
+    </label>
+    <p class="meta">LinkedIn limits: about 100 invites a week. Keep tasks per day at 20 or below.</p>
+    <button class="btn primary">Save settings</button>
+  </form>
+  <form class="card" method="post" action="/campaigns/{{ c.id }}/delete" data-confirm="Delete {{ c.name }} and its history? Leads stay in your lead list.">
+    <div class="card-head"><h2>Danger zone</h2></div>
+    <button class="btn danger">Delete campaign</button>
+  </form>
+{% endif %}
+{% endblock %}
+{% block scripts %}{% if tab == "sequence" %}<script src="{{ asset('seq.js') }}"></script>{% endif %}{% endblock %}
