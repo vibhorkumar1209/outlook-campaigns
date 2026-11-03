@@ -17,8 +17,7 @@ from jinja2 import TemplateError, TemplateSyntaxError
 from .. import ai, db, domain_health, engine, importer, linkedin_bot, stats
 from ..db import iso, one, parse, rows, scalar, utcnow
 from ..render import ENV, email_html, lead_context, render_text
-from ..graph import logout
-from ..runner import Runner
+from ..runner import Runner, remove_sender
 from ..tracking import Tracker
 
 HERE = Path(__file__).parent
@@ -595,16 +594,19 @@ def sender_li_mailbox(account: str = Form(...)):
     return back("/senders", msg=f"LinkedIn notifications are read from {account}")
 
 
-@app.post("/senders/{account}/disconnect")
-def sender_disconnect(account: str):
+@app.post("/senders/{account}/remove")
+def sender_remove(account: str):
     conn = db.connect()
-    in_use = scalar(conn, "SELECT COUNT(*) FROM campaigns WHERE sender = ? AND status = 'active'", account)
-    try:
-        logout(account)
-    except Exception:
-        pass
-    return back("/senders", msg=f"Signed out {account}." + (f" {in_use} live campaign(s) use it; their emails wait until "
-                                                           "you reconnect or pick another sender." if in_use else ""))
+    if not one(conn, "SELECT 1 FROM senders WHERE account = ?", account):
+        return back("/senders", err="Unknown mailbox")
+    r = remove_sender(conn, account)
+    msg = f"Removed {account}."
+    if r["campaigns"]:
+        msg += (f" {r['campaigns']} campaign(s) now send from {r['replacement']}." if r["replacement"]
+                else f" {r['campaigns']} campaign(s) have no mailbox until you connect one.")
+    if r["threads"]:
+        msg += f" {r['threads']} open thread(s) will continue as new emails."
+    return back("/senders", msg=msg)
 
 
 # ---------- settings / runner ----------

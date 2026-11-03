@@ -11,7 +11,7 @@ from datetime import datetime
 
 from . import ai, db, engine, linkedin_bot
 from .db import iso, utcnow
-from .graph import Graph, accounts, login
+from .graph import Graph, accounts, login, logout
 from .tracking import Tracker
 
 LOCK_PATH = db.DB_PATH.parent / ".tick.lock"
@@ -150,3 +150,21 @@ def comment_drafter(conn):
         return None
     voice = db.get_setting(conn, "comment_voice", "")
     return lambda text, lead: ai.draft_comment(text, lead, voice)
+
+
+def remove_sender(conn, account: str) -> dict:
+    """Forget a mailbox: sign it out, move its campaigns to the remaining default mailbox, and restart its open
+    threads from there (a thread can't move between mailboxes, so follow-ups start a fresh one)."""
+    try:
+        logout(account)
+    except Exception:  # already signed out, or offline: still remove it locally
+        pass
+    conn.execute("DELETE FROM senders WHERE account = ?", (account,))
+    new = engine.default_sender(conn)
+    moved = conn.execute("UPDATE campaigns SET sender = ? WHERE sender = ?", (new, account)).rowcount
+    threads = conn.execute("""UPDATE enrollments SET sender = NULL, conversation_id = NULL
+                              WHERE sender = ? AND status IN ('pending', 'active')""", (account,)).rowcount
+    if db.get_setting(conn, "li_mailbox") == account:
+        db.set_setting(conn, "li_mailbox", new)
+        db.set_setting(conn, "li_cursor", None)
+    return {"replacement": new, "campaigns": moved, "threads": threads}

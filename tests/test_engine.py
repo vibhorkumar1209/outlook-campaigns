@@ -226,6 +226,43 @@ class FlowTest(Base):
         self.assertIsNone(self.task("jane@x.com"))
 
 
+class BranchTest(Base):
+    BRANCH = [("li_connect", 0, None, "Hi {{ first_name }}"),
+              ("li_message", 0, None, "Great to be connected, {{ first_name }}"),
+              ("email", 0, "Hi {{ company }}", "Hello {{ first_name }}")]
+
+    def setUp(self):
+        super().setUp()
+        self.conn.execute("UPDATE campaigns SET status = 'paused' WHERE id = ?", (self.cid,))
+        self.cid = self.campaign(self.BRANCH, name="branch")
+        self.conn.execute("UPDATE steps SET condition = 'if_not_connected' WHERE campaign_id = ? AND pos = 0", (self.cid,))
+        self.conn.execute("UPDATE steps SET condition = 'if_connected' WHERE campaign_id = ? AND pos = 1", (self.cid,))
+        for l in rows(self.conn, "SELECT id FROM leads WHERE linkedin_url IS NOT NULL"):
+            self.conn.execute("INSERT INTO enrollments (campaign_id, lead_id, enrolled_at) VALUES (?, ?, ?)",
+                              (self.cid, l["id"], iso(MON)))
+
+    def test_not_connected_gets_invite_then_email_without_waiting(self):
+        self.tick(MON)
+        t = self.task("jane@x.com")
+        self.assertEqual(t["channel"], "li_connect")
+        engine.complete_task(self.conn, t["id"], "done", now=MON)
+        self.tick(MON + timedelta(minutes=10))
+        self.assertIsNone(self.task("jane@x.com"))          # message step skipped at once (not connected)
+        self.assertEqual([s[1] for s in self.g.sent], ["jane@x.com"])  # email went out, no 7-day wait
+
+    def test_already_connected_gets_message_not_invite(self):
+        self.conn.execute("UPDATE leads SET li_state = 'connected' WHERE email = 'jane@x.com'")
+        self.tick(MON)
+        t = self.task("jane@x.com")
+        self.assertEqual((t["channel"], t["body"]), ("li_message", "Great to be connected, Jane"))
+
+    def test_discovered_connection_at_invite_switches_to_message(self):
+        self.tick(MON)
+        engine.complete_task(self.conn, self.task("jane@x.com")["id"], "connected", now=MON)  # "Already connected"
+        self.tick(MON + timedelta(minutes=10))
+        self.assertEqual(self.task("jane@x.com")["channel"], "li_message")
+
+
 class MailboxTest(Base):
     EMAIL_ONLY = [("email", 0, "Hi {{ company }}", "Hello {{ first_name }}"), ("email", 2, None, "Bump")]
 
@@ -276,6 +313,37 @@ class MailboxTest(Base):
         self.assertEqual(len(self.graphs[OTHER].sent), 1)
         self.tick(MON + timedelta(days=1))
         self.assertEqual(len(self.graphs[OTHER].sent), 2)
+
+
+class NetworkFailTest(MailboxTest):
+    def test_network_error_holds_mailbox_without_failing_leads(self):
+        from campaigner.graph import NetworkError
+        self.conn.execute("UPDATE campaigns SET status = 'paused' WHERE id = ?", (self.cid,))
+        self.other_campaign()
+        def boom(*a, **k):
+            raise NetworkError("POST /me/messages: network error (ConnectionError)")
+        self.graphs[OTHER].send_new = boom
+        self.tick(MON)
+        self.assertEqual(scalar(self.conn, "SELECT MAX(failures) FROM enrollments"), 0)
+        self.assertEqual(scalar(self.conn, "SELECT COUNT(*) FROM enrollments WHERE status = 'error'"), 0)
+        self.assertTrue(any("network problem" in l for l in self.logs))
+
+
+class RemoveSenderTest(MailboxTest):
+    def test_remove_moves_campaigns_and_restarts_threads(self):
+        from campaigner.runner import remove_sender
+        from unittest import mock
+        self.conn.execute("UPDATE campaigns SET status = 'paused' WHERE id = ?", (self.cid,))
+        cid = self.other_campaign()
+        self.tick(MON)
+        db.set_setting(self.conn, "li_mailbox", OTHER)
+        with mock.patch("campaigner.runner.logout"):
+            r = remove_sender(self.conn, OTHER)
+        self.assertEqual((r["replacement"], r["campaigns"], r["threads"]), (ME, 1, 2))
+        self.assertEqual(one(self.conn, "SELECT sender FROM campaigns WHERE id = ?", cid)["sender"], ME)
+        self.assertEqual(db.get_setting(self.conn, "li_mailbox"), ME)
+        self.tick(MON + timedelta(days=2))  # follow-ups continue from ME as new emails
+        self.assertEqual({(s[0], s[1]) for s in self.g.sent}, {("new", "jane@x.com"), ("new", "bob@x.com")})
 
 
 class FakeTracker(Tracker):

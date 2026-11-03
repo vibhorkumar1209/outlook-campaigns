@@ -53,6 +53,8 @@
   const isLI = (ch) => ch !== "email";
   const gated = (s) => s.channel === "li_message" || s.condition !== "always";
   const priorEmail = (i) => steps.slice(0, i).some((x) => x.channel === "email");
+  const waitsForConnect = (s) => s.channel === "li_message" && s.condition !== "if_connected";
+  const needsConnect = (i) => waitsForConnect(steps[i]) && !steps.slice(0, i).some((x) => x.channel === "li_connect");
 
   function summary(s, i) {
     if (s.channel === "li_view") return "Visit their profile";
@@ -116,8 +118,10 @@
       h("span", { class: "fnum" }, String(i + 1)),
       h("div", { class: "ficon" }, icon(s.channel)),
       h("div", { class: "fbody" },
-        h("div", { class: "ftitle" }, h("span", {}, CH[s.channel]), h("span", { class: "fday" }, `Day ${fmt(day)}${gated(s) ? "+" : ""}`)),
+        h("div", { class: "ftitle" }, h("span", {}, CH[s.channel]), h("span", { class: "fday" }, `Day ${fmt(day)}${waitsForConnect(s) ? "+" : ""}`)),
         h("div", { class: "fsub" }, summary(s, i)),
+        needsConnect(i) ? h("div", { class: "fwarn" },
+          "⚠ No Connect step before this. LinkedIn only allows messages to connections, so leads who aren't already connected wait 7 days here, then skip.") : null,
         chips.length ? h("div", { class: "fstats" }, chips.map((c) => h("span", {}, c))) : null));
     el.addEventListener("dragstart", (e) => {
       dragFrom = i;
@@ -138,7 +142,7 @@
       diamond,
       h("div", { class: "fyes" }, h("span", {}, "yes")),
       node(s, i, day),
-      h("div", { class: "fbypass" }, h("span", {}, inverse ? "no → skip" : "no → skip after 7d")),
+      h("div", { class: "fbypass" }, h("span", {}, waitsForConnect(s) ? "no → wait ≤7d, then skip" : "no → skip")),
       h("div", { class: "fbypass-ret" }));
   }
 
@@ -266,8 +270,12 @@
             oninput: (e) => set("delay_days", parseFloat(e.target.value) || 0) }),
           i === 0 ? "Counted from enrollment, or the campaign's start date." : "Counted from when the previous step was done or skipped."),
         s.channel === "li_message"
-          ? h("p", { class: "meta" }, "Sends only once they've accepted your invite. Waits up to 7 days past due, then skips.")
-          : field("Run", select(COND, s.condition, (e) => set("condition", e.target.value))),
+          ? field("If they're not connected yet", select(
+              { always: "Wait for them to accept (up to 7 days)", if_connected: "Skip this step right away" },
+              s.condition === "if_connected" ? "if_connected" : "always", (e) => set("condition", e.target.value)),
+              "LinkedIn only allows messages to connections. To branch, use a Connect step set to “Only if not connected” before this one.")
+          : field("Run", select(COND, s.condition, (e) => set("condition", e.target.value)),
+              s.channel === "li_connect" ? "Already-connected leads skip this step automatically." : null),
         s.channel === "email" ? field(firstEmail || !s.in_thread ? "Subject" : "Subject (blank = reply in the same thread)",
           h("input", { value: s.subject, placeholder: firstEmail ? "Required: starts the thread" : "",
             oninput: (e) => set("subject", e.target.value), onfocus: (e) => (lastField = e.target) })) : null,

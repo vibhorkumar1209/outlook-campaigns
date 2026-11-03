@@ -27,6 +27,10 @@ class GraphError(RuntimeError):
     pass
 
 
+class NetworkError(GraphError):
+    """Couldn't reach Microsoft at all. Says nothing about the recipient."""
+
+
 # Microsoft's own public client ("Microsoft Graph Command Line Tools", used by Graph PowerShell), so no app
 # registration is needed. Sign-ins show under that name in the org's logs; set OC_CLIENT_ID to use your own app.
 DEFAULT_CLIENT_ID = "14d82eec-204b-4c2f-b7e8-296a70dab67e"
@@ -128,7 +132,14 @@ class Graph:
         # Token fetched per call: silent refresh keeps long throttled runs alive past the 1h expiry.
         headers = {"Authorization": f"Bearer {_token(self.account)}", **kw.pop("headers", {})}
         for attempt in range(6):
-            r = self.s.request(method, url, headers=headers, timeout=30, **kw)
+            try:
+                r = self.s.request(method, url, headers=headers, timeout=30, **kw)
+            except requests.RequestException as e:
+                # Wi-Fi drops, sleep/wake, DNS hiccups: retry briefly, then fail this mailbox for this run only.
+                if attempt >= 2:
+                    raise NetworkError(f"{method} {url.removeprefix(GRAPH)}: network error ({e.__class__.__name__})") from e
+                time.sleep(2 ** attempt * 2)
+                continue
             if r.status_code in RETRY_STATUS:
                 time.sleep(int(r.headers.get("Retry-After", 2 ** attempt)))
                 continue

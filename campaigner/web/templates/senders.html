@@ -37,8 +37,8 @@
         <button class="btn sm">Set</button>
       </form>
       {% if not s.connected %}<button class="btn sm primary" data-login>Reconnect</button>{% endif %}
-      <form method="post" action="/senders/{{ s.account }}/disconnect" data-confirm="Sign out {{ s.email }}? Campaigns using it pause their emails until you reconnect.">
-        <button class="btn sm danger">Sign out</button>
+      <form method="post" action="/senders/{{ s.account }}/remove" data-confirm="Remove {{ s.email }}? It's signed out and forgotten here. Campaigns using it switch to your other mailbox, and any open email threads continue from that mailbox as new emails.">
+        <button class="btn sm danger">Remove</button>
       </form>
     </div>
   </div>

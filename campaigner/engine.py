@@ -20,7 +20,7 @@ from jinja2 import TemplateError
 
 from . import db
 from .db import event, iso, one, parse, rows, scalar, utcnow
-from .graph import AuthError, GraphError
+from .graph import AuthError, GraphError, NetworkError
 from .render import email_html, lead_context, render_text
 from .tracking import BOT_UA, MACHINE_WINDOW_S
 
@@ -30,7 +30,7 @@ LI = ("li_view", "li_connect", "li_message")
 ENGAGE = "li_engage"
 TASK_LABELS = {**CHANNELS, ENGAGE: "Like + comment"}
 ENGAGE_DEFAULTS = {"engage_every_days": 7, "engage_lookback_months": 6}
-CONDITIONS = {"always": "Always", "if_connected": "Only if connected", "if_not_connected": "Only if not connected"}
+CONDITIONS = {"always": "Always", "if_connected": "Only if already connected", "if_not_connected": "Only if not connected"}
 DAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 OPEN = ("pending", "active", "done")
 REPLY_LOOKBACK = timedelta(days=30)   # keep watching finished sequences this long
@@ -407,7 +407,10 @@ def gate(st: dict, e: dict, now: datetime, due: datetime) -> tuple[str | None, b
         return "no email address", False
     if ch in LI and not e["linkedin_url"]:
         return "no LinkedIn URL", False
-    if (st["condition"] == "if_connected" or ch == "li_message") and li_state != "connected":
+    if st["condition"] == "if_connected" and li_state != "connected":
+        return "not connected", False  # an explicit branch: decide now, don't wait
+    if ch == "li_message" and li_state != "connected":
+        # A plain LinkedIn message waits for the invite to be accepted, then gives up.
         return ("not connected", False) if now >= due + WAIT_FOR_CONNECT else (None, True)
     if st["condition"] == "if_not_connected" and li_state == "connected":
         return "already connected", False
@@ -577,6 +580,9 @@ def send_emails(conn, c, steps, queue, boxes: Mailboxes, tracker, now, send, sle
                                            strip_pixels=tracker.base if tracker else None)
             else:
                 cid = graph.send_new(e["email"], ctx["name"], subject, html)
+        except NetworkError as ex:
+            boxes.hold(acct, f"network problem ({ex}).")  # not the lead's fault: don't count a failure
+            continue
         except GraphError as ex:
             _fail(conn, e, k, str(ex), log, permanent=False)
             continue
