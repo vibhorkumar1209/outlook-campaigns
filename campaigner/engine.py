@@ -211,7 +211,7 @@ def complete_task(conn, task_id: int, action: str, body: str | None = None, now:
         _complete_engage(conn, t, e, action, body, engage or {}, now, actor)
         return
     if action == "connected":
-        set_connected(conn, e["lead_id"], now, source="marked from queue")
+        set_connected(conn, e["lead_id"], now, source="seen by bot" if actor == "bot" else "marked from queue")
     status = "done" if action == "done" else "skipped"
     conn.execute("UPDATE tasks SET status = ?, body = COALESCE(?, body), done_at = ? WHERE id = ?",
                  (status, body, iso(now), task_id))

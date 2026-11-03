@@ -612,6 +612,30 @@ class BotTest(Base):
         self.assertEqual((t["bot_attempts"], t["bot_note"]), (2, "not a 1st-degree connection yet"))
         self.assertEqual(self.drivers[2].calls, [])  # third run had nothing left to try
 
+    def test_task_you_handled_mid_run_is_not_redone(self):
+        self.conn.execute("UPDATE leads SET linkedin_url = 'https://www.linkedin.com/in/bob' WHERE email = 'bob@x.com'")
+        self.tick(MON)
+        bob = self.task("bob@x.com")
+        d = FakeDriver()
+        def sleep(_):  # you click Done on Bob's card while the bot pauses between leads
+            if self.task("bob@x.com"):
+                engine.complete_task(self.conn, bob["id"], "done", now=MON)
+        linkedin_bot.run(self.conn, lambda: d, now=MON, log=self.logs.append, sleep=sleep)
+        self.assertEqual([c[1] for c in d.calls if c[0] == "connect"], ["https://www.linkedin.com/in/janedoe"])
+
+    def test_task_completed_during_action_does_not_crash(self):
+        self.tick(MON)
+        jane = self.task("jane@x.com")
+        d = FakeDriver(connect="already_connected")
+        orig = d.connect
+        def connect(url, note):
+            engine.complete_task(self.conn, jane["id"], "connected", now=MON)  # you, mid-action
+            return orig(url, note)
+        d.connect = connect
+        linkedin_bot.run(self.conn, lambda: d, now=MON, log=self.logs.append, sleep=lambda s: None)
+        self.assertTrue(any("already handled" in l for l in self.logs))
+        self.assertIn("close", d.calls)
+
     def test_block_pauses_until_resumed(self):
         self.tick(MON)
         self.bot(FakeDriver(blocked=True))

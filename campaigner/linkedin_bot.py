@@ -11,6 +11,7 @@ LinkedIn changes its pages often, so the page-specific code is confined to Chrom
 """
 from __future__ import annotations
 
+import hashlib
 import random
 import re
 import threading
@@ -35,8 +36,54 @@ DEFAULTS = {
 ACTION_OF = {"li_view": "view", "li_connect": "connect", "li_message": "message", "li_engage": "like"}
 MAX_ATTEMPTS = 2
 APPROVAL_TIMEOUT = timedelta(days=3)  # unapproved comment drafts expire; the like still counts
-# One Chrome profile can only be open once: the login window and the bot must not overlap.
-PROFILE_LOCK = threading.Lock()
+class _ProfileLock:
+    """One Chrome profile can only be open once. A file lock, so the dashboard's runs, its sign-in window and
+    CLI commands (`linkedin-login`, `linkedin-check`) in other processes never open it at the same time."""
+
+    path = PROFILE_DIR.parent / "linkedin-profile.lock"
+
+    def __init__(self):
+        self._f = None
+        self._t = threading.Lock()
+
+    def acquire(self, blocking: bool = True) -> bool:
+        import fcntl
+        import time
+
+        if not self._t.acquire(blocking=blocking):
+            return False
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        f = open(self.path, "w")
+        while True:
+            try:
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self._f = f
+                return True
+            except BlockingIOError:
+                if not blocking:
+                    f.close()
+                    self._t.release()
+                    return False
+                time.sleep(1)
+
+    def release(self) -> None:
+        import fcntl
+
+        if self._f:
+            fcntl.flock(self._f, fcntl.LOCK_UN)
+            self._f.close()
+            self._f = None
+        self._t.release()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *exc):
+        self.release()
+
+
+PROFILE_LOCK = _ProfileLock()
 
 
 class BlockedError(RuntimeError):
@@ -55,11 +102,12 @@ class Profile:
 
 @dataclass
 class Post:
-    urn: str
+    urn: str             # stable key (activity URN, or a hash of the post text)
     url: str
     age_days: float | None
     text: str
     liked: bool
+    ref: int | None = None  # position on the currently loaded activity page
 
 
 AGE_RE = re.compile(r"(\d+)\s*(mo|yr|min|hr|m|h|d|w|y)\b")
@@ -179,6 +227,10 @@ def run(conn, driver_factory, *, now: datetime | None = None, log=print, sleep=N
                 continue
             if done:
                 sleep(random.uniform(*cfg["li_bot_gap"]))
+            # You may have handled it in the queue while the bot was busy: never redo it on LinkedIn.
+            fresh = one(conn, "SELECT status, comment_status FROM tasks WHERE id = ?", t["id"])
+            if not fresh or fresh["status"] != "open" or fresh["comment_status"] != t["comment_status"]:
+                continue
             try:
                 if handle(conn, driver, t, action, now=now, log=log, draft=draft):
                     used[action] = used.get(action, 0) + 1
@@ -191,6 +243,9 @@ def run(conn, driver_factory, *, now: datetime | None = None, log=print, sleep=N
             except ActionError as e:
                 _fail(conn, t, str(e), log)
                 _record(conn, action, t, False, str(e))
+                done += 1
+            except ValueError as e:  # completed by you between our check and the action finishing
+                log(f"LinkedIn bot: {t['first_name']} {t['last_name']}: {e}, skipped")
                 done += 1
     finally:
         try:
@@ -237,7 +292,8 @@ def handle(conn, driver, t: dict, action: str, *, now: datetime, log, draft) -> 
         return True
 
     if action == "comment":
-        driver.comment(Post(urn="", url=t["post_url"], age_days=None, text="", liked=True), t["body"])
+        driver.comment(Post(urn=t["post_url"].split("#")[-1], url=t["post_url"], age_days=None, text="", liked=True),
+                       t["body"])
         engine.complete_task(conn, t["id"], "done", t["body"], now=now, actor="bot",
                              engage={"post_url": t["post_url"], "liked": t["bot_liked"], "commented": 1})
         _record(conn, "comment", t, True, now=now)
@@ -313,7 +369,9 @@ class ChromeDriver:
         u = self.page.url
         if any(x in u for x in ("/checkpoint", "/authwall", "/login", "/uas/", "/signup")):
             raise BlockedError(f"LinkedIn asked for sign-in or verification ({u.split('?')[0]})")
-        if self.page.locator("iframe[src*='captcha'], #captcha-internal, iframe[title*='challenge' i]").count():
+        # LinkedIn embeds an invisible reCAPTCHA for background scoring; only a visible challenge means "stop".
+        challenge = self.page.locator("iframe[src*='captcha'], #captcha-internal, iframe[title*='challenge' i]")
+        if any(challenge.nth(i).is_visible() for i in range(challenge.count())):
             raise BlockedError("LinkedIn showed a security check")
 
     def login_interactive(self, timeout_s: int = 600) -> bool:
@@ -330,30 +388,53 @@ class ChromeDriver:
     def _main(self):
         return self.page.locator("main").first
 
+    @staticmethod
+    def _slug(url: str) -> str:
+        m = re.search(r"/in/([^/?#]+)", url)
+        return m.group(1).lower() if m else ""
+
+    def _visible(self, locator):
+        for i in range(locator.count()):
+            if locator.nth(i).is_visible():
+                return locator.nth(i)
+        return None
+
+    # Profile pages also list other people ("People also viewed", "People you may know") with their own
+    # Message/Connect controls. Every control below is tied to the profile being worked on.
+
     def view(self, url: str) -> Profile:
         self._goto(url)
         head = self._main().inner_text(timeout=10000)[:2500]
+        self.profile_name = head.strip().split("\n", 1)[0].strip()
         # "· 1st" in the top card (inline elements can run together: "· 1stMessage"), or the screen-reader text.
         m = re.search(r"·\s*(1st|2nd|3rd)(?!\d)", head) or re.search(r"\b(1st|2nd|3rd) degree connection", head)
-        degree = m.group(1) if m else None
-        pending = self._main().get_by_role("button", name=re.compile(r"^Pending", re.I)).count() > 0
-        return Profile(degree=degree, pending=pending)
+        pending = self._visible(self._main().get_by_role("button", name=re.compile(r"^Pending\b", re.I)))
+        return Profile(degree=m.group(1) if m else None, pending=pending is not None)
 
-    def _connect_button(self):
-        main = self._main()
-        btn = main.get_by_role("button", name=re.compile(r"^Invite .+ to connect$", re.I))
-        if btn.count():
-            return btn.first
-        more = main.get_by_role("button", name=re.compile(r"^More actions$", re.I))
-        if more.count():
-            more.first.click()
-            self._pause(0.8, 1.6)
-            item = self.page.get_by_role("button", name=re.compile(r"^Invite .+ to connect$", re.I))
-            if not item.count():
-                item = self.page.locator("[aria-label^='Invite'][aria-label$='to connect']")
-            if item.count():
-                return item.first
+    def _invite_control(self, url: str):
+        """The invite link/button for THIS profile: LinkedIn links it as /preload/custom-invite/?vanityName=<slug>."""
+        slug = self._slug(url)
+        links = self.page.locator("a[href*='custom-invite']")
+        for i in range(links.count()):
+            a = links.nth(i)
+            m = re.search(r"vanityName=([^&]+)", a.get_attribute("href") or "")
+            if m and m.group(1).lower() == slug and a.is_visible():
+                return a
         return None
+
+    def _connect_button(self, url: str):
+        c = self._invite_control(url)
+        if c:
+            return c
+        more = self._visible(self._main().get_by_role("button", name=re.compile(r"^More( actions)?$", re.I)))
+        if more:
+            more.click()
+            self._pause(0.8, 1.6)
+            return self._invite_control(url)
+        return None
+
+    def _button_named(self, pattern):
+        return self._visible(self.page.get_by_role("button", name=re.compile(pattern, re.I)))
 
     def connect(self, url: str, note: str) -> str:
         p = self.view(url)
@@ -361,66 +442,94 @@ class ChromeDriver:
             return "already_connected"
         if p.pending:
             return "pending"
-        btn = self._connect_button()
+        btn = self._connect_button(url)
         if not btn:
-            raise ActionError("no Connect button (follow-only profile, or LinkedIn changed the page)")
+            raise ActionError("no Connect control for this profile (follow-only, or LinkedIn changed the page)")
         btn.click()
-        dialog = self.page.get_by_role("dialog").last
-        dialog.wait_for()
-        self._pause(0.8, 1.6)
-        if dialog.locator("input[type=email]").count():
+        self._pause(1.5, 2.5)
+        if self._visible(self.page.locator("input[type=email]")):
             raise ActionError("LinkedIn wants their email address to connect")
         if note.strip():
-            add = dialog.get_by_role("button", name=re.compile(r"Add a (free )?note", re.I))
-            if add.count():
-                add.first.click()
+            add = self._button_named(r"^Add a (free )?note$")
+            if add:
+                add.click()
                 self._pause(0.8, 1.6)
-                box = self.page.get_by_role("dialog").last.locator("textarea")
-                if box.count():
-                    box.first.click()
-                    box.first.type(note[:300], delay=random.randint(25, 60))
+                box = self._visible(self.page.locator("textarea"))
+                if box:
+                    box.click()
+                    box.type(note[:300], delay=random.randint(25, 60))
                     self._pause(0.6, 1.2)
-                    send = self.page.get_by_role("dialog").last.get_by_role(
-                        "button", name=re.compile(r"^Send( invitation| now)?$", re.I))
-                    if not send.count():
+                    send = self._button_named(r"^Send( invitation| now)?$")
+                    if not send or not send.is_enabled():
                         raise ActionError("invite dialog changed (no Send button)")
-                    send.first.click()
+                    send.click()
                     self._pause()
                     return "sent"
-                # Note blocked (free-account limit upsell): close it and send the invite without one.
+                # Note refused (free-account limit upsell): close it and send the invite without one.
                 self.page.keyboard.press("Escape")
                 self._pause(0.8, 1.6)
-                btn = self._connect_button()
+                btn = self._connect_button(url)
                 if not btn:
                     raise ActionError("couldn't reopen the invite after the note was refused")
                 btn.click()
-                dialog = self.page.get_by_role("dialog").last
-                dialog.wait_for()
-        send = dialog.get_by_role("button", name=re.compile(r"^Send without a note$|^Send( now)?$", re.I))
-        if not send.count():
+                self._pause(1.5, 2.5)
+        send = self._button_named(r"^Send without a note$|^Send( now)?$")
+        if not send:
             raise ActionError("invite dialog changed (no Send button)")
-        send.first.click()
+        send.click()
         self._pause()
         return "sent" if not note.strip() else "sent_without_note"
+
+    def _message_control(self):
+        """This profile's own Message control is labelled exactly "Message" (others say "Message <name>")."""
+        for role in ("link", "button"):
+            c = self._visible(self._main().get_by_role(role, name="Message", exact=True))
+            if c:
+                return c
+        return None
+
+    def _close_chats(self) -> None:
+        """Chat windows persist across page loads; close them so the composer we type into is unambiguous."""
+        for _ in range(6):
+            close = self._button_named(r"^Close your (conversation|draft conversation) with")
+            if not close:
+                return
+            close.click()
+            self._pause(0.5, 1.0)
 
     def message(self, url: str, text: str) -> str:
         p = self.view(url)
         if p.degree != "1st":
             return "not_connected"
-        btn = self._main().get_by_role("button", name=re.compile(r"^Message", re.I))
-        if not btn.count():
-            raise ActionError("no Message button")
-        btn.first.click()
-        box = self.page.locator("div.msg-form__contenteditable[contenteditable='true']").last
-        box.wait_for()
+        btn = self._message_control()
+        if not btn:
+            raise ActionError("no Message control on the profile")
+        self._close_chats()
+        btn.click()
+        self._pause(2.5, 4)
+        editors = self.page.locator("[contenteditable='true'][aria-label^='Write a message']")
+        vis = [editors.nth(i) for i in range(editors.count()) if editors.nth(i).is_visible()]
+        if len(vis) != 1:
+            raise ActionError(f"expected one message window, found {len(vis)}")
+        # The window's controls are named "... your conversation with <names>" (as hidden text, not aria-label).
+        first = (self.profile_name.split() or [""])[0].lower()
+        ctl = self.page.get_by_role("button", name=re.compile(r"your (draft )?conversation with", re.I))
+        names = [(ctl.nth(i).get_attribute("aria-label") or ctl.nth(i).inner_text() or "").lower()
+                 for i in range(ctl.count()) if ctl.nth(i).is_visible()]
+        if not first or not any(first in n for n in names):
+            raise ActionError(f"couldn't confirm the message window is addressed to {self.profile_name}")
+        box = vis[0]
         box.click()
         self._type_multiline(text)
         self._pause(0.8, 1.6)
-        send = self.page.locator("button.msg-form__send-button").last
-        if not send.count():
-            send = self.page.get_by_role("button", name=re.compile(r"^Send$", re.I)).last
+        send = self._button_named(r"^Send$")
+        if not send or not send.is_enabled():
+            raise ActionError("Send button not available")
         send.click()
-        self._pause()
+        self._pause(2, 3)
+        if (box.inner_text() or "").strip():
+            raise ActionError("message may not have sent (text still in the box)")
+        self._close_chats()
         return "sent"
 
     def _type_multiline(self, text: str) -> None:
@@ -431,71 +540,104 @@ class ChromeDriver:
             if line:
                 self.page.keyboard.type(line, delay=random.randint(20, 50))
 
-    def recent_posts(self, url: str, limit: int = 8) -> list[Post]:
-        self._goto(url.rstrip("/") + "/recent-activity/shares/")
-        items = self.page.locator("[data-urn^='urn:li:activity']")
+    # Activity page: class names are randomized, so posts are found through their accessibility labels.
+    # Each post has "Open control menu for post by <name>" and a "Reaction button state: ..." button.
+    _POSTS_JS = r"""() => {
+      const ctl = [...document.querySelectorAll('main button[aria-label^="Open control menu for post"]')];
+      const seen = new Set(), out = [];
+      ctl.forEach((b) => {
+        let c = b;
+        while (c && c !== document.body && !c.querySelector('button[aria-label^="Reaction button state"]')) c = c.parentElement;
+        if (!c || c === document.body || seen.has(c)) return;
+        seen.add(c);
+        const idx = out.length;
+        c.setAttribute('data-oc-post', String(idx));
+        const stamp = [...c.querySelectorAll('*')].find(e => e.children.length === 0 && /^\s*\d+\s*(mo|yr|min|hr|m|h|d|w|y)\b\s*•?/.test(e.textContent));
+        const react = c.querySelector('button[aria-label^="Reaction button state"]');
+        const text = c.innerText;
+        out.push({idx, stamp: stamp ? stamp.textContent.trim() : '', reaction: react ? react.getAttribute('aria-label') : '',
+                  repost: /reposted this|likes this|commented on this|celebrates this|loves this|supports this|finds this/i.test(text.slice(0, 300)),
+                  text});
+      });
+      return out;
+    }"""
+
+    def _parse_posts(self, activity: str) -> list[Post]:
         out = []
-        for i in range(min(items.count(), limit)):
-            it = items.nth(i)
-            urn = it.get_attribute("data-urn") or ""
-            header = it.locator(".update-components-header")
-            if header.count() and re.search(r"repost|likes|commented|celebrates|loves|supports|finds|reacted",
-                                            header.first.inner_text(), re.I):
-                continue  # not their own post
-            sub = it.locator(".update-components-actor__sub-description")
-            body = it.locator(".update-components-text, .feed-shared-update-v2__description")
-            like = it.get_by_role("button", name=re.compile(r"React Like|^Like$", re.I))
-            out.append(Post(
-                urn=urn, url=f"{self.base}/feed/update/{urn}/",
-                age_days=parse_age_days(sub.first.inner_text() if sub.count() else ""),
-                text=(body.first.inner_text() if body.count() else "")[:4000],
-                liked=bool(like.count() and like.first.get_attribute("aria-pressed") == "true"),
-            ))
+        for r in self.page.evaluate(self._POSTS_JS):
+            if r["repost"]:
+                continue
+            body = r["text"]
+            # Drop the header (name, headline, stamp) and the action bar; keep the post's own words.
+            if r["stamp"] and r["stamp"] in body:
+                body = body.split(r["stamp"], 1)[1]
+            body = re.split(r"\n(?:Like|Comment|Repost|Send)\n", body)[0]
+            body = re.sub(r"(?:…|\.\.\.)\s*more\s*$", "", body.strip()).strip()
+            key = "post:" + hashlib.sha1(re.sub(r"\s+", " ", body[:400]).lower().encode()).hexdigest()[:16]
+            out.append(Post(urn=key, url=f"{activity}#{key}", age_days=parse_age_days(r["stamp"]), text=body[:4000],
+                            liked="no reaction" not in r["reaction"].lower(), ref=r["idx"]))
         return out
 
-    def _like_button(self):
-        btn = self._main().get_by_role("button", name=re.compile(r"React Like|^Like$", re.I))
-        return btn.first if btn.count() else None
+    def recent_posts(self, url: str, limit: int = 8) -> list[Post]:
+        activity = url.split("#")[0].split("/recent-activity/")[0].rstrip("/") + "/recent-activity/all/"
+        self._goto(activity)
+        return self._parse_posts(activity)[:limit]
+
+    def _find_post(self, post: Post):
+        """This post's container on the activity page; reloads the page if needed (comments run on a later pass)."""
+        activity = post.url.split("#")[0]
+        here = self.page.url.split("#")[0] == activity
+        posts = self._parse_posts(activity) if here else self.recent_posts(activity, limit=20)
+        found = next((p for p in posts if p.urn == post.urn), None)
+        if not found:
+            raise ActionError("couldn't find that post on their activity page any more")
+        return self.page.locator(f"[data-oc-post='{found.ref}']"), found
 
     def like(self, post: Post) -> None:
-        self._goto(post.url)
-        btn = self._like_button()
-        if not btn:
-            raise ActionError("no Like button on the post")
-        if btn.get_attribute("aria-pressed") != "true":
-            btn.click()
-            self._pause(1, 2)
+        box, found = self._find_post(post)
+        if found.liked:
+            return
+        react = box.locator("button[aria-label^='Reaction button state']").first
+        react.click()
+        self._pause(1, 2)
+        if "no reaction" in (react.get_attribute("aria-label") or "").lower():
+            raise ActionError("like didn't register")
 
     def comment(self, post: Post, text: str) -> None:
-        self._goto(post.url)
-        open_btn = self._main().get_by_role("button", name=re.compile(r"^Comment$", re.I))
-        if open_btn.count():
-            open_btn.first.click()
-            self._pause(0.8, 1.6)
-        box = self._main().locator("div.ql-editor[contenteditable='true']").first
-        box.wait_for()
-        box.click()
+        box, _ = self._find_post(post)
+        toggle = box.get_by_role("button", name="Comment", exact=True).first
+        toggle.click()
+        self._pause(1, 2)
+        editor = box.locator("[contenteditable='true'][aria-label^='Text editor for creating comment']").first
+        editor.wait_for()
+        before = {box.locator("button").nth(i).evaluate("e => e.outerHTML.length + ':' + (e.getAttribute('componentkey') || '')")
+                  for i in range(box.locator("button").count())}
+        editor.click()
         self._type_multiline(text)
-        self._pause(0.8, 1.6)
-        submit = self._main().locator("button.comments-comment-box__submit-button, button.comments-comment-box__submit-button--cr")
-        if not submit.count():
-            submit = self._main().get_by_role("button", name=re.compile(r"^(Comment|Post)$", re.I))
-        if not submit.count():
-            raise ActionError("no button to post the comment")
-        submit.last.click()
-        self._pause()
+        self._pause(1, 2)
+        # The post button only appears once there's text. Use it only if exactly one new one showed up.
+        buttons = box.locator("button")
+        new = []
+        for i in range(buttons.count()):
+            b = buttons.nth(i)
+            sig = b.evaluate("e => e.outerHTML.length + ':' + (e.getAttribute('componentkey') || '')")
+            label = (b.get_attribute("aria-label") or b.inner_text() or "").strip()
+            if sig not in before and b.is_visible() and b.is_enabled() and re.search(r"comment|post|submit", label, re.I):
+                new.append(b)
+        if len(new) != 1:
+            raise ActionError("couldn't identify the button to post the comment (left typed, not posted)")
+        new[0].click()
+        self._pause(2, 3)
 
     def check(self, url: str) -> dict:
-        """Read-only diagnostic: what the bot can see on a profile. Clicks nothing except reading pages."""
+        """Read-only diagnostic: what the bot can see on a profile. Clicks nothing except "More" if present."""
         p = self.view(url)
-        main = self._main()
         report = {
-            "degree": p.degree, "pending": p.pending,
-            "connect_button": main.get_by_role("button", name=re.compile(r"^Invite .+ to connect$", re.I)).count() > 0,
-            "more_menu": main.get_by_role("button", name=re.compile(r"^More actions$", re.I)).count() > 0,
-            "message_button": main.get_by_role("button", name=re.compile(r"^Message", re.I)).count() > 0,
+            "name": self.profile_name, "degree": p.degree, "pending": p.pending,
+            "message_control": self._message_control() is not None,
+            "invite_control_for_this_profile": self._invite_control(url) is not None,
         }
         posts = self.recent_posts(url)
         report["posts"] = [{"age_days": round(x.age_days, 1) if x.age_days is not None else None, "liked": x.liked,
-                            "text": x.text[:80], "url": x.url} for x in posts]
+                            "text": x.text[:90].replace("\n", " "), "key": x.urn} for x in posts]
         return report
