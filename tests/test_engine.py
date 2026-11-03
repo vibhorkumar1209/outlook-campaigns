@@ -752,6 +752,54 @@ class BotTest(Base):
         g = one(self.conn, "SELECT * FROM engagements WHERE task_id = ?", t2["id"])
         self.assertEqual((g["liked"], g["commented"]), (1, 0))
 
+    def messaged(self):
+        """Jane (already connected) gets the sequence's LinkedIn message from the bot."""
+        self.conn.execute("UPDATE steps SET channel = 'li_message', condition = 'always' WHERE campaign_id = ? AND pos = 0", (self.cid,))
+        self.conn.execute("UPDATE leads SET li_state = 'connected' WHERE email = 'jane@x.com'")
+        self.tick(MON)
+        self.bot()
+        self.assertEqual(one(self.conn, "SELECT status FROM tasks WHERE channel = 'li_message'")["status"], "done")
+
+    def reply_driver(self, inbox, thread):
+        d = FakeDriver()
+        d.inbox = lambda: inbox
+        d.thread_reply = lambda url, ours: (d.calls.append(("thread", url)), thread)[1]
+        return d
+
+    def test_linkedin_reply_moves_to_leads(self):
+        self.messaged()
+        d = self.reply_driver([{"name": "Jane (JD)", "snippet": "Jane: yes", "last_from_me": False}], "yes")
+        self.bot(d, at=MON + timedelta(minutes=20))
+        self.assertEqual(self.enr("jane@x.com")["status"], "replied")
+        self.assertEqual(one(self.conn, "SELECT stage FROM leads WHERE email = 'jane@x.com'")["stage"], "lead")
+        ev = one(self.conn, "SELECT channel, detail FROM events WHERE type = 'reply'")
+        self.assertEqual((ev["channel"], ev["detail"]), ("linkedin", "yes"))
+
+    def test_reply_after_bounce_still_makes_a_lead(self):
+        self.messaged()
+        self.conn.execute("UPDATE enrollments SET status = 'bounced' WHERE lead_id = (SELECT id FROM leads WHERE email = 'jane@x.com')")
+        self.bot(self.reply_driver([], "Sure, call me"), at=MON + timedelta(minutes=20))
+        self.assertEqual(one(self.conn, "SELECT stage FROM leads WHERE email = 'jane@x.com'")["stage"], "lead")
+        self.assertEqual(self.enr("jane@x.com")["status"], "bounced")  # history kept
+
+    def test_inbox_showing_we_spoke_last_skips_thread(self):
+        self.messaged()
+        d = self.reply_driver([{"name": "Jane Doe", "snippet": "You: Hi Jane", "last_from_me": True}], "should not be read")
+        self.bot(d, at=MON + timedelta(minutes=20))
+        self.assertNotIn("thread", [c[0] for c in d.calls if isinstance(c, tuple)])
+        self.assertEqual(self.enr("jane@x.com")["status"], "active")
+
+    def test_old_message_from_them_is_not_a_reply_and_check_is_throttled(self):
+        self.messaged()
+        d = self.reply_driver([], None)            # not in the list -> open the thread; nothing after ours
+        self.bot(d, at=MON + timedelta(minutes=20))
+        self.assertEqual(self.enr("jane@x.com")["status"], "active")
+        d2 = self.reply_driver([], "late reply")
+        self.bot(d2, at=MON + timedelta(minutes=25))  # within 10 minutes: no new check
+        self.assertEqual(d2.calls, [])
+        self.bot(d2, at=MON + timedelta(minutes=31))
+        self.assertEqual(self.enr("jane@x.com")["status"], "replied")
+
     def test_parse_age(self):
         P = linkedin_bot.parse_age_days
         self.assertEqual([P("3h •"), P("2d • Edited"), P("1w"), P("5mo •"), P("1yr"), P("Just now")],

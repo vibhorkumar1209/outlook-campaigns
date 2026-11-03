@@ -109,13 +109,15 @@ def close_tasks(conn, enrollment_id: int, now: datetime) -> None:
 
 def mark_replied(conn, lead_id: int, channel: str, at: datetime, *, enrollment: dict | None = None,
                  detail: str | None = None) -> bool:
-    """Stop the lead in every campaign. The campaign that got the reply is 'replied', others 'stopped'."""
+    """Stop the lead in every campaign (the one that got the reply is 'replied', others 'stopped') and move them
+    to Leads. Still counts for someone whose sequences already ended (e.g. bounced). False if nothing changed."""
     ens = rows(conn, "SELECT * FROM enrollments WHERE lead_id = ? AND status IN ('pending', 'active', 'done')", lead_id)
-    if not ens:
+    if not ens and scalar(conn, "SELECT stage FROM leads WHERE id = ?", lead_id) == "lead":
         return False
     if enrollment is None:
-        contacted = [e for e in ens if e["step_pos"] >= 0] or ens
-        enrollment = max(contacted, key=lambda e: e["last_step_at"] or "")
+        contacted = [e for e in ens if e["step_pos"] >= 0] or ens or \
+            rows(conn, "SELECT * FROM enrollments WHERE lead_id = ? ORDER BY id DESC LIMIT 1", lead_id)
+        enrollment = max(contacted, key=lambda e: e["last_step_at"] or "") if contacted else None
     for e in ens:
         if e["id"] == enrollment["id"]:
             conn.execute("UPDATE enrollments SET status = 'replied', replied_at = ?, reply_channel = ? WHERE id = ?",
@@ -124,8 +126,8 @@ def mark_replied(conn, lead_id: int, channel: str, at: datetime, *, enrollment: 
             conn.execute("UPDATE enrollments SET status = 'stopped', note = ? WHERE id = ?",
                          (f"replied via {channel} in another campaign", e["id"]))
         close_tasks(conn, e["id"], at)
-    event(conn, lead_id, "reply", enrollment=enrollment, channel=channel, step_pos=enrollment["step_pos"],
-          detail=detail, at=at)
+    event(conn, lead_id, "reply", enrollment=enrollment, channel=channel,
+          step_pos=enrollment["step_pos"] if enrollment else None, detail=detail, at=at)
     # They responded: out of every sequence (above) and into Leads.
     conn.execute("UPDATE leads SET stage = 'lead', became_lead_at = COALESCE(became_lead_at, ?) WHERE id = ?",
                  (iso(at), lead_id))
