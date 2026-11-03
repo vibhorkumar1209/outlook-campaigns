@@ -116,6 +116,8 @@ def cmd_tick(a):
     r = Runner()
     if not r.run_once(send=not a.dry_run):
         sys.exit(1)
+    if not a.dry_run:
+        r.run_bot()
 
 
 def cmd_install(a):

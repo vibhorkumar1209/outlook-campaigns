@@ -226,6 +226,67 @@ class FlowTest(Base):
         self.assertIsNone(self.task("jane@x.com"))
 
 
+class ResumeStageTest(Base):
+    EMAIL = [("email", 0, "Hi {{ company }}", "Hello"), ("email", 2, None, "Bump")]
+
+    def setUp(self):
+        super().setUp()
+        self.conn.execute("UPDATE campaigns SET status = 'paused' WHERE id = ?", (self.cid,))
+        self.cid = self.campaign(self.EMAIL, name="email-only")
+        for l in rows(self.conn, "SELECT id FROM leads"):
+            self.conn.execute("INSERT INTO enrollments (campaign_id, lead_id, enrolled_at) VALUES (?, ?, ?)",
+                              (self.cid, l["id"], iso(MON)))
+
+    def test_bounce_then_fix_and_resume_resends_that_step(self):
+        self.tick(MON)
+        self.g.inbox.append(mail("postmaster@x.com", "Undeliverable: Hi Beta", cid=self.conv("bob@x.com"),
+                                 at=MON + timedelta(minutes=2)))
+        self.tick(MON + timedelta(minutes=5))
+        e = self.enr("bob@x.com")
+        self.assertEqual(e["status"], "bounced")
+        self.conn.execute("UPDATE leads SET email = 'bob.ray@x.com' WHERE email = 'bob@x.com'")
+        how = engine.resume_enrollment(self.conn, e["id"], now=MON + timedelta(minutes=10))
+        self.assertEqual(how, "resends step 1")
+        self.tick(MON + timedelta(minutes=11))
+        self.assertEqual([(k, to, subj) for k, to, subj, _ in self.g.sent if to == "bob.ray@x.com"],
+                         [("new", "bob.ray@x.com", "Hi Beta")])  # same step, fresh thread
+        self.assertEqual(one(self.conn, "SELECT status FROM enrollments WHERE id = ?", e["id"])["status"], "active")
+
+    def test_resume_error_and_refuse_replied(self):
+        self.conn.execute("UPDATE steps SET body = '{{ nope }}' WHERE campaign_id = ? AND pos = 0", (self.cid,))
+        self.tick(MON)
+        e = self.enr("jane@x.com")
+        self.assertEqual(e["status"], "error")
+        self.conn.execute("UPDATE steps SET body = 'Hello' WHERE campaign_id = ? AND pos = 0", (self.cid,))
+        engine.resume_enrollment(self.conn, e["id"], now=MON + timedelta(minutes=5))
+        self.tick(MON + timedelta(minutes=6))
+        self.assertIn("jane@x.com", [x[1] for x in self.g.sent])
+        engine.mark_replied(self.conn, e["lead_id"], "email", MON + timedelta(hours=1))
+        with self.assertRaises(ValueError):
+            engine.resume_enrollment(self.conn, e["id"])
+
+    def test_reply_moves_to_leads_and_out_of_sequences(self):
+        self.tick(MON)
+        self.g.inbox.append(mail("jane@x.com", cid=self.conv("jane@x.com"), at=MON + timedelta(minutes=30)))
+        self.tick(MON + timedelta(hours=1))
+        l = one(self.conn, "SELECT stage, became_lead_at FROM leads WHERE email = 'jane@x.com'")
+        self.assertEqual(l["stage"], "lead")
+        self.assertIsNotNone(l["became_lead_at"])
+        statuses = {r["status"] for r in rows(self.conn, "SELECT e.status FROM enrollments e JOIN leads l ON l.id = e.lead_id WHERE l.email = 'jane@x.com'")}
+        self.assertTrue(statuses <= {"replied", "stopped"})
+        self.tick(MON + timedelta(days=3))
+        self.assertEqual([x for x in self.g.sent if x[1] == "jane@x.com" and x[0] == "thread"], [])
+        self.assertEqual(one(self.conn, "SELECT stage FROM leads WHERE email = 'bob@x.com'")["stage"], "prospect")
+
+    def test_quick_pass_sends_without_inbox_scans(self):
+        calls = []
+        orig = self.g.conversation
+        self.g.conversation = lambda cid: calls.append(cid) or orig(cid)
+        engine.tick(self.conn, self.factory, now=MON, sleep=lambda s: None, log=self.logs.append, checks=False)
+        self.assertEqual(len(self.g.sent), 2)
+        self.assertEqual(calls, [])
+
+
 class BranchTest(Base):
     BRANCH = [("li_connect", 0, None, "Hi {{ first_name }}"),
               ("li_message", 0, None, "Great to be connected, {{ first_name }}"),

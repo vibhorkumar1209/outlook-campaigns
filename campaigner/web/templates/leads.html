@@ -1,16 +1,40 @@
 {% extends "base.html" %}
 {% from "_macros.html" import pill, lead_name %}
-{% block title %}Leads{% endblock %}
+{% block title %}{{ "Leads" if stage == "lead" else "Prospects" }}{% endblock %}
 {% block main %}
 <header class="head">
-  <div><h1>Leads <span class="meta">· {{ total }}</span></h1><p class="sub">One record per person across all campaigns, matched by email or LinkedIn URL.</p></div>
+  <div>
+    {% if stage == "lead" %}
+      <h1>Leads <span class="meta">· {{ counts.get("lead", 0) }}</span></h1>
+      <p class="sub">People who replied, by email or on LinkedIn. A reply drops them from every sequence and moves them here. Auto-replies don't count.</p>
+    {% else %}
+      <h1>Prospects <span class="meta">· {{ counts.get("prospect", 0) }}</span></h1>
+      <p class="sub">Everyone being worked by your sequences, matched across campaigns by email or LinkedIn URL. They move to <a href="/leads">Leads</a> when they reply.</p>
+    {% endif %}
+  </div>
   <div class="actions">
     <form method="get"><input name="q" value="{{ q }}" placeholder="Search name, email, company" style="width:260px"></form>
-    <a class="btn primary" href="/import">Import</a>
+    {% if stage != "lead" %}<a class="btn primary" href="/import">Import</a>{% endif %}
   </div>
 </header>
 {% if leads %}
 <section class="card"><div class="tbl-wrap"><table class="t">
+  {% if stage == "lead" %}
+  <thead><tr><th>Name</th><th>Company</th><th>Replied</th><th>Via</th><th>Campaign</th><th>Reply</th><th>Email</th></tr></thead>
+  <tbody>
+  {% for l in leads %}
+    <tr>
+      <td><a href="/leads/{{ l.id }}">{{ lead_name(l) }}</a><div class="meta">{{ l.title }}</div></td>
+      <td>{{ l.company }}</td>
+      <td class="meta">{{ (l.reply_at or l.became_lead_at) | ago if (l.reply_at or l.became_lead_at) else "–" }}</td>
+      <td>{% if l.reply_channel %}<span class="chip {{ 'email' if l.reply_channel == 'email' else 'linkedin' }}">{{ "Email" if l.reply_channel == "email" else "LinkedIn" }}</span>{% else %}<span class="meta">moved by you</span>{% endif %}</td>
+      <td>{{ l.reply_campaign or "–" }}</td>
+      <td class="meta">{{ (l.reply_detail or "")[:70] }}</td>
+      <td class="meta">{{ l.email or "–" }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+  {% else %}
   <thead><tr><th>Name</th><th>Company</th><th>Email</th><th>LinkedIn</th><th class="num">Campaigns</th><th>Latest status</th><th>Last touch</th></tr></thead>
   <tbody>
   {% for l in leads %}
@@ -25,8 +49,13 @@
     </tr>
   {% endfor %}
   </tbody>
+  {% endif %}
 </table></div></section>
 {% else %}
-  <div class="empty">{% if q %}No leads match "{{ q }}".{% else %}No leads yet. <a href="/import">Import a CSV or Excel file</a>.{% endif %}</div>
+  <div class="empty">
+    {% if q %}No {{ "leads" if stage == "lead" else "prospects" }} match "{{ q }}".
+    {% elif stage == "lead" %}No leads yet. When someone replies to a sequence, they move here.
+    {% else %}No prospects yet. <a href="/import">Import a CSV or Excel file</a>.{% endif %}
+  </div>
 {% endif %}
 {% endblock %}
