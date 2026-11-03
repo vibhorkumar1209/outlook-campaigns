@@ -42,7 +42,7 @@ class Runner:
         self.logs.append(line)
         print(line, flush=True)
 
-    def run_once(self, send: bool = True) -> bool:
+    def run_once(self, send: bool = True, checks: bool = True) -> bool:
         if not self._lock.acquire(blocking=False):
             return False
         self.busy = True
@@ -54,9 +54,7 @@ class Runner:
                 factory = Graph if self.accounts() else None
                 conn = db.connect()
                 try:
-                    engine.tick(conn, factory, tracker=Tracker.from_env(), send=send, log=self.log)
-                    if send:
-                        linkedin_bot.run(conn, linkedin_bot.ChromeDriver, log=self.log, draft=comment_drafter(conn))
+                    engine.tick(conn, factory, tracker=Tracker.from_env(), send=send, log=self.log, checks=checks)
                 finally:
                     conn.close()
                 return True
@@ -67,17 +65,41 @@ class Runner:
             self.busy = False
             self._lock.release()
 
+    def run_bot(self) -> None:
+        """One LinkedIn bot pass. Runs on its own loop so its slow, deliberate pace never holds up email."""
+        try:
+            conn = db.connect()
+            try:
+                linkedin_bot.run(conn, linkedin_bot.ChromeDriver, log=self.log, draft=comment_drafter(conn))
+            finally:
+                conn.close()
+        except Exception as e:
+            self.log(f"LinkedIn bot run crashed: {e!r}")
+
     def run_async(self) -> None:
         threading.Thread(target=self.run_once, daemon=True).start()
+        threading.Thread(target=self.run_bot, daemon=True).start()
 
     def start_loop(self, minutes: int) -> None:
-        def loop():
+        """Email: a quick pass every minute (send what's due); the inbox-wide checks every `minutes`.
+        LinkedIn bot: its own pass every 3 minutes (it only opens Chrome when there's work in its hours)."""
+        def email_loop():
             time.sleep(5)
+            last_full = 0.0
             while True:
-                self.run_once()
-                time.sleep(minutes * 60)
+                full = time.monotonic() - last_full >= minutes * 60
+                if self.run_once(checks=full) and full:
+                    last_full = time.monotonic()
+                time.sleep(60)
 
-        threading.Thread(target=loop, daemon=True, name="ticker").start()
+        def bot_loop():
+            time.sleep(30)
+            while True:
+                self.run_bot()
+                time.sleep(180)
+
+        threading.Thread(target=email_loop, daemon=True, name="email").start()
+        threading.Thread(target=bot_loop, daemon=True, name="linkedin-bot").start()
 
     def start_login(self) -> None:
         def go():

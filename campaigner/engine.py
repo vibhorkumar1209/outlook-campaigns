@@ -109,13 +109,15 @@ def close_tasks(conn, enrollment_id: int, now: datetime) -> None:
 
 def mark_replied(conn, lead_id: int, channel: str, at: datetime, *, enrollment: dict | None = None,
                  detail: str | None = None) -> bool:
-    """Stop the lead in every campaign. The campaign that got the reply is 'replied', others 'stopped'."""
+    """Stop the lead in every campaign (the one that got the reply is 'replied', others 'stopped') and move them
+    to Leads. Still counts for someone whose sequences already ended (e.g. bounced). False if nothing changed."""
     ens = rows(conn, "SELECT * FROM enrollments WHERE lead_id = ? AND status IN ('pending', 'active', 'done')", lead_id)
-    if not ens:
+    if not ens and scalar(conn, "SELECT stage FROM leads WHERE id = ?", lead_id) == "lead":
         return False
     if enrollment is None:
-        contacted = [e for e in ens if e["step_pos"] >= 0] or ens
-        enrollment = max(contacted, key=lambda e: e["last_step_at"] or "")
+        contacted = [e for e in ens if e["step_pos"] >= 0] or ens or \
+            rows(conn, "SELECT * FROM enrollments WHERE lead_id = ? ORDER BY id DESC LIMIT 1", lead_id)
+        enrollment = max(contacted, key=lambda e: e["last_step_at"] or "") if contacted else None
     for e in ens:
         if e["id"] == enrollment["id"]:
             conn.execute("UPDATE enrollments SET status = 'replied', replied_at = ?, reply_channel = ? WHERE id = ?",
@@ -124,8 +126,11 @@ def mark_replied(conn, lead_id: int, channel: str, at: datetime, *, enrollment: 
             conn.execute("UPDATE enrollments SET status = 'stopped', note = ? WHERE id = ?",
                          (f"replied via {channel} in another campaign", e["id"]))
         close_tasks(conn, e["id"], at)
-    event(conn, lead_id, "reply", enrollment=enrollment, channel=channel, step_pos=enrollment["step_pos"],
-          detail=detail, at=at)
+    event(conn, lead_id, "reply", enrollment=enrollment, channel=channel,
+          step_pos=enrollment["step_pos"] if enrollment else None, detail=detail, at=at)
+    # They responded: out of every sequence (above) and into Leads.
+    conn.execute("UPDATE leads SET stage = 'lead', became_lead_at = COALESCE(became_lead_at, ?) WHERE id = ?",
+                 (iso(at), lead_id))
     return True
 
 
@@ -187,6 +192,34 @@ def _complete_engage(conn, t: dict, e: dict, action: str, comment: str | None, e
     else:
         conn.execute("UPDATE tasks SET status = 'skipped', done_at = ? WHERE id = ?", (iso(now), t["id"]))
         event(conn, e["lead_id"], "task_skipped", enrollment=e, channel=ENGAGE, detail=_by(actor, "no recent posts"), at=now)
+
+
+def resume_enrollment(conn, enrollment_id: int, now: datetime | None = None) -> str:
+    """Restart a lead's sequence from where it broke. Returns a short description; ValueError if it can't resume."""
+    now = now or utcnow()
+    e = one(conn, "SELECT e.*, l.dnc FROM enrollments e JOIN leads l ON l.id = e.lead_id WHERE e.id = ?", enrollment_id)
+    if not e:
+        raise ValueError("not found")
+    if e["dnc"]:
+        raise ValueError("this lead unsubscribed / is marked do-not-contact")
+    if e["status"] == "replied" or (e["note"] or "").startswith("replied via"):
+        raise ValueError("this lead replied; not restarting their sequence")
+    if e["status"] not in ("bounced", "error", "stopped"):
+        raise ValueError(f"nothing to resume (status is {e['status']})")
+    step_pos, conv, first_email, how = e["step_pos"], e["conversation_id"], e["first_email_at"], "continues"
+    if e["status"] == "bounced":
+        # Re-run the email that bounced, as a fresh thread (the old one never reached them).
+        b = one(conn, "SELECT step_pos FROM events WHERE enrollment_id = ? AND type = 'bounce' ORDER BY id DESC LIMIT 1",
+                enrollment_id)
+        bounced = b["step_pos"] if b and b["step_pos"] is not None else e["step_pos"]
+        step_pos, conv, first_email, how = bounced - 1, None, None, f"resends step {bounced + 1}"
+    conn.execute("""UPDATE enrollments SET status = ?, step_pos = ?, conversation_id = ?, first_email_at = ?,
+                      failures = 0, note = NULL, last_step_at = CASE WHEN ? THEN NULL ELSE last_step_at END
+                    WHERE id = ?""",
+                 ("pending" if step_pos < 0 else "active", step_pos, conv, first_email,
+                  1 if e["status"] == "bounced" else 0, enrollment_id))
+    event(conn, e["lead_id"], "resumed", enrollment=e, step_pos=step_pos + 1, detail=f"after {e['status']}: {how}", at=now)
+    return how
 
 
 def _advance(conn, e: dict, k: int, now: datetime) -> None:
@@ -600,16 +633,22 @@ def send_emails(conn, c, steps, queue, boxes: Mailboxes, tracker, now, send, sle
 
 
 def tick(conn, factory, *, tracker=None, now: datetime | None = None, send: bool = True, sleep=time.sleep,
-         log=print) -> None:
-    """factory(account) -> Graph for that mailbox (raises AuthError if not signed in); None = no Outlook at all."""
+         log=print, checks: bool = True) -> None:
+    """factory(account) -> Graph for that mailbox (raises AuthError if not signed in); None = no Outlook at all.
+    checks=False is the quick pass (every minute): send what's due and queue LinkedIn tasks, skipping the
+    inbox-wide reply/LinkedIn-notification/tracking scans. Follow-ups still recheck that lead's replies first."""
     now = now or utcnow()
     boxes = Mailboxes(factory, log)
-    if not factory or not default_sender(conn):
+    if checks and (not factory or not default_sender(conn)):
         log("No mailbox connected: email steps wait, LinkedIn tasks still queue")
-    check_email(conn, boxes, now, log)
-    check_linkedin(conn, boxes, now, log)
-    if tracker:
+    if checks:
+        check_email(conn, boxes, now, log)
+        check_linkedin(conn, boxes, now, log)
+    if tracker and not checks:
+        tracker = tracker if db.get_setting(conn, "tracker_ok", True) else None
+    elif tracker:
         problem = tracker.health()
+        db.set_setting(conn, "tracker_ok", not problem)
         if problem:
             # Never put links in real emails that point at a tracker that isn't answering.
             log(f"tracking off this run ({tracker.base}: {problem}); emails go out with plain links")

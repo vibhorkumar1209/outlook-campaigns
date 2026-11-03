@@ -434,6 +434,17 @@ async def preview(request: Request):
         return {"error": str(e)}
 
 
+@app.post("/api/enrollments/{eid}/resume")
+def resume(eid: int):
+    conn = db.connect()
+    try:
+        how = engine.resume_enrollment(conn, eid)
+    except ValueError as e:
+        raise HTTPException(409, str(e))
+    runner.run_async()
+    return {"ok": True, "how": how}
+
+
 @app.post("/api/enrollments/{eid}/stop")
 def stop(eid: int):
     conn = db.connect()
@@ -443,18 +454,32 @@ def stop(eid: int):
 
 # ---------- leads ----------
 
-@app.get("/leads")
-def leads(request: Request, q: str = ""):
+def contacts_page(request: Request, stage: str, q: str):
     conn = db.connect()
     like = f"%{q.strip()}%"
     items = rows(conn, """
         SELECT l.*, (SELECT COUNT(*) FROM enrollments e WHERE e.lead_id = l.id) n_campaigns,
           (SELECT status FROM enrollments e WHERE e.lead_id = l.id ORDER BY e.id DESC LIMIT 1) last_status,
-          (SELECT MAX(at) FROM events ev WHERE ev.lead_id = l.id AND ev.type IN ('sent', 'task_done', 'reply')) last_touch
+          (SELECT MAX(at) FROM events ev WHERE ev.lead_id = l.id AND ev.type IN ('sent', 'task_done', 'reply')) last_touch,
+          r.channel reply_channel, r.at reply_at, r.detail reply_detail, rc.name reply_campaign
         FROM leads l
-        WHERE ? = '' OR l.first_name || ' ' || l.last_name LIKE ? OR l.email LIKE ? OR l.company LIKE ?
-        ORDER BY l.id DESC LIMIT 500""", q.strip(), like, like, like)
-    return page(request, "leads.html", conn, leads=items, q=q, total=scalar(conn, "SELECT COUNT(*) FROM leads"))
+        LEFT JOIN events r ON r.id = (SELECT MAX(id) FROM events WHERE lead_id = l.id AND type = 'reply')
+        LEFT JOIN campaigns rc ON rc.id = r.campaign_id
+        WHERE l.stage = ? AND (? = '' OR l.first_name || ' ' || l.last_name LIKE ? OR l.email LIKE ? OR l.company LIKE ?)
+        ORDER BY COALESCE(l.became_lead_at, '') DESC, l.id DESC LIMIT 500""", stage, q.strip(), like, like, like)
+    counts = {r["stage"]: r["n"] for r in rows(conn, "SELECT stage, COUNT(*) n FROM leads GROUP BY stage")}
+    return page(request, "leads.html", conn, leads=items, q=q, stage=stage, counts=counts)
+
+
+@app.get("/leads")
+def leads(request: Request, q: str = ""):
+    """People who responded: dropped from every sequence when they replied."""
+    return contacts_page(request, "lead", q)
+
+
+@app.get("/prospects")
+def prospects(request: Request, q: str = ""):
+    return contacts_page(request, "prospect", q)
 
 
 @app.get("/leads/{lid}")
@@ -469,7 +494,8 @@ def lead(request: Request, lid: int):
     events = rows(conn, """SELECT ev.*, c.name campaign FROM events ev LEFT JOIN campaigns c ON c.id = ev.campaign_id
                            WHERE ev.lead_id = ? ORDER BY ev.at DESC, ev.id DESC""", lid)
     extras = json.loads(l["data"] or "{}")
-    return page(request, "lead.html", conn, l=l, enrollments=ens, events=events, extras=extras)
+    return page(request, "lead.html", conn, l=l, enrollments=ens, events=events, extras=extras,
+                active="/leads" if l["stage"] == "lead" else "/prospects")
 
 
 @app.post("/api/leads/{lid}")
@@ -484,6 +510,13 @@ async def lead_action(lid: int, request: Request):
             raise HTTPException(409, "lead is not in an open sequence")
     elif act == "connected":
         engine.set_connected(conn, lid, now, source="marked manually")
+    elif act == "stage":
+        stage = "lead" if p.get("stage") == "lead" else "prospect"
+        conn.execute("UPDATE leads SET stage = ?, became_lead_at = CASE WHEN ? = 'lead' THEN COALESCE(became_lead_at, ?) "
+                     "ELSE NULL END WHERE id = ?", (stage, stage, iso(now), lid))
+        if stage == "lead":  # a lead is out of sequences, same as a reply
+            for e in rows(conn, "SELECT id FROM enrollments WHERE lead_id = ? AND status IN ('pending', 'active', 'done')", lid):
+                engine.stop_enrollment(conn, e["id"], "moved to leads", now=now)
     elif act == "dnc":
         if not engine.unsubscribe(conn, lid, now, detail="marked do-not-contact"):
             raise HTTPException(409, "already do-not-contact")

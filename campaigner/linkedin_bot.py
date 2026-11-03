@@ -35,6 +35,7 @@ DEFAULTS = {
 }
 ACTION_OF = {"li_view": "view", "li_connect": "connect", "li_message": "message", "li_engage": "like"}
 MAX_ATTEMPTS = 2
+REPLY_CHECK_EVERY = timedelta(minutes=10)  # LinkedIn inbox scan for replies to the bot's messages
 APPROVAL_TIMEOUT = timedelta(days=3)  # unapproved comment drafts expire; the like still counts
 class _ProfileLock:
     """One Chrome profile can only be open once. A file lock, so the dashboard's runs, its sign-in window and
@@ -211,7 +212,8 @@ def run(conn, driver_factory, *, now: datetime | None = None, log=print, sleep=N
         if action == "connect" and week_invites >= cfg["li_bot_week_invites"]:
             continue
         todo.append((t, action))
-    if not todo:
+    candidates = reply_candidates(conn) if reply_check_due(conn, now) else []
+    if not todo and not candidates:
         return
     if not PROFILE_LOCK.acquire(blocking=False):
         log("LinkedIn bot: browser profile busy (sign-in window open?), skipping this run")
@@ -220,6 +222,17 @@ def run(conn, driver_factory, *, now: datetime | None = None, log=print, sleep=N
     done = 0
     try:
         driver.open()
+        if candidates:
+            try:
+                check_replies(conn, driver, candidates, now, log)
+            except BlockedError:
+                raise
+            except Exception as e:  # never let a read-only check stop the outreach work
+                log(f"LinkedIn bot: reply check failed: {e}")
+            db.set_setting(conn, "li_reply_checked_at", iso(now))
+            # Anyone who just replied is out of the sequence: drop their pending actions from this pass.
+            todo = [(t, a) for t, a in todo
+                    if (one(conn, "SELECT status FROM tasks WHERE id = ?", t["id"]) or {}).get("status") == "open"]
         for t, action in todo:
             if done >= cfg["li_bot_per_run"]:
                 break
@@ -236,10 +249,6 @@ def run(conn, driver_factory, *, now: datetime | None = None, log=print, sleep=N
                     used[action] = used.get(action, 0) + 1
                     week_invites += action == "connect"
                 done += 1
-            except BlockedError as e:
-                pause(conn, str(e))
-                log(f"LinkedIn bot paused: {e}. Resolve it in the bot's Chrome window, then Resume in Settings.")
-                return
             except ActionError as e:
                 _fail(conn, t, str(e), log)
                 _record(conn, action, t, False, str(e))
@@ -247,11 +256,63 @@ def run(conn, driver_factory, *, now: datetime | None = None, log=print, sleep=N
             except ValueError as e:  # completed by you between our check and the action finishing
                 log(f"LinkedIn bot: {t['first_name']} {t['last_name']}: {e}, skipped")
                 done += 1
+    except BlockedError as e:  # from the reply check or any action: LinkedIn wants a person
+        pause(conn, str(e))
+        log(f"LinkedIn bot paused: {e}. Resolve it in the bot's Chrome window, then Resume in Settings.")
     finally:
         try:
             driver.close()
         finally:
             PROFILE_LOCK.release()
+
+
+# ---------- replies on LinkedIn ----------
+
+def reply_check_due(conn, now: datetime) -> bool:
+    last = parse(db.get_setting(conn, "li_reply_checked_at"))
+    return not last or now - last >= REPLY_CHECK_EVERY
+
+
+REPLY_CANDIDATES_SQL = """
+    SELECT l.id lead_id, l.first_name, l.last_name, l.linkedin_url, t.body sent_text, t.done_at sent_at
+    FROM tasks t JOIN enrollments e ON e.id = t.enrollment_id
+    JOIN campaigns c ON c.id = e.campaign_id JOIN leads l ON l.id = e.lead_id
+    WHERE t.channel = 'li_message' AND t.status = 'done' AND t.body != ''
+      AND e.status NOT IN ('replied') AND c.status != 'draft' AND l.stage = 'prospect' AND l.dnc = 0
+      AND l.linkedin_url IS NOT NULL AND t.done_at >= ?
+      AND t.id = (SELECT MAX(t2.id) FROM tasks t2 JOIN enrollments e2 ON e2.id = t2.enrollment_id
+                  WHERE e2.lead_id = l.id AND t2.channel = 'li_message' AND t2.status = 'done')
+"""
+
+
+def reply_candidates(conn) -> list[dict]:
+    """Prospects who got a LinkedIn message from us in the last 30 days, even if their sequence has since
+    ended (bounced, stopped): a reply still makes them a lead."""
+    return rows(conn, REPLY_CANDIDATES_SQL, iso(utcnow() - timedelta(days=30)))
+
+
+def _norm(s: str) -> str:
+    return " ".join(re.sub(r"[^a-z0-9 ]+", " ", (s or "").lower()).split())
+
+
+def inbox_says_no_reply(items: list[dict], lead: dict) -> bool:
+    """True only when the inbox list shows, unambiguously, that we spoke last in this lead's thread."""
+    first, last = _norm(lead["first_name"]), _norm(lead["last_name"])
+    named = [i for i in items if _norm(i["name"]).split()[:1] == first.split()[:1]]
+    strong = [i for i in named if last and last in _norm(i["name"])]
+    match = strong[0] if strong else (named[0] if len(named) == 1 else None)
+    return bool(match and match["last_from_me"])
+
+
+def check_replies(conn, driver, candidates: list[dict], now: datetime, log) -> None:
+    items = driver.inbox()
+    for lead in candidates:
+        if inbox_says_no_reply(items, lead):
+            continue
+        reply = driver.thread_reply(lead["linkedin_url"], lead["sent_text"])
+        if reply:
+            if engine.mark_replied(conn, lead["lead_id"], "linkedin", now, detail=reply[:200]):
+                log(f"reply (LinkedIn) from {lead['first_name']} {lead['last_name']}: moved to Leads")
 
 
 def handle(conn, driver, t: dict, action: str, *, now: datetime, log, draft) -> bool:
@@ -531,6 +592,64 @@ class ChromeDriver:
             raise ActionError("message may not have sent (text still in the box)")
         self._close_chats()
         return "sent"
+
+    _INBOX_JS = r"""() => {
+      const roots = [document];
+      const collect = (r) => { for (const el of r.querySelectorAll('*')) if (el.shadowRoot) { roots.push(el.shadowRoot); collect(el.shadowRoot); } };
+      collect(document);
+      const out = [];
+      for (const r of roots) for (const li of r.querySelectorAll('li')) {
+        const t = li.innerText || '';
+        if (!/conversation details/i.test(t) || t.length > 2000) continue;
+        const lines = t.split('\n').map(s => s.trim()).filter(Boolean).filter(s => !/^Status is /.test(s));
+        out.push(lines);
+      }
+      return out;
+    }"""
+
+    def inbox(self, limit: int = 40) -> list[dict]:
+        """Recent conversations: [{name, snippet, last_from_me}]. Read-only (LinkedIn may mark the top thread read)."""
+        self._goto(self.base + "/messaging/")
+        self.page.wait_for_timeout(2500)
+        out = []
+        for lines in self.page.evaluate(self._INBOX_JS)[:limit]:
+            if len(lines) < 3:
+                continue
+            snippet = next((l for l in lines[1:] if re.match(r"^[^:]{1,40}: ", l) or " sent " in l), "")
+            out.append({"name": lines[0], "snippet": snippet, "last_from_me": snippet.startswith("You:")})
+        return out
+
+    _THREAD_JS = r"""() => {
+      const roots = [document];
+      const collect = (r) => { for (const el of r.querySelectorAll('*')) if (el.shadowRoot) { roots.push(el.shadowRoot); collect(el.shadowRoot); } };
+      collect(document);
+      const out = [];
+      for (const r of roots) for (const el of r.querySelectorAll('[aria-label^="Options for the message from"]'))
+        out.push(el.getAttribute('aria-label').replace(/^Options for the message from /, ''));
+      return out;
+    }"""
+
+    def thread_reply(self, url: str, our_text: str) -> str | None:
+        """Open this profile's conversation and return the first thing they wrote AFTER our message, if any."""
+        p = self.view(url)
+        btn = self._message_control()
+        if not btn or p.degree != "1st":
+            return None
+        self._close_chats()
+        btn.click()
+        self._pause(3, 4.5)
+        msgs = []
+        for m in self.page.evaluate(self._THREAD_JS):  # "Name: text"; LinkedIn renders each message twice
+            if not msgs or msgs[-1] != m:
+                msgs.append(m)
+        self._close_chats()
+        key = re.sub(r"\s+", " ", our_text).strip()[:40].lower()
+        ours = [i for i, m in enumerate(msgs) if key and key in re.sub(r"\s+", " ", m).lower()]
+        if not ours:
+            return None
+        me = msgs[ours[-1]].split(":", 1)[0]
+        later = [m for m in msgs[ours[-1] + 1:] if m.split(":", 1)[0] != me]
+        return later[0].split(":", 1)[1].strip() if later else None
 
     def _type_multiline(self, text: str) -> None:
         # Shift+Enter: a bare Enter can send the message in LinkedIn's composer.

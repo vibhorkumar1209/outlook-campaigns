@@ -6,10 +6,10 @@
   "enrolled": "Enrolled", "sent": "Email sent", "task_created": "Task queued", "task_done": "Done",
   "task_skipped": "Task skipped", "step_skipped": "Step skipped", "connected": "Connected on LinkedIn",
   "reply": "Replied", "bounce": "Bounced", "stopped": "Stopped", "error": "Error",
-  "open": "Opened email", "click": "Clicked link", "unsubscribe": "Unsubscribed"} %}
+  "open": "Opened email", "click": "Clicked link", "unsubscribe": "Unsubscribed", "resumed": "Sequence resumed"} %}
 <header class="head">
   <div>
-    <h1>{{ lead_name(l) }} {% if l.li_state != "none" %}{{ pill(l.li_state) }}{% endif %}{% if l.dnc %} <span class="pill critical">do not contact</span>{% endif %}</h1>
+    <h1>{{ lead_name(l) }} {% if l.li_state != "none" %}{{ pill(l.li_state) }}{% endif %}{% if l.dnc %} <span class="pill critical">do not contact</span>{% endif %} {% if l.stage == "lead" %}<span class="pill good">lead</span>{% else %}<span class="pill muted">prospect</span>{% endif %}</h1>
     <p class="sub">{{ l.title }}{% if l.title and l.company %} · {% endif %}{{ l.company }}</p>
   </div>
   <div class="actions">
@@ -17,6 +17,11 @@
     {% if l.li_state != "connected" and l.linkedin_url %}<button class="btn" data-lead-act="connected" data-lead="{{ l.id }}">Mark connected</button>{% endif %}
     <button class="btn" data-lead-act="replied" data-channel="linkedin" data-lead="{{ l.id }}" data-ask="Mark as replied on LinkedIn? This stops all their sequences.">Replied on LinkedIn</button>
     <button class="btn" data-lead-act="replied" data-channel="email" data-lead="{{ l.id }}" data-ask="Mark as replied by email? This stops all their sequences.">Replied by email</button>
+    {% if l.stage == "lead" %}
+      <button class="btn" data-lead-act="stage" data-stage="prospect" data-lead="{{ l.id }}" data-ask="Move back to prospects? Their sequences stay stopped; use Resume on a campaign to restart one.">Move to prospects</button>
+    {% else %}
+      <button class="btn" data-lead-act="stage" data-stage="lead" data-lead="{{ l.id }}" data-ask="Move to leads? This stops all their sequences.">Move to leads</button>
+    {% endif %}
     {% if not l.dnc %}<button class="btn danger" data-lead-act="dnc" data-lead="{{ l.id }}" data-ask="Mark do-not-contact? Stops every campaign now and for future imports.">Do not contact</button>{% endif %}
     <button class="btn danger" data-lead-act="stop_all" data-lead="{{ l.id }}" data-ask="Stop every campaign for this lead?">Stop all</button>
   </div>
@@ -55,7 +60,8 @@
           <tr>
             <td><a href="/campaigns/{{ e.campaign_id }}">{{ e.campaign }}</a><div class="meta">step {{ e.step_pos + 1 if e.step_pos >= 0 else 0 }}/{{ e.n_steps }}{% if e.note %} · {{ e.note }}{% endif %}</div></td>
             <td>{{ pill(e.status) }}</td>
-            <td>{% if e.status in ("pending", "active", "done") %}<button class="btn sm ghost" data-stop="{{ e.id }}">Stop</button>{% endif %}</td>
+            <td>{% if e.status in ("pending", "active", "done") %}<button class="btn sm ghost" data-stop="{{ e.id }}">Stop</button>
+                {% elif e.status in ("bounced", "error", "stopped") and not l.dnc and not (e.note or "").startswith("replied via") %}<button class="btn sm" data-resume="{{ e.id }}" data-status="{{ e.status }}">Resume</button>{% endif %}</td>
           </tr>
         {% endfor %}
       </tbody></table>

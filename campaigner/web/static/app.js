@@ -139,7 +139,7 @@ $$(".task").forEach((card) => {
 $$("[data-lead-act]").forEach((b) => b.addEventListener("click", async () => {
   const act = b.dataset.leadAct;
   if (b.dataset.ask && !confirm(b.dataset.ask)) return;
-  const body = { action: act, channel: b.dataset.channel };
+  const body = { action: act, channel: b.dataset.channel, stage: b.dataset.stage };
   if (act === "update") {
     body.email = $("#lead-email").value;
     body.linkedin_url = $("#lead-li").value;
@@ -151,5 +151,14 @@ $$("[data-lead-act]").forEach((b) => b.addEventListener("click", async () => {
 $$("[data-stop]").forEach((b) => b.addEventListener("click", async () => {
   if (!confirm("Stop all further steps for this lead in this campaign?")) return;
   try { await api(`/api/enrollments/${b.dataset.stop}/stop`); location.reload(); }
+  catch (err) { toast(err.message, true); }
+}));
+
+$$("[data-resume]").forEach((b) => b.addEventListener("click", async () => {
+  const ask = b.dataset.status === "bounced"
+    ? "Resend the email that bounced and continue the sequence? Fix their email address first, or it will bounce again."
+    : "Restart this lead's sequence from where it stopped?";
+  if (!confirm(ask)) return;
+  try { const r = await api(`/api/enrollments/${b.dataset.resume}/resume`); toast(`Resumed: ${r.how}`); setTimeout(() => location.reload(), 900); }
   catch (err) { toast(err.message, true); }
 }));

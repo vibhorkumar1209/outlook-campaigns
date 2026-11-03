@@ -142,7 +142,8 @@
         <td>{% if e.linkedin_url %}<a href="{{ e.linkedin_url }}" target="_blank" rel="noopener">profile</a> {{ pill(e.li_state) if e.li_state != "none" }}{% else %}<span class="meta">–</span>{% endif %}</td>
         <td class="meta">{{ e.last_step_at | ago }}</td>
         <td class="meta">{{ e.note or "" }}</td>
-        <td>{% if e.status in ("pending", "active", "done") %}<button class="btn sm ghost" data-stop="{{ e.id }}">Stop</button>{% endif %}</td>
+        <td>{% if e.status in ("pending", "active", "done") %}<button class="btn sm ghost" data-stop="{{ e.id }}">Stop</button>
+            {% elif e.status in ("bounced", "error", "stopped") and not (e.note or "").startswith("replied via") and (e.note or "") != "unsubscribed" %}<button class="btn sm" data-resume="{{ e.id }}" data-status="{{ e.status }}">Resume</button>{% endif %}</td>
       </tr>
     {% endfor %}
     </tbody>
