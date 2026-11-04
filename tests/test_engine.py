@@ -123,6 +123,28 @@ class ImportTest(Base):
         self.assertEqual(one(self.conn, "SELECT title FROM leads WHERE email = 'jane@x.com'")["title"], "CIO")
 
 
+    def test_import_keeps_out_leads_dnc_and_people_in_another_sequence(self):
+        jane, bob = (one(self.conn, "SELECT id FROM leads WHERE email = ?", e)["id"] for e in ("jane@x.com", "bob@x.com"))
+        self.conn.execute("UPDATE leads SET stage = 'lead' WHERE id = ?", (jane,))
+        importer.import_rows(self.conn, [{"Email": "carl@x.com", "Name": "Carl Fox"}],
+                             importer.guess_mapping(["Email", "Name"]), None)
+        self.conn.execute("UPDATE leads SET dnc = 1 WHERE email = 'carl@x.com'")
+        other = self.campaign(name="other")
+        cols = ["Email", "Name"]
+        s = importer.import_rows(self.conn, [{"Email": e, "Name": n} for e, n in
+                                             [("jane@x.com", "Jane Doe"), ("bob@x.com", "Bob Ray"), ("carl@x.com", "Carl Fox"),
+                                              ("dee@x.com", "Dee Lin")]], importer.guess_mapping(cols), other)
+        self.assertEqual((s["enrolled"], s["not_enrolled"]), (1, 3))           # only the new person joins
+        self.assertTrue(any("Bob Ray is still in another sequence (c)" in m for m in s["skipped"]))
+        self.assertTrue(any("Jane Doe already replied" in m for m in s["skipped"]))
+        self.assertTrue(any("Carl Fox unsubscribed" in m for m in s["skipped"]))
+        # Once Bob's first sequence ends, he can join the next one; re-importing into his own campaign is a no-op.
+        self.conn.execute("UPDATE enrollments SET status = 'done' WHERE lead_id = ? AND campaign_id = ?", (bob, self.cid))
+        s = importer.import_rows(self.conn, [{"Email": "bob@x.com", "Name": "Bob Ray"}], importer.guess_mapping(cols), other)
+        self.assertEqual(s["enrolled"], 1)
+        s = importer.import_rows(self.conn, [{"Email": "bob@x.com", "Name": "Bob Ray"}], importer.guess_mapping(cols), self.cid)
+        self.assertEqual((s["already_enrolled"], s["not_enrolled"]), (1, 0))
+
 class FlowTest(Base):
     def test_full_cross_channel_sequence(self):
         self.tick(MON)
