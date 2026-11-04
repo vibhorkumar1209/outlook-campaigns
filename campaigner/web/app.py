@@ -554,6 +554,11 @@ async def lead_action(lid: int, request: Request):
     if act == "replied":
         if not engine.mark_replied(conn, lid, p.get("channel") or "linkedin", now, detail="marked manually"):
             raise HTTPException(409, "lead is not in an open sequence")
+    elif act == "not_reply":
+        try:
+            engine.undo_reply(conn, lid, now)
+        except ValueError as ex:
+            raise HTTPException(409, str(ex))
     elif act == "connected":
         engine.set_connected(conn, lid, now, source="marked manually")
     elif act == "stage":

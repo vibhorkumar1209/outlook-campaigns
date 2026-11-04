@@ -874,12 +874,71 @@ class RenderTest(unittest.TestCase):
         self.assertIn('&lt;b&gt;', email_html("{{ x }}", "", {"x": "<b>"}))
 
 
+class RepliesTest(Base):
+    def bob_emailed(self):
+        self.tick(MON)
+        self.tick(MON + timedelta(days=1))
+        self.assertEqual(self.g.sent[0][1:3], ("bob@x.com", "Hi Beta"))
+        return self.conv("bob@x.com")
+
+    def test_unrelated_mail_from_them_is_not_a_reply(self):
+        self.bob_emailed()
+        self.g.inbox.append(mail("bob@x.com", "RE: Interview invitation", cid="elsewhere", at=MON + timedelta(days=1, hours=1)))
+        self.tick(MON + timedelta(days=1, hours=2))
+        self.assertEqual(self.enr("bob@x.com")["status"], "active")
+        # ...but a reply or forward of our email counts even when Outlook files it in another thread.
+        self.g.inbox.append(mail("bob@x.com", "FW: Hi Beta", cid="forwarded", at=MON + timedelta(days=1, hours=3)))
+        self.tick(MON + timedelta(days=1, hours=4))
+        self.assertEqual(self.enr("bob@x.com")["status"], "replied")
+
+    def test_out_of_office_keeps_the_sequence_going(self):
+        cid = self.bob_emailed()
+        self.g.inbox += [
+            mail("bob@x.com", "Re: Hi Beta", cid=cid, at=MON + timedelta(days=1, hours=1),
+                 preview="Thanks for your email. I am currently out of the office until Monday with limited access."),
+            mail("bob@x.com", "Out of Office: Hi Beta", cid=cid, at=MON + timedelta(days=1, hours=2)),
+        ]
+        self.tick(MON + timedelta(days=1, hours=3))
+        self.tick(MON + timedelta(days=1, hours=4))  # rescans don't log them again
+        self.assertEqual(self.enr("bob@x.com")["status"], "active")
+        self.assertEqual(scalar(self.conn, "SELECT COUNT(*) FROM events WHERE type = 'auto_reply'"), 2)
+        for d in (4, 10):
+            self.tick(MON + timedelta(days=d))
+        self.assertIn(("thread", "bob@x.com"), [x[:2] for x in self.g.sent])  # the follow-up still went out
+
+    def test_not_a_reply_puts_them_back(self):
+        cid = self.bob_emailed()
+        self.g.inbox.append(mail("bob@x.com", "Re: Hi Beta", cid=cid, at=MON + timedelta(days=1, hours=1)))
+        self.tick(MON + timedelta(days=1, hours=2))
+        lead = self.enr("bob@x.com")["lead_id"]
+        self.assertEqual(self.enr("bob@x.com")["status"], "replied")
+        self.assertEqual(engine.undo_reply(self.conn, lead, MON + timedelta(days=1, hours=3)), 1)
+        self.assertEqual((self.enr("bob@x.com")["status"], scalar(self.conn, "SELECT stage FROM leads WHERE id = ?", lead)),
+                         ("active", "prospect"))
+        self.tick(MON + timedelta(days=1, hours=4))  # the same message doesn't count again
+        self.assertEqual(self.enr("bob@x.com")["status"], "active")
+        for d in (4, 10):
+            self.tick(MON + timedelta(days=d))
+        self.assertIn(("thread", "bob@x.com"), [x[:2] for x in self.g.sent])
+        self.g.inbox.append(mail("bob@x.com", "Re: Hi Beta", cid=cid, at=MON + timedelta(days=11)))
+        self.tick(MON + timedelta(days=11, hours=1))  # a newer reply still counts
+        self.assertEqual(self.enr("bob@x.com")["status"], "replied")
+        with self.assertRaises(ValueError):
+            engine.undo_reply(self.conn, self.enr("jane@x.com")["lead_id"])
+
+
 class ClassifyTest(unittest.TestCase):
     def test_kinds(self):
         self.assertEqual(engine.classify(mail("a@x.com"), ME), "reply")
         self.assertEqual(engine.classify(mail(ME), ME), None)
         self.assertEqual(engine.classify(mail("a@x.com", "Hi", headers=[("Auto-Submitted", "auto-replied")]), ME), "auto")
         self.assertEqual(engine.classify(mail("mailer-daemon@x.com", "Hi"), ME), "bounce")
+        self.assertEqual(engine.classify(mail("a@x.com", "RE: Automatic reply: Hi"), ME), "auto")
+        self.assertEqual(engine.classify(mail("a@x.com", "Réponse automatique : Hi"), ME), "auto")
+        self.assertEqual(engine.classify(mail("a@x.com", preview="I’m on annual leave and will reply when I return."), ME), "auto")
+        self.assertEqual(engine.classify(mail("a@x.com", headers=[("Precedence", "auto_reply")]), ME), "auto")
+        self.assertEqual(engine.classify(mail("a@x.com", preview="Sounds good, Tuesday works. Send the invite."), ME), "reply")
+        self.assertEqual(engine.topic("RE: Fwd: AW: Pick an account"), "pick an account")
         self.assertEqual(engine.li_kind(mail("invitations@linkedin.com", "Jane, start a conversation with your new connection")), "connected")
         self.assertEqual(engine.li_kind(mail("notifications-noreply@linkedin.com", "Jane sent you a new message")), "message")
         self.assertEqual(engine.li_kind(mail("invitations@linkedin.com", "Jane wants to connect")), None)

@@ -285,6 +285,7 @@ REPLY_CANDIDATES_SQL = """
     WHERE t.channel = 'li_message' AND t.status = 'done' AND t.body != ''
       AND e.status NOT IN ('replied') AND c.status != 'draft' AND l.stage = 'prospect' AND l.dnc = 0
       AND l.linkedin_url IS NOT NULL AND t.done_at >= ?
+      AND (l.reply_ignored_before IS NULL OR t.done_at > l.reply_ignored_before)  -- 'Not a reply': wait for our next message
       AND t.id = (SELECT MAX(t2.id) FROM tasks t2 JOIN enrollments e2 ON e2.id = t2.enrollment_id
                   WHERE e2.lead_id = l.id AND t2.channel = 'li_message' AND t2.status = 'done')
 """

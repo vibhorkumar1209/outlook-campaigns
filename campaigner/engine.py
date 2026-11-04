@@ -59,7 +59,19 @@ LI_LOOKBACK = timedelta(days=14)      # first scan of LinkedIn notification mail
 MAX_FAILURES = 3
 MAX_EMAILS_PER_TICK = 10
 
-AUTO_SUBJECTS = ("automatic reply", "auto reply", "autoreply", "auto-reply", "out of office")
+AUTO_SUBJECTS = ("automatic reply", "auto reply", "autoreply", "auto-reply", "auto response", "autoresponse",
+                 "auto-response", "out of office", "out of the office", "ooo", "away from", "on leave",
+                 "réponse automatique", "respuesta automática", "automatische antwort", "abwesend", "abwesenheit",
+                 "risposta automatica", "resposta automática", "automatisch antwoord", "afwezig")
+AUTO_BODY_RE = re.compile(
+    r"\b(out of (the )?office|i am (currently )?(out|away|on leave|travelling|traveling|on vacation|on holiday)"
+    r"|i'm (currently )?(out|away|on leave|travelling|traveling|on vacation|on holiday)"
+    r"|(on|taking) (annual |maternity |paternity |sick |parental )?leave|away from (the|my) (office|desk)"
+    r"|limited (access to|connectivity|availability)|(automatic|automated|auto) (reply|response|message)"
+    r"|(respond|reply|get back to you|attend to your (e-?mail|message)).{0,40}(when|upon|on|after) (i|my) return"
+    r"|no longer (with|at|working)|this (mailbox|e-?mail address) is (no longer|not) (monitored|in use))")
+AUTO_PRECEDENCE = ("auto_reply", "bulk", "junk", "list")
+REPLY_PREFIX_RE = re.compile(r"^\s*((re|fw|fwd|aw|wg|sv|vs|tr|rv|r|antw|vb|rif|odp|res|enc)\s*(\[\d+\])?\s*:\s*)+", re.I)
 BOUNCE_SENDERS = ("postmaster@", "mailer-daemon@", "microsoftexchange")
 BOUNCE_SUBJECTS = ("undeliverable", "delivery has failed", "mail delivery failed",
                    "delivery status notification (failure)", "returned mail")
@@ -84,9 +96,21 @@ def classify(msg: dict, me: str) -> str | None:
     if sender.startswith(BOUNCE_SENDERS) or subject.startswith(BOUNCE_SUBJECTS):
         return "bounce"
     headers = {h["name"].lower(): h["value"].lower() for h in msg.get("internetMessageHeaders") or []}
-    if headers.get("auto-submitted", "no") != "no" or "x-autoreply" in headers or subject.startswith(AUTO_SUBJECTS):
+    if (headers.get("auto-submitted", "no") != "no" or "x-autoreply" in headers or "x-autorespond" in headers
+            or headers.get("precedence", "") in AUTO_PRECEDENCE or subject.startswith(AUTO_SUBJECTS)
+            or topic(subject).startswith(AUTO_SUBJECTS)
+            or AUTO_BODY_RE.search(_norm_space(msg.get("bodyPreview") or "")[:400])):
         return "auto"
     return "reply"
+
+
+def topic(subject: str | None) -> str:
+    """'RE: FW: Pick an account' -> 'pick an account': what a reply or forward is about."""
+    return " ".join(REPLY_PREFIX_RE.sub("", subject or "").lower().split())
+
+
+def _norm_space(s: str) -> str:
+    return " ".join(s.lower().replace("\u2019", "'").split())
 
 
 def li_kind(msg: dict) -> str | None:
@@ -242,6 +266,27 @@ def resume_enrollment(conn, enrollment_id: int, now: datetime | None = None) -> 
     return how
 
 
+def undo_reply(conn, lead_id: int, now: datetime | None = None) -> int:
+    """'Not a reply': put a lead back into the sequences their last reply stopped, from where they were.
+    Messages up to now are ignored from then on. Returns how many sequences restart; ValueError if none."""
+    now = now or utcnow()
+    r = one(conn, "SELECT * FROM events WHERE lead_id = ? AND type = 'reply' ORDER BY at DESC, id DESC LIMIT 1", lead_id)
+    if not r:
+        raise ValueError("no reply to undo")
+    if scalar(conn, "SELECT dnc FROM leads WHERE id = ?", lead_id):
+        raise ValueError("this lead is marked do-not-contact")
+    ens = rows(conn, """SELECT * FROM enrollments WHERE lead_id = ?
+                        AND (status = 'replied' OR (status = 'stopped' AND note LIKE 'replied via %'))""", lead_id)
+    for e in ens:
+        conn.execute("""UPDATE enrollments SET status = ?, replied_at = NULL, reply_channel = NULL, note = NULL
+                        WHERE id = ?""", ("pending" if e["step_pos"] < 0 else "active", e["id"]))
+    conn.execute("UPDATE events SET type = 'reply_ignored' WHERE id = ?", (r["id"],))
+    conn.execute("UPDATE leads SET stage = 'prospect', became_lead_at = NULL, reply_ignored_before = ? WHERE id = ?",
+                 (iso(now), lead_id))
+    event(conn, lead_id, "resumed", enrollment=ens[0] if ens else None, detail="not a reply: sequence continues", at=now)
+    return len(ens)
+
+
 def set_lead_contact(conn, lead_id: int, email: str | None, linkedin_url: str | None, now: datetime | None = None) -> None:
     """Edit a lead's address/URL. A changed email clears a bounce, so email steps resume from the next one."""
     old = one(conn, "SELECT email FROM leads WHERE id = ?", lead_id)
@@ -327,22 +372,38 @@ def sender_email(conn, account: str) -> str:
 # ---------- reply detection ----------
 
 def check_lead_email(conn, graph, es: list[dict], log) -> bool:
-    """es: one lead's enrollments in one mailbox (conversation_id + email). True if the lead replied or bounced."""
+    """es: one lead's enrollments in one mailbox (conversation_id + email). True if the lead replied or bounced.
+    Out-of-office and other automatic replies are logged but don't stop anything."""
     me = graph.my_address()
     msgs: dict[str, tuple[dict, dict]] = {}
     for e in es:
         msgs.update({m["id"]: (m, e) for m in graph.conversation(e["conversation_id"])})
     since = min(parse(e["first_email_at"]) for e in es)
     latest = max(es, key=lambda e: e["last_step_at"] or "")
-    for m in graph.inbound_from(es[0]["email"], since):  # replies outside the thread count too
-        msgs.setdefault(m["id"], (m, latest))
+    lead_id = es[0]["lead_id"]
+    # Mail outside the thread counts only when it's about our email (they replied to or forwarded a copy),
+    # not every message they send you: colleagues and existing contacts email you about other things.
+    ours = {topic(r["detail"]) for r in rows(conn, "SELECT detail FROM events WHERE lead_id = ? AND type = 'sent'", lead_id)}
+    ours |= {topic(m.get("subject")) for m, _ in msgs.values() if _sender(m) == me}
+    ours.discard("")
+    for m in graph.inbound_from(es[0]["email"], since):
+        hs = {h["name"].lower(): h["value"] for h in m.get("internetMessageHeaders") or []}
+        if m["id"] in msgs or topic(m.get("subject")) in ours or topic(hs.get("thread-topic")) in ours:
+            msgs.setdefault(m["id"], (m, latest))
+    ignored = parse(scalar(conn, "SELECT reply_ignored_before FROM leads WHERE id = ?", lead_id))
     reply = bounce = None
     for m, e in sorted(msgs.values(), key=lambda p: p[0].get("receivedDateTime") or ""):
         kind = classify(m, me)
-        if kind == "reply" and not reply:
+        if kind == "reply" and not reply and not (ignored and parse(m["receivedDateTime"]) <= ignored):
             reply = (m, e)
         elif kind == "bounce" and not bounce:
             bounce = (m, e)
+        elif kind == "auto":
+            at = iso(parse(m["receivedDateTime"]))
+            if not scalar(conn, "SELECT 1 FROM events WHERE lead_id = ? AND type = 'auto_reply' AND at = ?", lead_id, at):
+                event(conn, lead_id, "auto_reply", enrollment=e, channel="email", step_pos=e["step_pos"],
+                      detail=m.get("subject"), at=parse(at))
+                log(f"automatic reply from {e['email']} ({m.get('subject')}): sequence continues")
     if reply:
         m, e = reply
         mark_replied(conn, e["lead_id"], "email", parse(m["receivedDateTime"]), enrollment=e, detail=m.get("subject"))
