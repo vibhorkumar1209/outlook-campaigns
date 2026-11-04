@@ -131,7 +131,8 @@ def email_stats(conn, *, campaign_id: int | None = None, sender: str | None = No
           COALESCE(SUM(machine_events), 0) machine
         FROM sends WHERE {w}""", *args)[0]
     emailed = f"SELECT enrollment_id FROM sends WHERE {w}"
-    bounced = scalar(conn, f"SELECT COUNT(*) FROM enrollments WHERE status = 'bounced' AND id IN ({emailed})", *args)
+    bounced = scalar(conn, f"SELECT COUNT(DISTINCT enrollment_id) FROM events WHERE type = 'bounce' "
+                           f"AND enrollment_id IN ({emailed})", *args)
     replied = scalar(conn, f"SELECT COUNT(*) FROM enrollments WHERE status = 'replied' AND id IN ({emailed})", *args)
     unsub = scalar(conn, f"""SELECT COUNT(DISTINCT lead_id) FROM events WHERE type = 'unsubscribe'
                              AND lead_id IN (SELECT lead_id FROM sends WHERE {w})""", *args)

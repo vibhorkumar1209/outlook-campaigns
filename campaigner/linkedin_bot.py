@@ -167,7 +167,8 @@ def _fail(conn, t: dict, note: str, log) -> None:
 
 
 TASKS_SQL = """
-    SELECT t.*, e.lead_id, l.linkedin_url, l.first_name, l.last_name, l.company, l.title, l.li_state, l.data
+    SELECT t.*, e.lead_id, l.linkedin_url, l.first_name, l.last_name, l.company, l.title, l.li_state, l.data,
+           c.name AS campaign_name
     FROM tasks t JOIN enrollments e ON e.id = t.enrollment_id
     JOIN campaigns c ON c.id = e.campaign_id JOIN leads l ON l.id = e.lead_id
     WHERE t.status = 'open' AND c.status = 'active' AND l.linkedin_url IS NOT NULL
@@ -175,9 +176,11 @@ TASKS_SQL = """
 
 
 def expire_unapproved(conn, now: datetime, log) -> None:
-    """Comment drafts nobody approved within APPROVAL_TIMEOUT: close as like-only."""
+    """Comment drafts nobody approved within APPROVAL_TIMEOUT (10 minutes in dummy campaigns): close as like-only."""
     for t in rows(conn, TASKS_SQL + " AND t.comment_status = 'needs_approval' AND t.created_at < ?",
-                  iso(now - APPROVAL_TIMEOUT)):
+                  iso(now - timedelta(minutes=10))):
+        if not engine.is_dummy(t) and parse(t["created_at"]) > now - APPROVAL_TIMEOUT:
+            continue
         engine.complete_task(conn, t["id"], "done", now=now, actor="bot",
                              engage={"post_url": t["post_url"], "liked": t["bot_liked"]})
         log(f"LinkedIn bot: comment for {t['first_name']} {t['last_name']} not approved in time; kept the like")
@@ -197,8 +200,8 @@ def run(conn, driver_factory, *, now: datetime | None = None, log=print, sleep=N
     if db.get_setting(conn, "li_bot_paused"):
         return
     expire_unapproved(conn, now, log)
-    if not in_hours(cfg, now):
-        return
+    # Outside bot hours only dummy (test) campaigns' tasks run, so a test can finish in its 30 minutes.
+    hours_ok = in_hours(cfg, now)
     caps, used = cfg["li_bot_caps"], used_today(conn, now)
     week_invites = scalar(conn, "SELECT COUNT(*) FROM bot_actions WHERE ok = 1 AND action = 'connect' AND at >= ?",
                           iso(now - timedelta(days=7)))
@@ -209,10 +212,12 @@ def run(conn, driver_factory, *, now: datetime | None = None, log=print, sleep=N
         action = "comment" if t["comment_status"] == "approved" else ACTION_OF.get(t["channel"])
         if not action or used.get(action, 0) >= caps.get(action, 0):
             continue
+        if not hours_ok and not engine.is_dummy(t):
+            continue
         if action == "connect" and week_invites >= cfg["li_bot_week_invites"]:
             continue
         todo.append((t, action))
-    candidates = reply_candidates(conn) if reply_check_due(conn, now) else []
+    candidates = reply_candidates(conn) if hours_ok and reply_check_due(conn, now) else []
     if not todo and not candidates:
         return
     if not PROFILE_LOCK.acquire(blocking=False):
@@ -280,6 +285,7 @@ REPLY_CANDIDATES_SQL = """
     WHERE t.channel = 'li_message' AND t.status = 'done' AND t.body != ''
       AND e.status NOT IN ('replied') AND c.status != 'draft' AND l.stage = 'prospect' AND l.dnc = 0
       AND l.linkedin_url IS NOT NULL AND t.done_at >= ?
+      AND (l.reply_ignored_before IS NULL OR t.done_at > l.reply_ignored_before)  -- 'Not a reply': wait for our next message
       AND t.id = (SELECT MAX(t2.id) FROM tasks t2 JOIN enrollments e2 ON e2.id = t2.enrollment_id
                   WHERE e2.lead_id = l.id AND t2.channel = 'li_message' AND t2.status = 'done')
 """

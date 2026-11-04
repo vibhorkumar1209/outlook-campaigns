@@ -1,6 +1,9 @@
-"""Template rendering. Bodies are written as plain text (blank line = new paragraph) and sent as light HTML.
+"""Template rendering. Bodies are written as plain text with light formatting, then:
+- email: light HTML that looks hand-typed in Outlook;
+- LinkedIn: plain text (LinkedIn messages don't support formatting), with Unicode bold/italic and "•" bullets.
 
-Links: bare URLs, or [text](https://...) to show text instead of the address.
+Formatting: **bold**, *italic* (or _italic_), lines starting "- " (bullets) or "1. " (numbered),
+[text](https://...) links, and bare URLs. A blank line starts a new paragraph.
 """
 from __future__ import annotations
 
@@ -31,6 +34,17 @@ def render_text(template: str | None, ctx: dict) -> str:
     return ENV.from_string(template or "").render(ctx).strip()
 
 
+BOLD_RE = re.compile(r"\*\*(?=\S)(.+?)(?<=\S)\*\*")
+ITALIC_RE = re.compile(r"(?<![\w*])\*(?=\S)([^*\n]+?)(?<=\S)\*(?![\w*])|(?<![\w])_(?=\S)([^_\n]+?)(?<=\S)_(?![\w])")
+BULLET_RE = re.compile(r"^\s*[-*•]\s+")
+NUMBER_RE = re.compile(r"^\s*\d+[.)]\s+")
+
+
+def _inline(escaped: str) -> str:
+    escaped = BOLD_RE.sub(r"<strong>\1</strong>", escaped)
+    return ITALIC_RE.sub(lambda m: f"<em>{m.group(1) or m.group(2)}</em>", escaped)
+
+
 def _linkify(p: str, link: Callable[[str], str] | None) -> str:
     out, pos = [], 0
     for m in LINK_RE.finditer(p):
@@ -41,16 +55,63 @@ def _linkify(p: str, link: Callable[[str], str] | None) -> str:
                 tail, url = url[-1] + tail, url[:-1]
             text = url
         href = link(url) if link else url
-        out.append(html.escape(p[pos:m.start()]))
-        out.append(f'<a href="{html.escape(href)}">{html.escape(text)}</a>{html.escape(tail)}')
+        out.append(_inline(html.escape(p[pos:m.start()])))
+        out.append(f'<a href="{html.escape(href)}">{_inline(html.escape(text))}</a>{html.escape(tail)}')
         pos = m.end()
-    out.append(html.escape(p[pos:]))
+    out.append(_inline(html.escape(p[pos:])))
     return "".join(out)
 
 
+LIST_STYLE = 'style="margin:0 0 10px 0;padding-left:22px"'
+
+
 def text_to_html(text: str, link: Callable[[str], str] | None = None) -> str:
-    paras = [p for p in re.split(r"\n\s*\n", text.strip()) if p.strip()]
-    return "".join("<p>" + _linkify(p.strip(), link).replace("\n", "<br>") + "</p>" for p in paras)
+    out = []
+    for para in (p for p in re.split(r"\n\s*\n", text.strip()) if p.strip()):
+        # Within a paragraph, runs of "- " / "1. " lines become lists; other lines stay as text with line breaks.
+        runs: list[tuple[str, list[str]]] = []
+        for line in para.strip().split("\n"):
+            kind = "ul" if BULLET_RE.match(line) else "ol" if NUMBER_RE.match(line) else "p"
+            if runs and runs[-1][0] == kind:
+                runs[-1][1].append(line)
+            else:
+                runs.append((kind, [line]))
+        for kind, lines in runs:
+            if kind == "p":
+                out.append("<p>" + "<br>".join(_linkify(l, link) for l in lines) + "</p>")
+            else:
+                strip = BULLET_RE if kind == "ul" else NUMBER_RE
+                items = "".join(f"<li>{_linkify(strip.sub('', l, count=1), link)}</li>" for l in lines)
+                out.append(f"<{kind} {LIST_STYLE}>{items}</{kind}>")
+    return "".join(out)
+
+
+def _styled(text: str, upper: int, lower: int, digits: int | None) -> str:
+    out = []
+    for ch in text:
+        if "A" <= ch <= "Z":
+            out.append(chr(upper + ord(ch) - 65))
+        elif "a" <= ch <= "z":
+            out.append(chr(lower + ord(ch) - 97))
+        elif digits and "0" <= ch <= "9":
+            out.append(chr(digits + ord(ch) - 48))
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def linkedin_text(text: str) -> str:
+    """LinkedIn messages are plain text: bold/italic become Unicode sans-serif bold/italic letters (as people
+    do in posts), bullets become "•", and [text](url) becomes "text (url)". Screen readers may read the
+    styled letters awkwardly, so use them sparingly."""
+    lines = []
+    for line in text.split("\n"):
+        line = BULLET_RE.sub("• ", line, count=1)
+        line = re.sub(r"\[([^\]\n]+)\]\((https?://[^\s)]+)\)", r"\1 (\2)", line)
+        line = BOLD_RE.sub(lambda m: _styled(m.group(1), 0x1D5D4, 0x1D5EE, 0x1D7EC), line)
+        line = ITALIC_RE.sub(lambda m: _styled(m.group(1) or m.group(2), 0x1D608, 0x1D622, None), line)
+        lines.append(line)
+    return "\n".join(lines)
 
 
 def email_html(body: str, signature: str, ctx: dict, *, link: Callable[[str], str] | None = None,

@@ -14,9 +14,9 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from jinja2 import TemplateError, TemplateSyntaxError
 
-from .. import ai, db, domain_health, engine, importer, linkedin_bot, stats
+from .. import ai, attachments, db, domain_health, engine, importer, linkedin_bot, stats
 from ..db import iso, one, parse, rows, scalar, utcnow
-from ..render import ENV, email_html, lead_context, render_text
+from ..render import ENV, email_html, lead_context, linkedin_text, render_text
 from ..runner import Runner, remove_sender
 from ..tracking import Tracker
 
@@ -321,6 +321,19 @@ def campaign_settings(cid: int, name: str = Form(...), timezone: str = Form(""),
     return back(url, tab="settings", msg="Saved")
 
 
+@app.post("/api/campaigns/{cid}/rename")
+async def campaign_rename(cid: int, request: Request):
+    name = ((await request.json()).get("name") or "").strip()
+    if not name:
+        raise HTTPException(422, "Name can't be empty")
+    if len(name) > 120:
+        raise HTTPException(422, "Keep the name under 120 characters")
+    conn = db.connect()
+    get_campaign(conn, cid)
+    conn.execute("UPDATE campaigns SET name = ? WHERE id = ?", (name, cid))
+    return {"ok": True, "name": name, "dummy": "dummy" in name.lower()}
+
+
 @app.post("/campaigns/{cid}/status")
 def campaign_status(cid: int, status: str = Form(...)):
     conn = db.connect()
@@ -384,8 +397,19 @@ def _validate_steps(raw: list[dict]) -> tuple[list[dict], list[str]]:
                 ENV.parse(t or "")
             except TemplateSyntaxError as e:
                 errs.append(f"{n} {label}: template syntax: {e.message}")
+        files = []
+        if ch == "email":
+            for m in s.get("attachments") or []:
+                try:
+                    ok = attachments.path(m).exists()
+                except attachments.AttachmentError:
+                    ok = False
+                if not ok:
+                    errs.append(f"{n}: attachment {m.get('name', '?')} is missing; remove and re-upload it")
+                else:
+                    files.append({k: m[k] for k in ("id", "name", "size", "type") if k in m})
         out.append({"pos": i, "channel": ch, "delay_days": max(delay, 0), "condition": cond, "subject": subject,
-                    "body": body, "in_thread": 1 if in_thread else 0})
+                    "body": body, "in_thread": 1 if in_thread else 0, "attachments": files})
     if not raw:
         errs.append("Add at least one step")
     return out, errs
@@ -395,9 +419,10 @@ def _save_steps(conn, cid: int, steps: list[dict]) -> None:
     conn.execute("BEGIN")
     conn.execute("DELETE FROM steps WHERE campaign_id = ?", (cid,))
     for s in steps:
-        conn.execute("INSERT INTO steps (campaign_id, pos, channel, delay_days, condition, subject, body, in_thread) "
-                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                     (cid, s["pos"], s["channel"], s["delay_days"], s["condition"], s["subject"], s["body"], s["in_thread"]))
+        conn.execute("INSERT INTO steps (campaign_id, pos, channel, delay_days, condition, subject, body, in_thread, "
+                     "attachments) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                     (cid, s["pos"], s["channel"], s["delay_days"], s["condition"], s["subject"], s["body"], s["in_thread"],
+                      json.dumps(s.get("attachments") or [])))
     conn.execute("COMMIT")
 
 
@@ -410,6 +435,27 @@ async def save_steps(cid: int, request: Request):
         return JSONResponse({"ok": False, "errors": errs}, status_code=422)
     _save_steps(conn, cid, steps)
     return {"ok": True}
+
+
+@app.post("/api/attachments")
+async def upload_attachment(file: UploadFile = File(...)):
+    data = await file.read(attachments.MAX_BYTES + 1)
+    try:
+        return attachments.save(file.filename or "file", data)
+    except attachments.AttachmentError as e:
+        raise HTTPException(413 if len(data) > attachments.MAX_BYTES else 422, str(e))
+
+
+@app.get("/api/attachments/{aid}")
+def get_attachment(aid: str, name: str):
+    from fastapi.responses import FileResponse
+    try:
+        p = attachments.path({"id": aid, "name": name})
+    except attachments.AttachmentError:
+        raise HTTPException(404)
+    if not p.exists():
+        raise HTTPException(404)
+    return FileResponse(p, filename=p.name.split("__", 1)[1])
 
 
 @app.post("/api/preview")
@@ -428,7 +474,7 @@ async def preview(request: Request):
             if not st.get("subject") and p.get("in_thread_followup"):
                 subject = "Re: " + subject
             return {"subject": subject, "html": email_html(st.get("body") or "", c["signature"], ctx)}
-        text = render_text(st.get("body") or "", ctx)
+        text = linkedin_text(render_text(st.get("body") or "", ctx))
         return {"text": text, "chars": len(text)}
     except TemplateError as e:
         return {"error": str(e)}
@@ -508,6 +554,11 @@ async def lead_action(lid: int, request: Request):
     if act == "replied":
         if not engine.mark_replied(conn, lid, p.get("channel") or "linkedin", now, detail="marked manually"):
             raise HTTPException(409, "lead is not in an open sequence")
+    elif act == "not_reply":
+        try:
+            engine.undo_reply(conn, lid, now)
+        except ValueError as ex:
+            raise HTTPException(409, str(ex))
     elif act == "connected":
         engine.set_connected(conn, lid, now, source="marked manually")
     elif act == "stage":
@@ -531,7 +582,7 @@ async def lead_action(lid: int, request: Request):
         if email and not importer.EMAIL_RE.match(email):
             raise HTTPException(422, "Invalid email")
         try:
-            conn.execute("UPDATE leads SET email = ?, linkedin_url = ? WHERE id = ?", (email, li, lid))
+            engine.set_lead_contact(conn, lid, email, li, now)
         except Exception:
             raise HTTPException(409, "That email or URL belongs to another lead")
     else:

@@ -10,12 +10,15 @@
   const VARS = JSON.parse(root.dataset.vars);
   const LEADS = JSON.parse(root.dataset.leads);
   const ENGAGE = root.dataset.engage === "1";
+  const DUMMY = root.dataset.dummy === "1";  // test mode: every wait scaled so the run finishes within 30 minutes
+  const DUMMY_MINUTES = 25;
   const enrolled = +root.dataset.enrolled, pending = +root.dataset.pending;
   const flow = $("#flow"), insp = $("#inspector"), errList = $("#seq-errors");
 
   let steps = JSON.parse(document.getElementById("seq-data").textContent).map((s) => ({
     channel: s.channel, delay_days: s.delay_days, condition: s.condition, subject: s.subject || "",
     body: s.body || "", in_thread: !!s.in_thread,
+    attachments: typeof s.attachments === "string" ? JSON.parse(s.attachments || "[]") : (s.attachments || []),
     stats: { done: s.done || 0, queued: s.queued || 0, waiting: s.waiting || 0, replies: s.replies || 0 },
   }));
   let sel = steps.length ? 0 : -1, dirty = false, dragFrom = null, timer = null, lastField = null, menu = null;
@@ -50,6 +53,15 @@
   const select = (opts, val, on) =>
     h("select", { onchange: on }, Object.entries(opts).map(([k, v]) => h("option", { value: k, selected: k === val }, v)));
   const fmt = (n) => String(Math.round((+n || 0) * 10) / 10);
+  const testScale = () => {
+    const total = steps.reduce((a, s) => a + (+s.delay_days || 0), 0);
+    return total ? Math.min(1, DUMMY_MINUTES / (total * 1440)) : 0;
+  };
+  const testMins = (days) => {
+    const m = (+days || 0) * 1440 * testScale();
+    return m < 1 ? `${Math.round(m * 60)}s` : `${Math.round(m * 10) / 10}m`;
+  };
+  const kb = (n) => n > 1048576 ? `${(n / 1048576).toFixed(1)} MB` : `${Math.max(1, Math.round(n / 1024))} KB`;
   const isLI = (ch) => ch !== "email";
   const gated = (s) => s.channel === "li_message" || s.condition !== "always";
   const priorEmail = (i) => steps.slice(0, i).some((x) => x.channel === "email");
@@ -81,7 +93,9 @@
       last ? null : h("button", {
         class: "fwait", type: "button", title: "Wait before the next step",
         onclick: () => selectStep(index, "wait"),
-      }, (+steps[index].delay_days || 0) > 0 ? `wait ${fmt(steps[index].delay_days)}d` : "no wait"),
+      }, (+steps[index].delay_days || 0) > 0
+        ? `wait ${fmt(steps[index].delay_days)}d` + (DUMMY ? ` · test ${testMins(steps[index].delay_days)}` : "")
+        : "no wait"),
       h("button", {
         class: "fadd", type: "button", title: "Insert a step here", "aria-label": `Insert a step at position ${index + 1}`,
         onclick: (e) => { e.stopPropagation(); openMenu(e.currentTarget, index); },
@@ -120,6 +134,8 @@
       h("div", { class: "fbody" },
         h("div", { class: "ftitle" }, h("span", {}, CH[s.channel]), h("span", { class: "fday" }, `Day ${fmt(day)}${waitsForConnect(s) ? "+" : ""}`)),
         h("div", { class: "fsub" }, summary(s, i)),
+        s.channel === "email" && s.attachments.length
+          ? h("div", { class: "fstats" }, h("span", {}, `${s.attachments.length} attachment${s.attachments.length > 1 ? "s" : ""}`)) : null,
         needsConnect(i) ? h("div", { class: "fwarn" },
           "⚠ No Connect step before this. LinkedIn only allows messages to connections, so leads who aren't already connected wait 7 days here, then skip.") : null,
         chips.length ? h("div", { class: "fstats" }, chips.map((c) => h("span", {}, c))) : null));
@@ -283,6 +299,7 @@
           h("input", { type: "checkbox", checked: s.in_thread, onchange: (e) => set("in_thread", e.target.checked, true) }),
           "Reply in the same thread as the previous email") : null,
         s.channel === "li_view" ? h("p", { class: "meta" }, "Task: open their profile so your visit shows up. No message.") : [
+          toolbar(s.channel),
           field(s.channel === "email" ? "Message" : s.channel === "li_connect" ? "Invite note (optional)" : "Message",
             h("textarea", {
               id: "f-body", rows: s.channel === "email" ? 8 : 4,
@@ -291,7 +308,10 @@
             }, s.body)),
           s.channel === "li_connect" ? counter : null,
           h("div", { class: "vars" }, VARS.map((v) => h("button", { type: "button", onclick: () => insertVar(v) }, `{{ ${v} }}`))),
-          h("p", { class: "meta" }, "Plain text; a blank line starts a paragraph. [text](https://…) makes a link. Fallback: {{ title | default('there', true) }}."),
+          h("p", { class: "meta" }, s.channel === "email"
+            ? "**bold**, *italic*, lines starting “- ” or “1. ” for lists, [text](https://…) for links. A blank line starts a paragraph. Fallback: {{ title | default('there', true) }}."
+            : "LinkedIn messages are plain text: **bold** and *italic* become Unicode bold/italic letters, “- ” lines become • bullets. Use sparingly (screen readers read styled letters awkwardly)."),
+          s.channel === "email" ? attachmentsField(s) : null,
         ]),
       h("div", { class: "card-head", style: "margin:18px 0 8px" }, h("h2", {}, "Preview")),
       field("Render for", h("select", { onchange: (e) => { previewLead = e.target.value; preview(); } },
@@ -300,6 +320,62 @@
       h("div", { id: "preview-out", style: "margin-top:10px" }));
     if (s.channel === "li_connect") updateCount((s.body || "").length);
     schedulePreview();
+  }
+
+  function toolbar(channel) {
+    const wrap = (before, after = before, placeholder = "text") => {
+      const f = $("#f-body");
+      if (!f) return;
+      const a = f.selectionStart, b = f.selectionEnd, sel = f.value.slice(a, b) || placeholder;
+      f.value = f.value.slice(0, a) + before + sel + after + f.value.slice(b);
+      f.focus();
+      f.selectionStart = a + before.length;
+      f.selectionEnd = a + before.length + sel.length;
+      f.dispatchEvent(new Event("input"));
+    };
+    const lines = (prefix) => {
+      const f = $("#f-body");
+      if (!f) return;
+      let a = f.value.lastIndexOf("\n", f.selectionStart - 1) + 1, b = f.value.indexOf("\n", f.selectionEnd);
+      if (b < 0) b = f.value.length;
+      const block = f.value.slice(a, b).split("\n").map((l, i) => (prefix === "1." ? `${i + 1}. ` : "- ") + l.replace(/^\s*([-*•]|\d+[.)])\s+/, "")).join("\n");
+      f.value = f.value.slice(0, a) + block + f.value.slice(b);
+      f.focus();
+      f.dispatchEvent(new Event("input"));
+    };
+    const link = () => {
+      const url = prompt("Link address (https://…)");
+      if (url && /^https?:\/\//.test(url)) wrap("[", `](${url})`, "link text");
+    };
+    const b = (label, title, on) => h("button", { type: "button", class: "btn sm ghost", title, onclick: on }, label);
+    return h("div", { class: "fmt-bar", role: "toolbar", "aria-label": "Formatting" },
+      b("B", "Bold (**text**)", () => wrap("**")), b("I", "Italic (*text*)", () => wrap("*")),
+      b("• List", "Bulleted list", () => lines("-")), b("1. List", "Numbered list", () => lines("1.")),
+      channel === "email" ? b("Link", "Link ([text](url))", link) : null);
+  }
+
+  function attachmentsField(s) {
+    const list = h("div", { class: "att-list" }, s.attachments.map((a, j) => h("span", { class: "att" },
+      h("a", { href: `/api/attachments/${a.id}?name=${encodeURIComponent(a.name)}`, target: "_blank" }, a.name),
+      h("span", { class: "meta" }, ` ${kb(a.size)} `),
+      h("button", { type: "button", class: "btn sm ghost", title: `Remove ${a.name}`, "aria-label": `Remove ${a.name}`,
+        onclick: () => { s.attachments.splice(j, 1); markDirty(); render(); inspector(); } }, "✕"))));
+    const input = h("input", { type: "file", multiple: true, style: "display:none", onchange: async (e) => {
+      for (const file of e.target.files) {
+        const fd = new FormData();
+        fd.append("file", file);
+        try {
+          const r = await fetch("/api/attachments", { method: "POST", body: fd });
+          const data = await r.json();
+          if (!r.ok) throw new Error(data.detail || r.statusText);
+          s.attachments.push(data);
+          markDirty();
+        } catch (err) { toast(err.message, true); }
+      }
+      render(); inspector();
+    } });
+    return h("div", { class: "f" }, "Attachments (up to 3 MB each, sent with every email from this step)", list,
+      h("div", {}, input, h("button", { type: "button", class: "btn sm", onclick: () => input.click() }, "+ Attach files")));
   }
 
   function schedulePreview() { clearTimeout(timer); timer = setTimeout(preview, 250); }
@@ -318,7 +394,8 @@
       if (r.html != null) {
         const body = h("div");
         body.innerHTML = r.html; // server-rendered from your template; lead values are escaped
-        out.replaceChildren(h("div", { class: "mail" }, h("div", { class: "subj" }, r.subject || "(no subject)"), body));
+        out.replaceChildren(h("div", { class: "mail" }, h("div", { class: "subj" }, r.subject || "(no subject)"), body),
+          s.attachments.length ? h("div", { class: "meta", style: "margin-top:6px" }, "Attached: " + s.attachments.map((a) => a.name).join(", ")) : "");
       } else {
         out.replaceChildren(h("div", { class: "li-bubble" }, r.text || "(no note)"));
       }

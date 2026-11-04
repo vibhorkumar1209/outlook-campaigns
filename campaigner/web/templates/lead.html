@@ -6,7 +6,8 @@
   "enrolled": "Enrolled", "sent": "Email sent", "task_created": "Task queued", "task_done": "Done",
   "task_skipped": "Task skipped", "step_skipped": "Step skipped", "connected": "Connected on LinkedIn",
   "reply": "Replied", "bounce": "Bounced", "stopped": "Stopped", "error": "Error",
-  "open": "Opened email", "click": "Clicked link", "unsubscribe": "Unsubscribed", "resumed": "Sequence resumed"} %}
+  "open": "Opened email", "click": "Clicked link", "unsubscribe": "Unsubscribed", "resumed": "Sequence resumed",
+  "auto_reply": "Automatic reply (sequence continues)", "reply_ignored": "Not a reply (ignored)"} %}
 <header class="head">
   <div>
     <h1>{{ lead_name(l) }} {% if l.li_state != "none" %}{{ pill(l.li_state) }}{% endif %}{% if l.dnc %} <span class="pill critical">do not contact</span>{% endif %} {% if l.stage == "lead" %}<span class="pill good">lead</span>{% else %}<span class="pill muted">prospect</span>{% endif %}</h1>
@@ -18,6 +19,7 @@
     <button class="btn" data-lead-act="replied" data-channel="linkedin" data-lead="{{ l.id }}" data-ask="Mark as replied on LinkedIn? This stops all their sequences.">Replied on LinkedIn</button>
     <button class="btn" data-lead-act="replied" data-channel="email" data-lead="{{ l.id }}" data-ask="Mark as replied by email? This stops all their sequences.">Replied by email</button>
     {% if l.stage == "lead" %}
+      {% if events | selectattr("type", "equalto", "reply") | list %}<button class="btn" data-lead-act="not_reply" data-lead="{{ l.id }}" data-ask="Not a real reply? This puts {{ l.first_name or 'them' }} back into the sequences it stopped, from the step they were on. Pending steps that are already due go out on the next run.">Not a reply</button>{% endif %}
       <button class="btn" data-lead-act="stage" data-stage="prospect" data-lead="{{ l.id }}" data-ask="Move back to prospects? Their sequences stay stopped; use Resume on a campaign to restart one.">Move to prospects</button>
     {% else %}
       <button class="btn" data-lead-act="stage" data-stage="lead" data-lead="{{ l.id }}" data-ask="Move to leads? This stops all their sequences.">Move to leads</button>
@@ -27,6 +29,7 @@
   </div>
 </header>
 
+{% if l.email_bounced %}<div class="flash err">Email to <b>{{ l.email }}</b> bounced, so email steps are skipped for this person while LinkedIn steps carry on. Fix the address under Details and later emails go out normally.</div>{% endif %}
 <div class="grid2">
   <section class="card">
     <div class="card-head"><h2>Timeline</h2></div>
