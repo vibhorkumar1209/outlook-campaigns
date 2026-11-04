@@ -162,3 +162,44 @@ $$("[data-resume]").forEach((b) => b.addEventListener("click", async () => {
   try { const r = await api(`/api/enrollments/${b.dataset.resume}/resume`); toast(`Resumed: ${r.how}`); setTimeout(() => location.reload(), 900); }
   catch (err) { toast(err.message, true); }
 }));
+
+// Rename a campaign in place (header or campaigns list). "dummy" in the name turns test mode on, so confirm that change.
+$$("[data-rename]").forEach((b) => b.addEventListener("click", () => {
+  const cid = b.dataset.rename, old = b.dataset.name;
+  const target = document.getElementById("c-name")?.dataset.campaign === cid
+    ? document.getElementById("c-name") : document.querySelector(`[data-name-of="${cid}"]`);
+  const input = Object.assign(document.createElement("input"), { value: old, className: "rename-input",
+    ariaLabel: "Campaign name", maxLength: 120 });
+  target.replaceWith(input);
+  b.hidden = true;
+  input.focus();
+  input.select();
+  let done = false;
+  const finish = async (save) => {
+    if (done) return;
+    done = true;
+    const name = input.value.trim();
+    if (!save || !name || name === old) { input.replaceWith(target); b.hidden = false; return; }
+    const was = /dummy/i.test(old), now = /dummy/i.test(name);
+    if (was !== now && !confirm(now
+        ? "A name with “dummy” turns on test mode: the whole sequence runs within 30 minutes, ignoring the send window. Continue?"
+        : "Removing “dummy” turns test mode off: the sequence goes back to its real timing. Continue?")) {
+      input.replaceWith(target); b.hidden = false; return;
+    }
+    try {
+      await api(`/api/campaigns/${cid}/rename`, { name });
+      if (was !== now) return location.reload();  // test-mode badge and timings change
+      target.textContent = name;
+      b.dataset.name = name;
+      if (target.id === "c-name") document.title = `${name} · Outreach`;
+      toast("Renamed");
+    } catch (err) { toast(err.message, true); }
+    input.replaceWith(target);
+    b.hidden = false;
+  };
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); finish(true); }
+    if (e.key === "Escape") finish(false);
+  });
+  input.addEventListener("blur", () => finish(true));
+}));

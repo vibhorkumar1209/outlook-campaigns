@@ -27,6 +27,7 @@
   </div>
 </header>
 
+{% if l.email_bounced %}<div class="flash err">Email to <b>{{ l.email }}</b> bounced, so email steps are skipped for this person while LinkedIn steps carry on. Fix the address under Details and later emails go out normally.</div>{% endif %}
 <div class="grid2">
   <section class="card">
     <div class="card-head"><h2>Timeline</h2></div>

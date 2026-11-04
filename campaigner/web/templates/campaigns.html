@@ -16,7 +16,8 @@
   <tbody>
   {% for c in campaigns %}
     <tr>
-      <td><a href="/campaigns/{{ c.id }}">{{ c.name }}</a></td>
+      <td><a href="/campaigns/{{ c.id }}" data-name-of="{{ c.id }}">{{ c.name }}</a>
+        <button class="btn sm ghost rename-btn" data-rename="{{ c.id }}" data-name="{{ c.name }}" title="Rename campaign" aria-label="Rename {{ c.name }}">✎</button></td>
       <td>{{ pill(c.status) }}</td>
       <td class="num">{{ c.n_steps }}</td>
       <td class="num">{{ c.enrolled }}</td>

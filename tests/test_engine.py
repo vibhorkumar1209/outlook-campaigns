@@ -1,6 +1,8 @@
 """Orchestration logic against a fake Graph. Run: .venv/bin/python -m unittest discover tests"""
+import json
 import tempfile
 import unittest
+from unittest import mock
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -34,12 +36,14 @@ class FakeGraph:
     def my_address(self):
         return self.me
 
-    def send_new(self, to, name, subject, html):
+    def send_new(self, to, name, subject, html, attachments=None):
         self.sent.append(("new", to, subject, html))
+        self.files = [a["name"] for a in attachments or []]
         return f"conv-{self.me}-{len(self.sent)}"
 
-    def send_in_thread(self, cid, to, name, html, fallback, strip_pixels=None):
+    def send_in_thread(self, cid, to, name, html, fallback, strip_pixels=None, attachments=None):
         self.sent.append(("thread", to, fallback, html))
+        self.files = [a["name"] for a in attachments or []]
         return cid
 
     def conversation(self, cid):
@@ -171,13 +175,19 @@ class FlowTest(Base):
         self.tick(MON + timedelta(days=13))
         self.assertEqual({self.enr("jane@x.com")["status"], self.enr("bob@x.com")["status"]}, {"done"})
 
-    def test_bounce(self):
+    def test_bounce_flags_address_and_linkedin_continues(self):
         self.tick(MON)
         self.tick(MON + timedelta(days=1))
         self.g.inbox.append(mail("postmaster@x.com", "Undeliverable: Hi Beta", cid=self.conv("bob@x.com"),
-                                 at=MON + timedelta(days=1, hours=1)))
+                                 at=MON + timedelta(days=1, hours=1), preview="Your message to bob@x.com couldn't be delivered"))
         self.tick(MON + timedelta(days=1, hours=2))
-        self.assertEqual(self.enr("bob@x.com")["status"], "bounced")
+        self.assertEqual(one(self.conn, "SELECT email_bounced FROM leads WHERE email = 'bob@x.com'")["email_bounced"], 1)
+        self.assertEqual(self.enr("bob@x.com")["status"], "active")       # sequence keeps going
+        self.assertEqual(scalar(self.conn, "SELECT COUNT(*) FROM events WHERE type = 'bounce'"), 1)
+        self.tick(MON + timedelta(days=1, hours=3))                       # rescans don't double-count
+        self.assertEqual(scalar(self.conn, "SELECT COUNT(*) FROM events WHERE type = 'bounce'"), 1)
+        self.tick(MON + timedelta(days=20))
+        self.assertEqual([x for x in self.g.sent if x[1] == "bob@x.com" and x[0] == "thread"], [])  # email steps skipped
 
     def test_reply_stops_other_campaigns(self):
         other = self.campaign(name="other")
@@ -237,20 +247,20 @@ class ResumeStageTest(Base):
             self.conn.execute("INSERT INTO enrollments (campaign_id, lead_id, enrolled_at) VALUES (?, ?, ?)",
                               (self.cid, l["id"], iso(MON)))
 
-    def test_bounce_then_fix_and_resume_resends_that_step(self):
+    def test_fixing_a_bounced_address_resumes_email(self):
+        self.conn.execute("INSERT INTO steps (campaign_id, pos, channel, delay_days, subject, body) VALUES (?, 2, 'email', 2, NULL, 'Last')",
+                          (self.cid,))
         self.tick(MON)
         self.g.inbox.append(mail("postmaster@x.com", "Undeliverable: Hi Beta", cid=self.conv("bob@x.com"),
-                                 at=MON + timedelta(minutes=2)))
+                                 at=MON + timedelta(minutes=2), preview="Your message to bob@x.com couldn't be delivered"))
         self.tick(MON + timedelta(minutes=5))
-        e = self.enr("bob@x.com")
-        self.assertEqual(e["status"], "bounced")
-        self.conn.execute("UPDATE leads SET email = 'bob.ray@x.com' WHERE email = 'bob@x.com'")
-        how = engine.resume_enrollment(self.conn, e["id"], now=MON + timedelta(minutes=10))
-        self.assertEqual(how, "resends step 1")
-        self.tick(MON + timedelta(minutes=11))
-        self.assertEqual([(k, to, subj) for k, to, subj, _ in self.g.sent if to == "bob.ray@x.com"],
-                         [("new", "bob.ray@x.com", "Hi Beta")])  # same step, fresh thread
-        self.assertEqual(one(self.conn, "SELECT status FROM enrollments WHERE id = ?", e["id"])["status"], "active")
+        lead = one(self.conn, "SELECT id FROM leads WHERE email = 'bob@x.com'")["id"]
+        self.tick(MON + timedelta(days=2))                                  # step 2 skipped: still bounced
+        engine.set_lead_contact(self.conn, lead, "bob.ray@x.com", None, MON + timedelta(days=2, hours=1))
+        self.tick(MON + timedelta(days=2, hours=2))                         # old notice doesn't re-flag the new address
+        self.assertEqual(one(self.conn, "SELECT email_bounced FROM leads WHERE id = ?", lead)["email_bounced"], 0)
+        self.tick(MON + timedelta(days=4, hours=1))
+        self.assertIn("bob.ray@x.com", [x[1] for x in self.g.sent])         # step 3 goes to the fixed address
 
     def test_resume_error_and_refuse_replied(self):
         self.conn.execute("UPDATE steps SET body = '{{ nope }}' WHERE campaign_id = ? AND pos = 0", (self.cid,))
@@ -285,6 +295,50 @@ class ResumeStageTest(Base):
         engine.tick(self.conn, self.factory, now=MON, sleep=lambda s: None, log=self.logs.append, checks=False)
         self.assertEqual(len(self.g.sent), 2)
         self.assertEqual(calls, [])
+
+
+class NewFeaturesTest(Base):
+    def test_dummy_campaign_runs_in_30_minutes(self):
+        self.conn.execute("UPDATE campaigns SET status = 'paused' WHERE id = ?", (self.cid,))
+        cid = self.campaign([("email", 0, "Hi {{ company }}", "Hello"), ("email", 2, None, "Bump"), ("email", 7, None, "Last")],
+                            name="Dummy run", window_days="sat", window_start="09:00", window_end="09:01")  # window ignored
+        lead = one(self.conn, "SELECT id FROM leads WHERE email = 'bob@x.com'")["id"]
+        self.conn.execute("INSERT INTO enrollments (campaign_id, lead_id, enrolled_at) VALUES (?, ?, ?)", (cid, lead, iso(MON)))
+        c = one(self.conn, "SELECT * FROM campaigns WHERE id = ?", cid)
+        steps = rows(self.conn, "SELECT * FROM steps WHERE campaign_id = ? ORDER BY pos", cid)
+        total = sum((engine.step_delay(c, steps, k) for k in range(3)), timedelta())
+        self.assertEqual(round(total.total_seconds() / 60), 25)
+        for m in range(0, 31):
+            self.tick(MON + timedelta(minutes=m))
+        self.assertEqual(len([x for x in self.g.sent if x[1] == "bob@x.com"]), 3)
+        self.assertEqual(one(self.conn, "SELECT status FROM enrollments WHERE campaign_id = ?", cid)["status"], "done")
+
+    def test_linkedin_step_runs_after_an_email_bounce(self):
+        self.conn.execute("UPDATE campaigns SET status = 'paused' WHERE id = ?", (self.cid,))
+        cid = self.campaign([("email", 0, "Hi {{ company }}", "Hello"), ("li_message", 0.01, None, "Follow-up **now**")],
+                            name="mixed")
+        jane = one(self.conn, "SELECT id FROM leads WHERE email = 'jane@x.com'")["id"]
+        self.conn.execute("UPDATE leads SET li_state = 'connected' WHERE id = ?", (jane,))
+        self.conn.execute("INSERT INTO enrollments (campaign_id, lead_id, enrolled_at) VALUES (?, ?, ?)", (cid, jane, iso(MON)))
+        self.tick(MON)
+        conv = one(self.conn, "SELECT conversation_id FROM enrollments WHERE campaign_id = ?", cid)["conversation_id"]
+        self.g.inbox.append(mail("postmaster@x.com", "Undeliverable: Hi Acme", cid=conv, at=MON + timedelta(minutes=2),
+                                 preview="Your message to jane@x.com couldn't be delivered"))
+        self.tick(MON + timedelta(hours=1))
+        t = one(self.conn, "SELECT t.* FROM tasks t JOIN enrollments e ON e.id = t.enrollment_id WHERE e.campaign_id = ?", cid)
+        self.assertEqual((t["channel"], t["body"]), ("li_message", "Follow-up 𝗻𝗼𝘄"))
+
+    def test_attachments_go_with_the_email(self):
+        from campaigner import attachments
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(attachments, "DIR", Path(d)):
+            meta = attachments.save("Deck Q4.pdf", b"%PDF-1.4 test")
+            self.conn.execute("UPDATE steps SET attachments = ? WHERE campaign_id = ? AND pos = 1",
+                              (json.dumps([meta]), self.cid))
+            self.tick(MON)
+            self.tick(MON + timedelta(days=1))
+            self.assertEqual(self.g.files, ["Deck Q4.pdf"])
+            with self.assertRaises(attachments.AttachmentError):
+                attachments.save("big.bin", b"x" * (attachments.MAX_BYTES + 1))
 
 
 class BranchTest(Base):
@@ -630,6 +684,12 @@ class FakeDriver:
 class BotTest(Base):
     def setUp(self):
         super().setUp()
+        # A private profile lock: the real one may be held by the dashboard's live bot while tests run.
+        lock = linkedin_bot._ProfileLock()
+        lock.path = Path(self.tmp.name) / "profile.lock"
+        patcher = mock.patch.object(linkedin_bot, "PROFILE_LOCK", lock)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         db.set_setting(self.conn, "li_mode", "bot")
         db.set_setting(self.conn, "li_bot_hours", ["00:00", "23:59"])
         db.set_setting(self.conn, "li_bot_days", "mon,tue,wed,thu,fri,sat,sun")

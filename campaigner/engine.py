@@ -8,6 +8,7 @@ Idempotent: safe to run every few minutes.
 """
 from __future__ import annotations
 
+import json
 import random
 import re
 import secrets
@@ -18,10 +19,10 @@ from zoneinfo import ZoneInfo
 
 from jinja2 import TemplateError
 
-from . import db
+from . import attachments, db
 from .db import event, iso, one, parse, rows, scalar, utcnow
 from .graph import AuthError, GraphError, NetworkError
-from .render import email_html, lead_context, render_text
+from .render import email_html, lead_context, linkedin_text, render_text
 from .tracking import BOT_UA, MACHINE_WINDOW_S
 
 CHANNELS = {"email": "Email", "li_view": "View profile", "li_connect": "Connect", "li_message": "LinkedIn message"}
@@ -35,6 +36,25 @@ DAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 OPEN = ("pending", "active", "done")
 REPLY_LOOKBACK = timedelta(days=30)   # keep watching finished sequences this long
 WAIT_FOR_CONNECT = timedelta(days=7)  # connection-gated steps wait this long past due, then skip
+# Test mode: a campaign with "dummy" in its name runs its whole sequence within 30 minutes. Waits are scaled to
+# DUMMY_TOTAL, leaving headroom for the 1-minute send check and the LinkedIn bot's pace between actions.
+DUMMY_TOTAL = timedelta(minutes=25)
+DUMMY_WAIT_FOR_CONNECT = timedelta(minutes=5)
+DUMMY_ENGAGE_EVERY = timedelta(minutes=10)
+DUMMY_GAP = (5, 15)  # seconds between emails
+
+
+def is_dummy(c: dict) -> bool:
+    return "dummy" in (c.get("name") or c.get("campaign_name") or "").lower()
+
+
+def step_delay(c: dict, steps: list[dict], k: int) -> timedelta:
+    """Real wait before step k; dummy campaigns scale every wait so the whole sequence fits in DUMMY_TOTAL."""
+    d = timedelta(days=steps[k]["delay_days"])
+    if not is_dummy(c):
+        return d
+    total = timedelta(days=sum(st["delay_days"] for st in steps))
+    return d * min(1.0, DUMMY_TOTAL / total) if total else timedelta(0)
 LI_LOOKBACK = timedelta(days=14)      # first scan of LinkedIn notification mails
 MAX_FAILURES = 3
 MAX_EMAILS_PER_TICK = 10
@@ -222,6 +242,14 @@ def resume_enrollment(conn, enrollment_id: int, now: datetime | None = None) -> 
     return how
 
 
+def set_lead_contact(conn, lead_id: int, email: str | None, linkedin_url: str | None, now: datetime | None = None) -> None:
+    """Edit a lead's address/URL. A changed email clears a bounce, so email steps resume from the next one."""
+    old = one(conn, "SELECT email FROM leads WHERE id = ?", lead_id)
+    conn.execute("UPDATE leads SET email = ?, linkedin_url = ? WHERE id = ?", (email, linkedin_url, lead_id))
+    if old and (old["email"] or "") != (email or ""):
+        conn.execute("UPDATE leads SET email_bounced = 0, email_updated_at = ? WHERE id = ?", (iso(now or utcnow()), lead_id))
+
+
 def _advance(conn, e: dict, k: int, now: datetime) -> None:
     conn.execute("UPDATE enrollments SET step_pos = ?, last_step_at = ?, status = 'active' WHERE id = ?",
                  (k, iso(now), e["id"]))
@@ -323,17 +351,25 @@ def check_lead_email(conn, graph, es: list[dict], log) -> bool:
     if bounce:
         m, e = bounce
         at = parse(m["receivedDateTime"])
-        conn.execute("UPDATE enrollments SET status = 'bounced', note = ? WHERE id = ?", (m.get("subject"), e["id"]))
-        close_tasks(conn, e["id"], at)
+        lead = one(conn, "SELECT email, email_bounced, email_updated_at FROM leads WHERE id = ?", e["lead_id"])
+        text = f"{m.get('subject') or ''} {m.get('bodyPreview') or ''}".lower()
+        # Only for the current address: an old bounce must not re-flag an address you've since fixed.
+        about_now = (lead["email"] or "").lower() in text if "@" in text else True
+        if lead["email_bounced"]:
+            return True  # already flagged: don't email
+        if not about_now or (lead["email_updated_at"] and at <= parse(lead["email_updated_at"])):
+            return False  # a bounce for an address you've since fixed: carry on
+        conn.execute("UPDATE leads SET email_bounced = 1 WHERE id = ?", (e["lead_id"],))
+        conn.execute("UPDATE enrollments SET note = 'email bounced' WHERE id = ?", (e["id"],))
         event(conn, e["lead_id"], "bounce", enrollment=e, channel="email", step_pos=e["step_pos"],
               detail=m.get("subject"), at=at)
-        log(f"bounce for {e['email']}")
+        log(f"bounce for {e['email']}: email steps skipped until the address is fixed; LinkedIn steps continue")
         return True
     return False
 
 
 EMAIL_WATCH_SQL = """
-    SELECT e.*, l.email, COALESCE(e.sender, c.sender) AS acct FROM enrollments e
+    SELECT e.*, l.email, l.email_bounced, COALESCE(e.sender, c.sender) AS acct FROM enrollments e
     JOIN leads l ON l.id = e.lead_id JOIN campaigns c ON c.id = e.campaign_id
     WHERE c.status != 'draft' AND e.status IN ('active', 'done') AND e.conversation_id IS NOT NULL
 """
@@ -433,18 +469,21 @@ def ingest_tracking(conn, tracker, log) -> None:
 
 # ---------- sequencing ----------
 
-def gate(st: dict, e: dict, now: datetime, due: datetime) -> tuple[str | None, bool]:
+def gate(st: dict, e: dict, now: datetime, due: datetime,
+         wait_for_connect: timedelta = WAIT_FOR_CONNECT) -> tuple[str | None, bool]:
     """(skip reason, wait). Neither = go."""
     ch, li_state = st["channel"], e["li_state"]
     if ch == "email" and not e["email"]:
         return "no email address", False
+    if ch == "email" and e.get("email_bounced"):
+        return "email address bounced (fix it on the contact to resume email)", False
     if ch in LI and not e["linkedin_url"]:
         return "no LinkedIn URL", False
     if st["condition"] == "if_connected" and li_state != "connected":
         return "not connected", False  # an explicit branch: decide now, don't wait
     if ch == "li_message" and li_state != "connected":
         # A plain LinkedIn message waits for the invite to be accepted, then gives up.
-        return ("not connected", False) if now >= due + WAIT_FOR_CONNECT else (None, True)
+        return ("not connected", False) if now >= due + wait_for_connect else (None, True)
     if st["condition"] == "if_not_connected" and li_state == "connected":
         return "already connected", False
     if ch == "li_connect" and li_state != "none":
@@ -462,7 +501,8 @@ def _fail(conn, e: dict, k: int, msg: str, log, permanent: bool) -> None:
 
 
 ENROLLED_SQL = """
-    SELECT e.*, l.email, l.linkedin_url, l.first_name, l.last_name, l.company, l.title, l.data, l.li_state, l.dnc
+    SELECT e.*, l.email, l.linkedin_url, l.first_name, l.last_name, l.company, l.title, l.data, l.li_state, l.dnc,
+           l.email_bounced
     FROM enrollments e JOIN leads l ON l.id = e.lead_id
     WHERE e.campaign_id = ? AND e.status IN ('pending', 'active')
       AND NOT EXISTS (SELECT 1 FROM tasks t WHERE t.enrollment_id = e.id AND t.status = 'open'
@@ -507,10 +547,10 @@ def process_campaign(conn, c: dict, boxes: Mailboxes, tracker, now: datetime, se
                 break
             st = steps[k]
             base = parse(e["last_step_at"]) or max(d for d in (start, parse(e["enrolled_at"])) if d)
-            due = base + timedelta(days=st["delay_days"])
+            due = base + step_delay(c, steps, k)
             if now < due:
                 break
-            reason, wait = gate(st, e, now, due)
+            reason, wait = gate(st, e, now, due, DUMMY_WAIT_FOR_CONNECT if is_dummy(c) else WAIT_FOR_CONNECT)
             if wait:
                 break
             if reason:
@@ -524,7 +564,7 @@ def process_campaign(conn, c: dict, boxes: Mailboxes, tracker, now: datetime, se
             if li_today >= c["li_daily_cap"]:
                 break
             try:
-                body = render_text(st["body"], lead_context(e))
+                body = linkedin_text(render_text(st["body"], lead_context(e)))
             except TemplateError as ex:
                 _fail(conn, e, k, f"template: {ex}", log, permanent=True)
                 break
@@ -535,8 +575,8 @@ def process_campaign(conn, c: dict, boxes: Mailboxes, tracker, now: datetime, se
             break
     if c["li_engage"]:
         # Sequence steps took their share of today's LinkedIn budget first; engagement uses what's left.
-        every = engage_settings(conn)["engage_every_days"]
-        for e in rows(conn, ENGAGE_SQL, c["id"], iso(now - timedelta(days=every))):
+        every = DUMMY_ENGAGE_EVERY if is_dummy(c) else timedelta(days=engage_settings(conn)["engage_every_days"])
+        for e in rows(conn, ENGAGE_SQL, c["id"], iso(now - every)):
             if li_today >= c["li_daily_cap"]:
                 break
             conn.execute("INSERT INTO tasks (enrollment_id, step_pos, channel, body, created_at) VALUES (?, -1, ?, '', ?)",
@@ -554,7 +594,7 @@ def mailbox_remaining(conn, account: str, c: dict, now: datetime) -> int:
 
 
 def send_emails(conn, c, steps, queue, boxes: Mailboxes, tracker, now, send, sleep, log) -> None:
-    if not in_window(c, now):
+    if not in_window(c, now) and not is_dummy(c):
         log(f"{c['name']}: outside send window, {len(queue)} emails waiting")
         return
     sent_today = scalar(conn, "SELECT COUNT(*) FROM sends WHERE campaign_id = ? AND sent_at >= ?",
@@ -593,14 +633,18 @@ def send_emails(conn, c, steps, queue, boxes: Mailboxes, tracker, now, send, sle
         try:
             subject = render_text(st["subject"] or first_email["subject"], ctx)
             html = email_html(st["body"], c["signature"], ctx, link=link, pixel=pixel)
+            files = attachments.load(json.loads(st.get("attachments") or "[]"))
         except TemplateError as ex:
             _fail(conn, e, k, f"template: {ex}", log, permanent=True)
+            continue
+        except attachments.AttachmentError as ex:
+            _fail(conn, e, k, str(ex), log, permanent=True)
             continue
         if not send:
             log(f"[dry run] {c['name']} step {k + 1} {acct} -> {e['email']}: {subject}")
             continue
         if sent:
-            sleep(random.uniform(c["gap_min"], c["gap_max"]))
+            sleep(random.uniform(*(DUMMY_GAP if is_dummy(c) else (c["gap_min"], c["gap_max"]))))
         try:
             if e["conversation_id"]:
                 # Replies can land between the batch check and now; recheck before nudging.
@@ -610,9 +654,9 @@ def send_emails(conn, c, steps, queue, boxes: Mailboxes, tracker, now, send, sle
                     continue
             if st["in_thread"] and e["conversation_id"]:
                 cid = graph.send_in_thread(e["conversation_id"], e["email"], ctx["name"], html, "Re: " + subject,
-                                           strip_pixels=tracker.base if tracker else None)
+                                           strip_pixels=tracker.base if tracker else None, attachments=files)
             else:
-                cid = graph.send_new(e["email"], ctx["name"], subject, html)
+                cid = graph.send_new(e["email"], ctx["name"], subject, html, attachments=files)
         except NetworkError as ex:
             boxes.hold(acct, f"network problem ({ex}).")  # not the lead's fault: don't count a failure
             continue

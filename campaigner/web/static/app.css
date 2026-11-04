@@ -158,6 +158,9 @@ details.tv summary { color: var(--muted); cursor: pointer; font-size: 12px; marg
 .count.warn { color: var(--warning); }
 .task-actions { display: flex; gap: 6px; flex-wrap: wrap; }
 
+.rename-btn { vertical-align: middle; opacity: .6; }
+.rename-btn:hover, .rename-btn:focus-visible { opacity: 1; }
+.rename-input { font: inherit; font-size: inherit; width: min(420px, 100%); display: inline-block; padding: 2px 8px; }
 .post-quote { margin: 0; padding: 8px 12px; border-left: 3px solid var(--linkedin); background: var(--panel-2); color: var(--text-2); font-size: 12px; white-space: pre-wrap; max-height: 160px; overflow: auto; }
 
 /* sequence builder: flowchart canvas + inspector */
@@ -246,6 +249,11 @@ details.tv summary { color: var(--muted); cursor: pointer; font-size: 12px; marg
 .flane span { position: absolute; left: -22px; top: 50%; transform: translateY(-50%) rotate(180deg); writing-mode: vertical-rl;
   font-size: 10px; color: var(--text-2); white-space: nowrap; }
 
+.fmt-bar { display: flex; gap: 4px; flex-wrap: wrap; margin-bottom: -4px; }
+.fmt-bar .btn { font-weight: 600; }
+.att-list { display: flex; flex-direction: column; gap: 4px; margin: 4px 0 6px; }
+.att { display: inline-flex; align-items: center; gap: 4px; }
+.mail ul, .mail ol { margin: 0 0 10px; padding-left: 22px; }
 .vars { display: flex; gap: 4px; flex-wrap: wrap; }
 .vars button { font: inherit; font-size: 11px; background: transparent; color: var(--text-2); border: 1px dashed var(--line); border-radius: 4px; padding: 1px 6px; cursor: pointer; }
 .vars button:hover { color: #fff; border-color: var(--brand); }

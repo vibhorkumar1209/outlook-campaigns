@@ -15,7 +15,7 @@ GRAPH = "https://graph.microsoft.com/v1.0"
 SCOPES = ["Mail.Send", "Mail.ReadWrite", "User.Read"]
 # Encrypted at rest: macOS Keychain under the hood. Holds every signed-in mailbox.
 CACHE_PATH = os.path.expanduser("~/.outlook-campaigns/token_cache.bin")
-MSG_FIELDS = "id,conversationId,from,subject,receivedDateTime,isDraft,internetMessageHeaders"
+MSG_FIELDS = "id,conversationId,from,subject,bodyPreview,receivedDateTime,isDraft,internetMessageHeaders"
 RETRY_STATUS = {429, 502, 503, 504}
 
 
@@ -177,18 +177,32 @@ class Graph:
                 pass
             raise
 
-    def send_new(self, to_email: str, to_name: str, subject: str, html: str) -> str:
+    def _attach(self, draft_id: str, attachments: list[dict] | None) -> None:
+        import base64
+
+        for a in attachments or []:
+            self._req("POST", f"/me/messages/{draft_id}/attachments", json={
+                "@odata.type": "#microsoft.graph.fileAttachment",
+                "name": a["name"], "contentType": a["type"], "contentBytes": base64.b64encode(a["data"]).decode(),
+            })
+
+    def send_new(self, to_email: str, to_name: str, subject: str, html: str, attachments: list[dict] | None = None) -> str:
         """Send a fresh message. Returns its conversationId."""
         draft = self._req("POST", "/me/messages", json={
             "subject": subject,
             "body": {"contentType": "HTML", "content": html},
             "toRecipients": [_rcpt(to_email, to_name)],
         })
+        try:
+            self._attach(draft["id"], attachments)
+        except GraphError:
+            self._req("DELETE", f"/me/messages/{draft['id']}")
+            raise
         self._send_draft(draft["id"])
         return draft["conversationId"]
 
     def send_in_thread(self, conversation_id: str, to_email: str, to_name: str, html: str, fallback_subject: str,
-                       strip_pixels: str | None = None) -> str:
+                       strip_pixels: str | None = None, attachments: list[dict] | None = None) -> str:
         """Reply on top of our last sent message in the thread, so follow-ups stack like a human's would.
         strip_pixels: tracker base URL; earlier open pixels are removed from the quoted text so they
         don't fire again (and misattribute opens) when the follow-up is read."""
@@ -198,7 +212,7 @@ class Graph:
             select="id,sentDateTime",
         )
         if not sent:
-            return self.send_new(to_email, to_name, fallback_subject, html)
+            return self.send_new(to_email, to_name, fallback_subject, html, attachments)
         last = max(sent, key=lambda m: m.get("sentDateTime") or "")
         draft = self._req("POST", f"/me/messages/{last['id']}/createReply",
                           headers={"Prefer": 'outlook.body-content-type="html"'})
@@ -210,6 +224,11 @@ class Graph:
             "toRecipients": [_rcpt(to_email, to_name)],
             "ccRecipients": [],
         })
+        try:
+            self._attach(draft["id"], attachments)
+        except GraphError:
+            self._req("DELETE", f"/me/messages/{draft['id']}")
+            raise
         self._send_draft(draft["id"])
         return conversation_id
 

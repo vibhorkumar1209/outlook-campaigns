@@ -169,6 +169,9 @@ MIGRATIONS = [
     ("tasks", "comment_status", "TEXT NOT NULL DEFAULT ''"),       # ''|needs_approval|approved
     ("leads", "stage", "TEXT NOT NULL DEFAULT 'prospect'"),        # prospect | lead (they replied)
     ("leads", "became_lead_at", "TEXT"),
+    ("leads", "email_bounced", "INTEGER NOT NULL DEFAULT 0"),      # address bounced: email steps skip until fixed
+    ("leads", "email_updated_at", "TEXT"),
+    ("steps", "attachments", "TEXT NOT NULL DEFAULT '[]'"),        # [{id, name, size, type}] for email steps
 ]
 
 
@@ -194,6 +197,11 @@ def connect(path: Path = DB_PATH) -> sqlite3.Connection:
     for table, col, decl in MIGRATIONS:
         if col not in {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+    if not get_setting(conn, "bounce_model_v2"):
+        # Bounces used to stop the whole sequence; now they only flag the address and LinkedIn steps carry on.
+        conn.execute("UPDATE leads SET email_bounced = 1 WHERE id IN (SELECT lead_id FROM enrollments WHERE status = 'bounced')")
+        conn.execute("UPDATE enrollments SET status = 'active', note = 'email bounced' WHERE status = 'bounced'")
+        set_setting(conn, "bounce_model_v2", True)
     if not get_setting(conn, "stage_backfilled"):
         # Everyone who replied before stages existed becomes a lead (once; later manual moves are kept).
         conn.execute("""UPDATE leads SET stage = 'lead', became_lead_at = (
