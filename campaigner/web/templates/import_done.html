@@ -14,6 +14,7 @@
   {{ tile("Updated", s.updated, "matched existing") }}
   {{ tile("Enrolled", s.enrolled) }}
   {{ tile("Already in campaign", s.already_enrolled) }}
+  {{ tile("Not enrolled", s.not_enrolled, "leads, unsubscribed, or in another sequence") }}
   {{ tile("Skipped rows", s.skipped_rows) }}
 </section>
 {% if s.skipped %}

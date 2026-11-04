@@ -73,9 +73,26 @@ def _find(conn, email: str | None, li: str | None) -> dict | None:
     return None
 
 
+def _keep_out(conn, lead_id: int, campaign_id: int) -> str | None:
+    """Why an existing lead shouldn't join this campaign, or None. Someone who replied is in Leads, and someone in
+    another live sequence would get two at once."""
+    if one(conn, "SELECT 1 FROM enrollments WHERE lead_id = ? AND campaign_id = ?", lead_id, campaign_id):
+        return None  # counted as already in the campaign
+    lead = one(conn, "SELECT stage, dnc FROM leads WHERE id = ?", lead_id)
+    if lead["dnc"]:
+        return "unsubscribed / is do-not-contact"
+    if lead["stage"] == "lead":
+        return "already replied (in Leads)"
+    other = one(conn, """SELECT c.name FROM enrollments e JOIN campaigns c ON c.id = e.campaign_id
+                         WHERE e.lead_id = ? AND e.campaign_id != ? AND e.status IN ('pending', 'active')
+                           AND c.status != 'draft' ORDER BY e.id LIMIT 1""", lead_id, campaign_id)
+    return f"is still in another sequence ({other['name']})" if other else None
+
+
 def import_rows(conn, rows: list[dict], mapping: dict[str, str], campaign_id: int | None) -> dict:
     now = utcnow()
-    summary = {"created": 0, "updated": 0, "enrolled": 0, "already_enrolled": 0, "skipped_rows": 0, "skipped": []}
+    summary = {"created": 0, "updated": 0, "enrolled": 0, "already_enrolled": 0, "not_enrolled": 0,
+               "skipped_rows": 0, "skipped": []}
     mapped = {v for v in mapping.values() if v}
     conn.execute("BEGIN")
     for n, r in enumerate(rows, start=2):
@@ -129,6 +146,12 @@ def import_rows(conn, rows: list[dict], mapping: dict[str, str], campaign_id: in
             summary["created"] += 1
 
         if campaign_id:
+            why = lead and _keep_out(conn, lead_id, campaign_id)
+            if why:
+                who = " ".join(x for x in (first or lead["first_name"], last or lead["last_name"]) if x) or email or li
+                summary["skipped"].append(f"row {n}: {who} {why}; not enrolled")
+                summary["not_enrolled"] += 1
+                continue
             cur = conn.execute("INSERT OR IGNORE INTO enrollments (campaign_id, lead_id, enrolled_at) VALUES (?, ?, ?)",
                                (campaign_id, lead_id, iso(now)))
             if cur.rowcount:
