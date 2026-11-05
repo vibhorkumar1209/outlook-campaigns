@@ -413,6 +413,68 @@ class BranchTest(Base):
         self.assertEqual(self.task("jane@x.com")["channel"], "li_message")
 
 
+
+class StartBranchTest(Base):
+    """Connected at the start: email + LinkedIn at once. Needed an invite: email on day 2, message on day 4 if accepted."""
+    SEQ = [("li_connect", 0, None, "Hi {{ first_name }}", "if_not_connected"),
+           ("email", 0, "Intro", "Hello {{ first_name }}", "if_was_connected"),
+           ("li_message", 0, None, "Curious, {{ first_name }}", "if_was_connected"),
+           ("email", 2, "Intro", "Hello {{ first_name }}", "if_was_invited"),
+           ("li_message", 2, None, "Curious, {{ first_name }}", "if_was_invited"),
+           ("email", 2, "Value", "Value {{ first_name }}", "always")]
+
+    def setUp(self):
+        super().setUp()
+        self.conn.execute("UPDATE campaigns SET status = 'paused' WHERE id = ?", (self.cid,))
+        self.cid = self.campaign([s[:4] for s in self.SEQ], name="start")
+        for i, s in enumerate(self.SEQ):
+            self.conn.execute("UPDATE steps SET condition = ?, in_thread = 0 WHERE campaign_id = ? AND pos = ?", (s[4], self.cid, i))
+        lead = one(self.conn, "SELECT id FROM leads WHERE email = 'jane@x.com'")["id"]
+        self.conn.execute("INSERT INTO enrollments (campaign_id, lead_id, enrolled_at) VALUES (?, ?, ?)", (self.cid, lead, iso(MON)))
+
+    def subjects(self):
+        return [x[2] for x in self.g.sent if x[1] == "jane@x.com"]
+
+    def test_already_connected_gets_email_and_message_at_once(self):
+        self.conn.execute("UPDATE leads SET li_state = 'connected' WHERE email = 'jane@x.com'")
+        self.tick(MON)
+        self.assertEqual(self.subjects(), ["Intro"])
+        self.tick(MON + timedelta(minutes=1))                    # next 1-minute pass queues the LinkedIn message
+        t = self.task("jane@x.com")
+        self.assertEqual((t["channel"], t["body"]), ("li_message", "Curious, Jane"))
+        engine.complete_task(self.conn, t["id"], "done", now=MON + timedelta(minutes=5))
+        for d in (2, 4, 6):
+            self.tick(MON + timedelta(days=d, minutes=10))
+        self.assertEqual(self.subjects(), ["Intro", "Value"])   # invite-branch steps skipped, no repeats
+        self.assertIsNone(self.task("jane@x.com"))
+        self.assertEqual(self.enr("jane@x.com")["was_connected"], 1)
+
+    def test_found_connected_at_invite_counts_as_connected(self):
+        self.tick(MON)
+        engine.complete_task(self.conn, self.task("jane@x.com")["id"], "connected", now=MON)  # bot: already connected
+        self.tick(MON + timedelta(minutes=5))
+        self.assertEqual(self.subjects(), ["Intro"])
+
+    def test_invited_lead_who_accepts_stays_on_invite_branch(self):
+        self.tick(MON)
+        engine.complete_task(self.conn, self.task("jane@x.com")["id"], "done", now=MON)  # invite sent
+        self.tick(MON + timedelta(minutes=5))
+        self.assertEqual(self.subjects(), [])                   # nothing right away
+        engine.set_connected(self.conn, self.enr("jane@x.com")["lead_id"], MON + timedelta(days=1))  # accepts on day 1
+        self.tick(MON + timedelta(days=2, minutes=10))
+        self.assertEqual(self.subjects(), ["Intro"])             # day 2 email, not skipped because they connected
+        self.tick(MON + timedelta(days=4, minutes=20))
+        self.assertEqual(self.task("jane@x.com")["channel"], "li_message")
+        self.assertEqual(self.enr("jane@x.com")["was_connected"], 0)
+
+    def test_invited_lead_who_never_accepts_skips_message_without_waiting(self):
+        self.tick(MON)
+        engine.complete_task(self.conn, self.task("jane@x.com")["id"], "done", now=MON)
+        self.tick(MON + timedelta(minutes=1))
+        for d in (2, 4, 6):
+            self.tick(MON + timedelta(days=d, minutes=10))
+        self.assertEqual(self.subjects(), ["Intro", "Value"])
+
 class MailboxTest(Base):
     EMAIL_ONLY = [("email", 0, "Hi {{ company }}", "Hello {{ first_name }}"), ("email", 2, None, "Bump")]
 

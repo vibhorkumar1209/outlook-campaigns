@@ -65,7 +65,9 @@
   const isLI = (ch) => ch !== "email";
   const gated = (s) => s.channel === "li_message" || s.condition !== "always";
   const priorEmail = (i) => steps.slice(0, i).some((x) => x.channel === "email");
-  const waitsForConnect = (s) => s.channel === "li_message" && s.condition !== "if_connected";
+  const waitsForConnect = (s) => s.channel === "li_message" && s.condition === "always";
+  const BRANCH_Q = { if_connected: "Connected?", if_not_connected: "Not connected?",
+                     if_was_connected: "Connected at start?", if_was_invited: "Needed an invite?" };
   const needsConnect = (i) => waitsForConnect(steps[i]) && !steps.slice(0, i).some((x) => x.channel === "li_connect");
 
   function summary(s, i) {
@@ -150,10 +152,10 @@
   }
 
   function branch(s, i, day) {
-    const inverse = s.condition === "if_not_connected";
+    const q = BRANCH_Q[s.condition] || "Connected?";
     const diamond = h("div", { class: "fdiamond" });
     diamond.innerHTML = '<svg viewBox="0 0 172 56" preserveAspectRatio="none" aria-hidden="true"><polygon points="86,1 171,28 86,55 1,28"/></svg>';
-    diamond.append(h("span", {}, inverse ? "Not connected?" : "Connected?"));
+    diamond.append(h("span", {}, q));
     return h("div", { class: "fbranch" },
       diamond,
       h("div", { class: "fyes" }, h("span", {}, "yes")),
@@ -286,11 +288,15 @@
             oninput: (e) => set("delay_days", parseFloat(e.target.value) || 0) }),
           i === 0 ? "Counted from enrollment, or the campaign's start date." : "Counted from when the previous step was done or skipped."),
         s.channel === "li_message"
-          ? field("If they're not connected yet", select(
-              { always: "Wait for them to accept (up to 7 days)", if_connected: "Skip this step right away" },
-              s.condition === "if_connected" ? "if_connected" : "always", (e) => set("condition", e.target.value)),
-              "LinkedIn only allows messages to connections. To branch, use a Connect step set to “Only if not connected” before this one.")
-          : field("Run", select(COND, s.condition, (e) => set("condition", e.target.value)),
+          ? field("Run", select(
+              { always: "Always (if not connected yet, wait up to 7 days for them to accept)",
+                if_connected: "Only if connected (otherwise skip right away)",
+                if_was_connected: COND.if_was_connected, if_was_invited: COND.if_was_invited + " (and have accepted)" },
+              s.condition === "if_not_connected" ? "always" : s.condition, (e) => set("condition", e.target.value)),
+              "LinkedIn only allows messages to connections. “Connected at the start” vs “needed an invite” is decided once, after the Connect step, so you can give each group its own steps.")
+          : field("Run", select(s.channel === "li_connect"
+                ? { always: COND.always, if_not_connected: COND.if_not_connected } : COND,
+              s.condition, (e) => set("condition", e.target.value)),
               s.channel === "li_connect" ? "Already-connected leads skip this step automatically." : null),
         s.channel === "email" ? field(firstEmail || !s.in_thread ? "Subject" : "Subject (blank = reply in the same thread)",
           h("input", { value: s.subject, placeholder: firstEmail ? "Required: starts the thread" : "",

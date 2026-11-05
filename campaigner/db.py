@@ -172,7 +172,8 @@ MIGRATIONS = [
     ("leads", "email_bounced", "INTEGER NOT NULL DEFAULT 0"),      # address bounced: email steps skip until fixed
     ("leads", "email_updated_at", "TEXT"),
     ("steps", "attachments", "TEXT NOT NULL DEFAULT '[]'"),        # [{id, name, size, type}] for email steps
-    ("leads", "reply_ignored_before", "TEXT"),                     # 'Not a reply': messages up to here don't count
+    ("leads", "reply_ignored_before", "TEXT"),
+    ("enrollments", "was_connected", "INTEGER"),                   # start branch: 1 already connected, 0 needed an invite                     # 'Not a reply': messages up to here don't count
 ]
 
 
