@@ -67,7 +67,8 @@
   const priorEmail = (i) => steps.slice(0, i).some((x) => x.channel === "email");
   const waitsForConnect = (s) => s.channel === "li_message" && s.condition === "always";
   const BRANCH_Q = { if_connected: "Connected?", if_not_connected: "Not connected?",
-                     if_was_connected: "Connected at start?", if_was_invited: "Needed an invite?" };
+                     if_was_connected: "Connected at start?", if_was_invited: "Needed an invite?",
+                     on_accept: "They accepted?" };
   const needsConnect = (i) => waitsForConnect(steps[i]) && !steps.slice(0, i).some((x) => x.channel === "li_connect");
 
   function summary(s, i) {
@@ -160,7 +161,8 @@
       diamond,
       h("div", { class: "fyes" }, h("span", {}, "yes")),
       node(s, i, day),
-      h("div", { class: "fbypass" }, h("span", {}, waitsForConnect(s) ? "no → wait ≤7d, then skip" : "no → skip")),
+      h("div", { class: "fbypass" }, h("span", {}, s.condition === "on_accept" ? "runs alongside · sent when they accept"
+        : waitsForConnect(s) ? "no → wait ≤7d, then skip" : "no → skip")),
       h("div", { class: "fbypass-ret" }));
   }
 
@@ -284,15 +286,20 @@
       h("div", { class: "stack-y", style: "gap:10px" },
         field("Type", select(CH, s.channel, (e) => set("channel", e.target.value, true))),
         field("Wait before this step (days)",
-          h("input", { id: "f-wait", type: "number", min: 0, step: 0.5, value: s.delay_days,
-            oninput: (e) => set("delay_days", parseFloat(e.target.value) || 0) }),
-          i === 0 ? "Counted from enrollment, or the campaign's start date." : "Counted from when the previous step was done or skipped."),
+          h("input", { id: "f-wait", type: "number", min: 0, step: 0.5, value: s.condition === "on_accept" ? 0 : s.delay_days,
+            disabled: s.condition === "on_accept", oninput: (e) => set("delay_days", parseFloat(e.target.value) || 0) }),
+          s.condition === "on_accept" ? "Not used: this message goes out as soon as they accept, whatever step they're on."
+            : i === 0 ? "Counted from enrollment, or the campaign's start date." : "Counted from when the previous step was done or skipped."),
         s.channel === "li_message"
           ? field("Run", select(
               { always: "Always (if not connected yet, wait up to 7 days for them to accept)",
                 if_connected: "Only if connected (otherwise skip right away)",
-                if_was_connected: COND.if_was_connected, if_was_invited: COND.if_was_invited + " (and have accepted)" },
-              s.condition === "if_not_connected" ? "always" : s.condition, (e) => set("condition", e.target.value)),
+                if_was_connected: COND.if_was_connected, if_was_invited: COND.if_was_invited + " (and have accepted)",
+                on_accept: COND.on_accept },
+              s.condition === "if_not_connected" ? "always" : s.condition, (e) => {
+                if (e.target.value === "on_accept") steps[sel].delay_days = 0;
+                set("condition", e.target.value, true);
+              }),
               "LinkedIn only allows messages to connections. “Connected at the start” vs “needed an invite” is decided once, after the Connect step, so you can give each group its own steps.")
           : field("Run", select(s.channel === "li_connect"
                 ? { always: COND.always, if_not_connected: COND.if_not_connected } : COND,

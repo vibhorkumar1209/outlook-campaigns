@@ -37,6 +37,7 @@ DEFAULTS = {
 ACTION_OF = {"li_view": "view", "li_connect": "connect", "li_message": "message", "li_engage": "like"}
 MAX_ATTEMPTS = 2
 REPLY_CHECK_EVERY = timedelta(minutes=10)  # LinkedIn inbox scan for replies to the bot's messages
+ACCEPT_CHECK_EVERY = timedelta(minutes=15)  # "recently added" connections scan for accepted invites
 APPROVAL_TIMEOUT = timedelta(days=3)  # unapproved comment drafts expire; the like still counts
 class _ProfileLock:
     """One Chrome profile can only be open once. A file lock, so the dashboard's runs, its sign-in window and
@@ -219,7 +220,8 @@ def run(conn, driver_factory, *, now: datetime | None = None, log=print, sleep=N
             continue
         todo.append((t, action))
     candidates = reply_candidates(conn) if hours_ok and reply_check_due(conn, now) else []
-    if not todo and not candidates:
+    invited = accept_candidates(conn) if hours_ok and accept_check_due(conn, now) else []
+    if not todo and not candidates and not invited:
         return
     if not PROFILE_LOCK.acquire(blocking=False):
         log("LinkedIn bot: browser profile busy (sign-in window open?), skipping this run")
@@ -239,6 +241,14 @@ def run(conn, driver_factory, *, now: datetime | None = None, log=print, sleep=N
             # Anyone who just replied is out of the sequence: drop their pending actions from this pass.
             todo = [(t, a) for t, a in todo
                     if (one(conn, "SELECT status FROM tasks WHERE id = ?", t["id"]) or {}).get("status") == "open"]
+        if invited:
+            try:
+                check_accepts(conn, driver, invited, now, log)
+            except BlockedError:
+                raise
+            except Exception as e:  # read-only, like the reply check
+                log(f"LinkedIn bot: acceptance check failed: {e}")
+            db.set_setting(conn, "li_accept_checked_at", iso(now))
         for t, action in todo:
             if done >= cfg["li_bot_per_run"]:
                 break
@@ -285,6 +295,29 @@ def run(conn, driver_factory, *, now: datetime | None = None, log=print, sleep=N
 
 
 # ---------- replies on LinkedIn ----------
+
+def accept_check_due(conn, now: datetime) -> bool:
+    last = parse(db.get_setting(conn, "li_accept_checked_at"))
+    return not last or now - last >= ACCEPT_CHECK_EVERY
+
+
+def accept_candidates(conn) -> list[dict]:
+    """Prospects we've invited who are still in a live sequence."""
+    return rows(conn, """SELECT DISTINCT l.id lead_id, l.first_name, l.last_name, l.linkedin_url FROM leads l
+                         JOIN enrollments e ON e.lead_id = l.id JOIN campaigns c ON c.id = e.campaign_id
+                         WHERE l.li_state = 'invited' AND l.stage = 'prospect' AND l.dnc = 0
+                           AND l.linkedin_url IS NOT NULL AND e.status IN ('pending', 'active')
+                           AND c.status = 'active'""")
+
+
+def check_accepts(conn, driver, invited: list[dict], now: datetime, log) -> None:
+    """Mark invited prospects who appear in your newest connections as connected (an on-accept message follows)."""
+    recent = set(driver.recent_connections())
+    for lead in invited:
+        if ChromeDriver._slug(lead["linkedin_url"]) in recent:
+            if engine.set_connected(conn, lead["lead_id"], now, source="accepted the invite (seen by bot)"):
+                log(f"LinkedIn bot: {lead['first_name']} {lead['last_name']} accepted the invite")
+
 
 def reply_check_due(conn, now: datetime) -> bool:
     last = parse(db.get_setting(conn, "li_reply_checked_at"))
@@ -411,6 +444,16 @@ def handle(conn, driver, t: dict, action: str, *, now: datetime, log, draft) -> 
 
 
 # ---------- Chrome (Playwright) ----------
+
+HONORIFICS = {"dr", "mr", "mrs", "ms", "miss", "prof", "sir", "dame"}
+
+
+def first_name_token(full: str) -> str:
+    """'Jenny (Cox) Garms' -> 'jenny'; 'Dr. Ana Ruiz' -> 'ana'. Lowercase first real name word, or ''."""
+    words = [w for w in re.sub(r"\([^)]*\)", " ", full or "").lower().replace(".", " ").split()
+             if w not in HONORIFICS]
+    return words[0] if words else ""
+
 
 class ChromeDriver:
     """Drives LinkedIn in your installed Chrome, with a profile used only by the bot."""
@@ -597,6 +640,20 @@ class ChromeDriver:
         self._pause()
         return "sent" if not note.strip() else "sent_without_note"
 
+    _CONNECTIONS_JS = """() => {
+      const main = document.querySelector('main') || document.body, out = [];
+      for (const a of main.querySelectorAll('a[href*="/in/"]')) {
+        const m = (a.getAttribute('href') || '').match(/\\/in\\/([^/?#]+)/);
+        if (m) { const s = decodeURIComponent(m[1]).toLowerCase(); if (!out.includes(s)) out.push(s); }
+      }
+      return out;
+    }"""
+
+    def recent_connections(self, limit: int = 40) -> list[str]:
+        """Profile slugs of your newest connections (LinkedIn lists them most recently added first)."""
+        self._goto(self.base + "/mynetwork/invite-connect/connections/")
+        return self.page.evaluate(self._CONNECTIONS_JS)[:limit]
+
     def _message_control(self):
         """This profile's own Message control is labelled exactly "Message" (others say "Message <name>")."""
         for role in ("link", "button"):
@@ -628,12 +685,18 @@ class ChromeDriver:
         vis = [editors.nth(i) for i in range(editors.count()) if editors.nth(i).is_visible()]
         if len(vis) != 1:
             raise ActionError(f"expected one message window, found {len(vis)}")
-        # The window's controls are named "... your conversation with <names>" (as hidden text, not aria-label).
-        first = (self.profile_name.split() or [""])[0].lower()
+        # An existing thread names its controls "... your conversation with <names>" (hidden text, not
+        # aria-label). A first message opens "New message" with one recipient chip whose x is "Remove <name>".
+        first = first_name_token(self.profile_name)
         ctl = self.page.get_by_role("button", name=re.compile(r"your (draft )?conversation with", re.I))
         names = [(ctl.nth(i).get_attribute("aria-label") or ctl.nth(i).inner_text() or "").lower()
                  for i in range(ctl.count()) if ctl.nth(i).is_visible()]
-        if not first or not any(first in n for n in names):
+        chips = self.page.get_by_role("button", name=re.compile(r"^Remove \S", re.I))
+        recipients = [(chips.nth(i).get_attribute("aria-label") or chips.nth(i).inner_text() or "").lower()
+                      for i in range(chips.count()) if chips.nth(i).is_visible()]
+        if len(recipients) > 1:
+            raise ActionError(f"message window has {len(recipients)} recipients; expected only {self.profile_name}")
+        if not first or not any(first in n for n in names + recipients):
             raise ActionError(f"couldn't confirm the message window is addressed to {self.profile_name}")
         box = vis[0]
         box.click()

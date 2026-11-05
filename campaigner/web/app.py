@@ -390,6 +390,10 @@ def _validate_steps(raw: list[dict]) -> tuple[list[dict], list[str]]:
             delay = -1
         if delay < 0:
             errs.append(f"{n}: wait must be 0 or more days")
+        if cond == engine.ON_ACCEPT:
+            if ch != "li_message":
+                errs.append(f"{n}: “as soon as they accept” is only for LinkedIn messages")
+            delay = 0  # it fires on acceptance, not after a wait
         subject = ((s.get("subject") or "").strip() or None) if ch == "email" else None
         body = (s.get("body") or "") if ch != "li_view" else ""
         in_thread = bool(s.get("in_thread", True))
