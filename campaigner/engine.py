@@ -658,13 +658,14 @@ def process_campaign(conn, c: dict, boxes: Mailboxes, tracker, now: datetime, se
     li_today = scalar(conn, "SELECT COUNT(*) FROM events WHERE campaign_id = ? AND type = 'task_created' AND at >= ?",
                       c["id"], today)
     queue = []
-    # Acceptances first: a message right after someone accepts matters more than starting someone new.
+    # Acceptances first, and outside the campaign's daily LinkedIn limit: they answer an invite already counted
+    # there (the bot's own message limit still paces sending).
     for st in (s for s in steps if s["condition"] == ON_ACCEPT and s["channel"] == "li_message"):
         for e in rows(conn, ACCEPTED_SQL, c["id"], st["pos"]):
             if e["was_connected"] is None:  # never had a Connect step: decide now, once
                 e["was_connected"] = was_connected(conn, e)
                 conn.execute("UPDATE enrollments SET was_connected = ? WHERE id = ?", (e["was_connected"], e["id"]))
-            if e["was_connected"] or li_today >= c["li_daily_cap"]:
+            if e["was_connected"]:
                 continue
             try:
                 body = linkedin_text(render_text(st["body"], lead_context(e)))

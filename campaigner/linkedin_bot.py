@@ -445,6 +445,16 @@ def handle(conn, driver, t: dict, action: str, *, now: datetime, log, draft) -> 
 
 # ---------- Chrome (Playwright) ----------
 
+HONORIFICS = {"dr", "mr", "mrs", "ms", "miss", "prof", "sir", "dame"}
+
+
+def first_name_token(full: str) -> str:
+    """'Jenny (Cox) Garms' -> 'jenny'; 'Dr. Ana Ruiz' -> 'ana'. Lowercase first real name word, or ''."""
+    words = [w for w in re.sub(r"\([^)]*\)", " ", full or "").lower().replace(".", " ").split()
+             if w not in HONORIFICS]
+    return words[0] if words else ""
+
+
 class ChromeDriver:
     """Drives LinkedIn in your installed Chrome, with a profile used only by the bot."""
 
@@ -675,12 +685,18 @@ class ChromeDriver:
         vis = [editors.nth(i) for i in range(editors.count()) if editors.nth(i).is_visible()]
         if len(vis) != 1:
             raise ActionError(f"expected one message window, found {len(vis)}")
-        # The window's controls are named "... your conversation with <names>" (as hidden text, not aria-label).
-        first = (self.profile_name.split() or [""])[0].lower()
+        # An existing thread names its controls "... your conversation with <names>" (hidden text, not
+        # aria-label). A first message opens "New message" with one recipient chip whose x is "Remove <name>".
+        first = first_name_token(self.profile_name)
         ctl = self.page.get_by_role("button", name=re.compile(r"your (draft )?conversation with", re.I))
         names = [(ctl.nth(i).get_attribute("aria-label") or ctl.nth(i).inner_text() or "").lower()
                  for i in range(ctl.count()) if ctl.nth(i).is_visible()]
-        if not first or not any(first in n for n in names):
+        chips = self.page.get_by_role("button", name=re.compile(r"^Remove \S", re.I))
+        recipients = [(chips.nth(i).get_attribute("aria-label") or chips.nth(i).inner_text() or "").lower()
+                      for i in range(chips.count()) if chips.nth(i).is_visible()]
+        if len(recipients) > 1:
+            raise ActionError(f"message window has {len(recipients)} recipients; expected only {self.profile_name}")
+        if not first or not any(first in n for n in names + recipients):
             raise ActionError(f"couldn't confirm the message window is addressed to {self.profile_name}")
         box = vis[0]
         box.click()

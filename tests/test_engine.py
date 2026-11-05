@@ -534,6 +534,14 @@ class OnAcceptTest(Base):
         self.assertEqual(self.subjects(), ["Intro", "Value"])
         self.assertEqual(scalar(self.conn, "SELECT COUNT(*) FROM tasks WHERE channel = 'li_message'"), 1)  # once only
 
+    def test_full_daily_linkedin_limit_doesnt_hold_back_the_accept_message(self):
+        self.tick(MON)
+        engine.complete_task(self.conn, self.task("jane@x.com")["id"], "done", now=MON)
+        self.conn.execute("UPDATE campaigns SET li_daily_cap = 1 WHERE id = ?", (self.cid,))  # used by the invite
+        engine.set_connected(self.conn, self.lead, MON + timedelta(minutes=5))
+        self.tick(MON + timedelta(minutes=6))
+        self.assertEqual(self.task("jane@x.com")["channel"], "li_message")
+
     def test_open_on_accept_message_doesnt_hold_up_email(self):
         self.tick(MON)
         engine.complete_task(self.conn, self.task("jane@x.com")["id"], "done", now=MON)
@@ -1066,6 +1074,10 @@ class BotTest(Base):
         self.assertEqual(d2.calls, [])
         self.bot(d2, at=MON + timedelta(minutes=31))
         self.assertEqual(self.enr("jane@x.com")["status"], "replied")
+
+    def test_first_name_token(self):
+        F = linkedin_bot.first_name_token
+        self.assertEqual([F("Jenny (Cox) Garms"), F("Dr. Ana Ruiz"), F("(Maiden) Lee Kim"), F("")], ["jenny", "ana", "lee", ""])
 
     def test_parse_age(self):
         P = linkedin_bot.parse_age_days
