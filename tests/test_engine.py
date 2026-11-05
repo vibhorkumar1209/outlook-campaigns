@@ -158,6 +158,24 @@ class ImportTest(Base):
         self.assertEqual(one(self.conn, "SELECT name FROM campaigns WHERE id = ?", engine.copy_campaign(self.conn, self.cid))["name"],
                          "c (copy 2)")
 
+    def test_keep_awake_only_while_a_campaign_is_active(self):
+        from campaigner import runner
+        self.assertTrue(runner.wants_awake(self.conn))                     # campaign "c" is active
+        db.set_setting(self.conn, "keep_awake", False)
+        self.assertFalse(runner.wants_awake(self.conn))
+        db.set_setting(self.conn, "keep_awake", True)
+        self.conn.execute("UPDATE campaigns SET status = 'paused'")
+        self.assertFalse(runner.wants_awake(self.conn))
+        k = runner.KeepAwake()
+        with mock.patch.object(runner.subprocess, "Popen") as popen, mock.patch.object(runner.shutil, "which", return_value="/usr/bin/caffeinate"):
+            popen.return_value.poll.return_value = None
+            k.update(True)
+            k.update(True)                                                  # already holding: no second process
+            self.assertEqual(popen.call_count, 1)
+            self.assertEqual(popen.call_args[0][0][:2], ["caffeinate", "-i"])
+            k.update(False)
+            popen.return_value.terminate.assert_called_once()
+
 class FlowTest(Base):
     def test_full_cross_channel_sequence(self):
         self.tick(MON)
@@ -803,6 +821,27 @@ class BotTest(Base):
         self.tick(MON)
         self.assertEqual(self.bot().calls, [])
         self.assertIsNotNone(self.task("jane@x.com"))
+
+    def test_page_error_uses_an_attempt_and_the_queue_moves_on(self):
+        importer.import_rows(self.conn, [{"Email": "kim@x.com", "Name": "Kim Lee", "LinkedIn": "linkedin.com/in/kimlee"}],
+                             importer.guess_mapping(["Email", "Name", "LinkedIn"]), self.cid)
+        self.conn.execute("UPDATE enrollments SET enrolled_at = ?", (iso(MON),))
+        self.tick(MON)
+
+        class Flaky(FakeDriver):
+            def connect(self, url, note):
+                if "janedoe" in url:
+                    raise TimeoutError("Locator.click: Timeout 15000ms exceeded.\n<svg> intercepts pointer events")
+                return super().connect(url, note)
+
+        d = self.bot(Flaky())
+        self.assertIn(("connect", "https://www.linkedin.com/in/kimlee", "Hi Kim"), d.calls)  # not stuck behind Jane
+        jane = self.task("jane@x.com")
+        self.assertEqual(jane["bot_attempts"], 1)
+        self.assertTrue(jane["bot_note"].startswith("TimeoutError: Locator.click: Timeout 15000ms"))
+        self.bot(Flaky(), at=MON + timedelta(minutes=5))
+        self.assertEqual(self.task("jane@x.com")["bot_attempts"], 2)       # limit reached: left for you
+        self.assertNotIn("open", self.bot(Flaky(), at=MON + timedelta(minutes=10)).calls)
 
     def test_connect_with_note(self):
         self.tick(MON)

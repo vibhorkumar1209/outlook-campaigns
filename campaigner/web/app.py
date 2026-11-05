@@ -17,7 +17,7 @@ from jinja2 import TemplateError, TemplateSyntaxError
 from .. import ai, attachments, db, domain_health, engine, importer, linkedin_bot, stats
 from ..db import iso, one, parse, rows, scalar, utcnow
 from ..render import ENV, email_html, lead_context, linkedin_text, render_text
-from ..runner import Runner, remove_sender
+from ..runner import Runner, remove_sender, wants_awake
 from ..tracking import Tracker
 
 HERE = Path(__file__).parent
@@ -715,7 +715,16 @@ def settings(request: Request):
                 ai_ready=bool(os.environ.get("ANTHROPIC_API_KEY")),
                 tracker=tracker, tracker_error=tracker.health() if tracker else None,
                 track_cursor=db.get_setting(conn, "track_cursor", 0),
-                tick_minutes=os.environ.get("OC_TICK_MINUTES", "10"))
+                tick_minutes=os.environ.get("OC_TICK_MINUTES", "10"),
+                keep_awake=db.get_setting(conn, "keep_awake", True), awake_on=runner.awake.on)
+
+
+@app.post("/settings/keep-awake")
+def settings_keep_awake(keep_awake: str = Form("")):
+    conn = db.connect()
+    db.set_setting(conn, "keep_awake", bool(keep_awake))
+    runner.awake.update(wants_awake(conn))
+    return back("/settings", msg="Saved")
 
 
 @app.post("/settings/engagement")
