@@ -20,6 +20,7 @@
     {% if c.status == "paused" %}
       <form method="post" action="/campaigns/{{ c.id }}/status"><input type="hidden" name="status" value="draft"><button class="btn ghost">Back to draft</button></form>
     {% endif %}
+    <form method="post" action="/campaigns/{{ c.id }}/copy"><button class="btn" title="New draft with this sequence and settings, no leads">Copy campaign</button></form>
     <a class="btn" href="/import?campaign={{ c.id }}">Import leads</a>
   </div>
 </header>

@@ -145,6 +145,19 @@ class ImportTest(Base):
         s = importer.import_rows(self.conn, [{"Email": "bob@x.com", "Name": "Bob Ray"}], importer.guess_mapping(cols), self.cid)
         self.assertEqual((s["already_enrolled"], s["not_enrolled"]), (1, 0))
 
+    def test_copy_campaign(self):
+        self.conn.execute("UPDATE campaigns SET signature = 'Best, V', track_opens = 0, status = 'active' WHERE id = ?", (self.cid,))
+        self.conn.execute("UPDATE steps SET attachments = '[{\"id\": \"abc\"}]' WHERE campaign_id = ? AND pos = 1", (self.cid,))
+        new = engine.copy_campaign(self.conn, self.cid)
+        c = one(self.conn, "SELECT * FROM campaigns WHERE id = ?", new)
+        self.assertEqual((c["name"], c["status"], c["signature"], c["track_opens"]), ("c (copy)", "draft", "Best, V", 0))
+        cols = "pos, channel, delay_days, condition, subject, body, in_thread, attachments"
+        self.assertEqual([tuple(r.values()) for r in rows(self.conn, f"SELECT {cols} FROM steps WHERE campaign_id = ? ORDER BY pos", new)],
+                         [tuple(r.values()) for r in rows(self.conn, f"SELECT {cols} FROM steps WHERE campaign_id = ? ORDER BY pos", self.cid)])
+        self.assertEqual(scalar(self.conn, "SELECT COUNT(*) FROM enrollments WHERE campaign_id = ?", new), 0)
+        self.assertEqual(one(self.conn, "SELECT name FROM campaigns WHERE id = ?", engine.copy_campaign(self.conn, self.cid))["name"],
+                         "c (copy 2)")
+
 class FlowTest(Base):
     def test_full_cross_channel_sequence(self):
         self.tick(MON)

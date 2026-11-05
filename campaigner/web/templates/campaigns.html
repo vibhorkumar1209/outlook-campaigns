@@ -17,7 +17,8 @@
   {% for c in campaigns %}
     <tr>
       <td><a href="/campaigns/{{ c.id }}" data-name-of="{{ c.id }}">{{ c.name }}</a>
-        <button class="btn sm ghost rename-btn" data-rename="{{ c.id }}" data-name="{{ c.name }}" title="Rename campaign" aria-label="Rename {{ c.name }}">✎</button></td>
+        <button class="btn sm ghost rename-btn" data-rename="{{ c.id }}" data-name="{{ c.name }}" title="Rename campaign" aria-label="Rename {{ c.name }}">✎</button>
+        <form class="inline-form" method="post" action="/campaigns/{{ c.id }}/copy"><button class="btn sm ghost rename-btn" title="Copy campaign: new draft, same sequence and settings, no leads" aria-label="Copy {{ c.name }}">⧉</button></form></td>
       <td>{{ pill(c.status) }}</td>
       <td class="num">{{ c.n_steps }}</td>
       <td class="num">{{ c.enrolled }}</td>

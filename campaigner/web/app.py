@@ -254,6 +254,15 @@ def create_campaign(name: str = Form(...)):
     return back(f"/campaigns/{cur.lastrowid}", tab="sequence", msg="Campaign created with a starter sequence. Edit it, import leads, then activate.")
 
 
+@app.post("/campaigns/{cid}/copy")
+def campaign_copy(cid: int):
+    conn = db.connect()
+    get_campaign(conn, cid)
+    new = engine.copy_campaign(conn, cid)
+    return back(f"/campaigns/{new}", tab="sequence",
+                msg="Copied as a draft with the same sequence and settings, no leads. Rename it, import leads, then activate.")
+
+
 @app.get("/campaigns/{cid}")
 def campaign(request: Request, cid: int, tab: str = "overview", status: str | None = None):
     conn = db.connect()
