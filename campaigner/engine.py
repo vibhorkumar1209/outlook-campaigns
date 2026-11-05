@@ -295,6 +295,125 @@ def copy_campaign(conn, cid: int, now: datetime | None = None) -> int:
     return new
 
 
+# ---------- history from a spreadsheet ----------
+
+HIST_DATE_FORMATS = ("%d-%b-%y", "%d-%b-%Y", "%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y", "%d/%m/%Y", "%d %b %Y")
+LI_RANK = {"none": 0, "invited": 1, "connected": 2}
+
+
+def history_day(s: str | None) -> datetime | None:
+    """'09-Oct-26', '2026-10-09', '10/09/2026' or an Excel date -> that day at 16:00 UTC (US morning)."""
+    s = (s or "").strip()
+    for fmt in HIST_DATE_FORMATS:
+        for text in (s, s[:10]):
+            try:
+                return datetime.strptime(text, fmt).replace(hour=16, tzinfo=timezone.utc)
+            except ValueError:
+                continue
+    return None
+
+
+def _on_path(cond: str, li_state: str, was: int | None) -> bool:
+    return {"if_not_connected": was != 1, "if_connected": li_state == "connected", "if_was_connected": was == 1,
+            "if_was_invited": was == 0, ON_ACCEPT: li_state == "connected" and was == 0}.get(cond, True)
+
+
+def seed_history(conn, e: dict, hist: dict, now: datetime) -> str | None:
+    """Record what was already done for this lead outside the app (from import columns) and place them in the
+    sequence after it, so nothing is repeated. hist keys: lead_status, li_status, li_msg_1/2, email_1/2.
+    Steps done out of order (a later LinkedIn message) are kept and skipped when the sequence reaches them.
+    Returns a note for the import summary, or None."""
+    steps = rows(conn, "SELECT * FROM steps WHERE campaign_id = ? ORDER BY pos", e["campaign_id"])
+    lead = one(conn, "SELECT * FROM leads WHERE id = ?", e["lead_id"])
+    raw = (hist.get("li_status") or "").lower()
+    li = "connected" if re.search(r"accept|connected", raw) else "invited" if re.search(r"sent|pending|invit", raw) else None
+    was = 1 if "already" in raw else (0 if li else None)
+    li_state = lead["li_state"]
+    if li and LI_RANK[li] > LI_RANK[li_state]:
+        li_state = li
+        conn.execute("UPDATE leads SET li_state = ? WHERE id = ?", (li, lead["id"]))
+    emails, notes = [], []
+    for f in ("email_1", "email_2"):
+        v = (hist.get(f) or "").strip()
+        if re.search(r"\booo\b|out of (the )?office|auto", v, re.I):
+            if emails:
+                emails[-1]["ooo"] = True  # their automatic reply to the email before
+        elif re.search(r"undeliver|bounce|fail", v, re.I):
+            emails.append({"at": None, "bounced": True})
+        elif history_day(v):
+            emails.append({"at": history_day(v)})
+        elif v:
+            notes.append(f"{f.replace('_', ' ')} '{v}' not understood")
+    # Before they accept, a "message" can only have been the invite note.
+    msgs = [d for d in (history_day(hist.get("li_msg_1")), history_day(hist.get("li_msg_2"))) if d] \
+        if li_state == "connected" else []
+    dated = [x["at"] for x in emails if x.get("at")] + msgs
+    start = min(dated) if dated else now
+    for x in emails:  # an undelivered email: assume it went with the one before it
+        x["at"] = x.get("at") or (max(d for d in dated if d) if dated else now)
+    ctx = lead_context({**e, **lead})
+
+    def task(k, ch, at):  # a done task marks the step as done before import (see _done_before)
+        conn.execute("INSERT INTO tasks (enrollment_id, step_pos, channel, body, status, created_at, done_at) "
+                     "VALUES (?, ?, ?, '', 'done', ?, ?)", (e["id"], k, ch, iso(at), iso(at)))
+        if ch != "email":
+            event(conn, lead["id"], "task_done", enrollment=e, channel=ch, step_pos=k, detail="before import", at=at)
+
+    pos, last, linear, first_email = -1, None, True, None
+    for k, st in enumerate(steps):
+        ch, cond = st["channel"], st["condition"]
+        usable = (ch != "email" or lead["email"]) and (ch not in LI or lead["linkedin_url"])
+        on = _on_path(cond, li_state, was) and usable
+        done = None
+        if on and ch == "li_connect" and li and was == 0:
+            done = start
+            task(k, ch, done)
+        elif on and ch == "email" and emails:
+            x = emails.pop(0)
+            done = x["at"]
+            first_email = first_email or done
+            try:
+                subject = render_text(st["subject"] or "", ctx)
+            except TemplateError:
+                subject = st["subject"]
+            event(conn, lead["id"], "sent", enrollment=e, channel="email", step_pos=k, detail=subject, at=done)
+            task(k, "email", done)
+            if x.get("bounced"):
+                conn.execute("UPDATE leads SET email_bounced = 1 WHERE id = ?", (lead["id"],))
+                event(conn, lead["id"], "bounce", enrollment=e, channel="email", step_pos=k, detail="before import",
+                      at=done)
+            if x.get("ooo"):
+                event(conn, lead["id"], "auto_reply", enrollment=e, channel="email", step_pos=k,
+                      detail="out of office (before import)", at=done + timedelta(hours=1))
+        elif on and ch == "li_message" and msgs:
+            done = msgs.pop(0)
+            task(k, ch, done)
+        elif on and ch == "li_view" and linear and (emails or msgs or k < len(steps) - 1):
+            done = None  # a profile view leaves no trace; pass it if anything later was done
+            on = False
+        if cond == ON_ACCEPT:
+            continue  # outside the step-by-step order
+        if not on or done:
+            if linear:
+                pos, last = k, done or last
+        else:
+            linear = False
+    if emails or msgs:
+        notes.append(f"{len(emails) + len(msgs)} past step(s) didn't fit this sequence")
+    conn.execute("""UPDATE enrollments SET step_pos = ?, last_step_at = ?, first_email_at = ?, was_connected = ?,
+                    status = ? WHERE id = ?""",
+                 (pos, iso(last) if last else None, iso(first_email) if first_email else None, was,
+                  "active" if pos >= 0 else "pending", e["id"]))
+    status = (hist.get("lead_status") or "").strip()
+    if status:  # already engaged: a lead, not a prospect, and out of the sequence
+        conn.execute("UPDATE leads SET lead_status = ?, stage = 'lead', became_lead_at = COALESCE(became_lead_at, ?) "
+                     "WHERE id = ?", (status, iso(now), lead["id"]))
+        conn.execute("UPDATE enrollments SET status = 'stopped', note = ? WHERE id = ?", (f"lead: {status}", e["id"]))
+        event(conn, lead["id"], "stopped", enrollment=e, detail=f"lead before import: {status}", at=now)
+        notes.append(f"{status}: moved to Leads, not in the sequence")
+    return "; ".join(notes) or None
+
+
 def undo_reply(conn, lead_id: int, now: datetime | None = None) -> int:
     """'Not a reply': put a lead back into the sequences their last reply stopped, from where they were.
     Messages up to now are ignored from then on. Returns how many sequences restart; ValueError if none."""
@@ -590,6 +709,13 @@ def gate(st: dict, e: dict, now: datetime, due: datetime,
     return None, False
 
 
+def _done_before(conn, e: dict, k: int) -> bool:
+    """A step recorded as done by an import (seed_history) ahead of where the sequence is. Emails the app sent
+    have no task, so resuming after a bounce still re-sends."""
+    return bool(scalar(conn, "SELECT 1 FROM tasks WHERE enrollment_id = ? AND step_pos = ? AND status = 'done'",
+                       e["id"], k))
+
+
 def was_connected(conn, e: dict) -> int:
     """1 if the lead is connected and this sequence never had to invite them (no invite sent, none pending)."""
     if e["li_state"] != "connected":
@@ -695,6 +821,11 @@ def process_campaign(conn, c: dict, boxes: Mailboxes, tracker, now: datetime, se
             due = base + step_delay(c, steps, k)
             if now < due:
                 break
+            if _done_before(conn, e, k):
+                _advance(conn, e, k, now)
+                event(conn, e["lead_id"], "step_skipped", enrollment=e, channel=st["channel"], step_pos=k,
+                      detail="already done (before import)", at=now)
+                continue
             if st["condition"] in START_BRANCH and e.get("was_connected") is None:
                 e["was_connected"] = was_connected(conn, e)
                 conn.execute("UPDATE enrollments SET was_connected = ? WHERE id = ?", (e["was_connected"], e["id"]))

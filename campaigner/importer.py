@@ -8,6 +8,7 @@ import re
 import sqlite3
 from urllib.parse import unquote
 
+from . import engine
 from .db import event, iso, one, utcnow
 
 FIELDS = {
@@ -18,7 +19,15 @@ FIELDS = {
     "company": "Company",
     "title": "Title",
     "linkedin_url": "LinkedIn URL",
+    # Optional history, so leads you've already worked outside the app start at the right step.
+    "lead_status": "History: lead status",
+    "li_status": "History: LinkedIn status",
+    "li_msg_1": "History: LinkedIn message 1 date",
+    "li_msg_2": "History: LinkedIn message 2 date",
+    "email_1": "History: email 1 date",
+    "email_2": "History: email 2 date",
 }
+HISTORY = ("lead_status", "li_status", "li_msg_1", "li_msg_2", "email_1", "email_2")
 GUESS = {
     "email": ["email", "e_mail", "email_address", "work_email", "business_email", "mail"],
     "first_name": ["first_name", "firstname", "first", "given_name", "fname"],
@@ -26,6 +35,12 @@ GUESS = {
     "name": ["name", "full_name", "fullname", "contact_name", "contact", "person"],
     "company": ["company", "company_name", "organization", "organisation", "account", "account_name", "employer"],
     "title": ["title", "job_title", "position", "role", "designation", "headline"],
+    "lead_status": ["lead_status"],
+    "li_status": ["li_status", "linkedin_status", "connection_status"],
+    "li_msg_1": ["li_1st_msg", "li_msg_1", "li_message_1", "linkedin_message_1", "li_msg1"],
+    "li_msg_2": ["li_2nd_msg", "li_msg_2", "li_message_2", "linkedin_message_2", "li_msg2"],
+    "email_1": ["em1", "em_1", "email_1", "email_1_date", "email1"],
+    "email_2": ["em2", "em_2", "email_2", "email_2_date", "email2"],
     "linkedin_url": ["linkedin", "linkedin_url", "linkedin_profile", "profile_url", "person_linkedin_url",
                      "li_url", "linkedin_profile_url"],
 }
@@ -53,6 +68,30 @@ def read_table(filename: str, content: bytes) -> tuple[list[str], list[dict]]:
     header = [h for h in header if h]
     clean = [{h: ("" if r.get(h) is None else str(r.get(h)).strip()) for h in header} for r in data]
     return header, [r for r in clean if any(r.values())]
+
+
+CREDENTIALS = {"pe", "cpsm", "mba", "phd", "cpa", "pmp", "cfa", "jr", "sr", "ii", "iii", "esq"}
+
+
+def _fix_text(s: str) -> str:
+    """Undo Excel-on-Mac mojibake ('AtkinsR√©alis' -> 'AtkinsRéalis')."""
+    if "√" in s:
+        try:
+            return s.encode("mac_roman").decode("utf-8")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            pass
+    return s
+
+
+def clean_last_name(last: str, full: str) -> str:
+    """Spreadsheet splits leave 'KK)', 'Nats]', 'PE', 'MBA' as the last name: take it from the full name instead."""
+    l = last.strip()
+    bad = not l or not l[0].isalpha() or l[-1] in ")]" or l.lower().strip(".") in CREDENTIALS
+    if not bad or not full:
+        return l
+    words = re.sub(r"[(\[][^)\]]*[)\]]", " ", full.split(",")[0]).split()
+    words = [w for w in words if w.lower().strip(".") not in CREDENTIALS]
+    return words[-1] if len(words) > 1 else l
 
 
 def guess_mapping(headers: list[str]) -> dict[str, str]:
@@ -108,10 +147,12 @@ def import_rows(conn, rows: list[dict], mapping: dict[str, str], campaign_id: in
             summary["skipped"].append(f"row {n}: no email or LinkedIn URL")
             summary["skipped_rows"] += 1
             continue
-        first, last = val["first_name"], val["last_name"]
+        first, last = val["first_name"].strip(), val["last_name"]
         if not first and val["name"]:
             first, _, rest = val["name"].partition(" ")
             last = last or rest.strip()
+        last = clean_last_name(last, val["name"])
+        val["company"], val["title"] = _fix_text(val["company"]), _fix_text(val["title"])
         extras = {snake(k): v for k, v in r.items() if k not in mapped and v}
         fields = {"first_name": first, "last_name": last, "company": val["company"], "title": val["title"]}
 
@@ -158,6 +199,12 @@ def import_rows(conn, rows: list[dict], mapping: dict[str, str], campaign_id: in
                 e = one(conn, "SELECT * FROM enrollments WHERE id = ?", cur.lastrowid)
                 event(conn, lead_id, "enrolled", enrollment=e, at=now)
                 summary["enrolled"] += 1
+                hist = {f: val[f] for f in HISTORY if (val.get(f) or "").strip() not in ("", "-")}
+                if hist:
+                    note = engine.seed_history(conn, e, hist, now)
+                    summary["with_history"] = summary.get("with_history", 0) + 1
+                    if note:
+                        summary["skipped"].append(f"row {n}: {note}")
             else:
                 summary["already_enrolled"] += 1
     conn.execute("COMMIT")

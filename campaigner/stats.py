@@ -1,6 +1,7 @@
 """Read-side queries for the dashboard."""
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta
 
 from .db import iso, parse, rows, scalar, utcnow
@@ -181,3 +182,63 @@ def sender_rows(conn, tz) -> list[dict]:
             "health": bounce_health(st["bounce_rate"], st["sent"]),
         })
     return out
+
+
+# ---------- Campaign Status (the outreach tracker sheet, built from what the app did) ----------
+
+LI_STATUS = {"none": "-", "invited": "Request Sent", "connected": "Request Accepted"}
+N_VOICEMAILS = 3
+
+
+def campaign_status(conn, campaign_id: int, tz) -> tuple[list[str], list[dict]]:
+    """Columns and rows like a hand-kept tracker: one row per lead, a date per LinkedIn message and email."""
+    day = lambda s: parse(s).astimezone(tz).strftime("%d-%b-%y") if s else ""  # noqa: E731
+    ens = rows(conn, """SELECT e.id eid, e.status, e.reply_channel, e.was_connected, e.voicemails, l.*
+                        FROM enrollments e JOIN leads l ON l.id = e.lead_id WHERE e.campaign_id = ? ORDER BY e.id""",
+               campaign_id)
+    ids = [e["eid"] for e in ens] or [0]
+    marks = ",".join("?" * len(ids))
+    msgs, mails = {}, {}
+    for t in rows(conn, f"""SELECT enrollment_id, done_at FROM tasks WHERE enrollment_id IN ({marks})
+                            AND channel = 'li_message' AND status = 'done' ORDER BY done_at""", *ids):
+        msgs.setdefault(t["enrollment_id"], []).append(day(t["done_at"]))
+    evs = rows(conn, f"""SELECT enrollment_id, type, step_pos, at FROM events WHERE enrollment_id IN ({marks})
+                         AND channel = 'email' AND type IN ('sent', 'bounce', 'auto_reply') ORDER BY at, id""", *ids)
+    for ev in evs:
+        out = mails.setdefault(ev["enrollment_id"], [])
+        if ev["type"] == "sent":
+            out.append({"step": ev["step_pos"], "text": day(ev["at"])})
+        elif out and ev["type"] == "bounce":
+            match = [m for m in out if m["step"] == ev["step_pos"]] or out[-1:]
+            match[-1]["text"] = "Undelivered"
+        elif out and ev["type"] == "auto_reply" and "OOO" not in out[-1]["text"]:
+            out[-1]["text"] += " (OOO)"
+    n_li = max([2] + [len(v) for v in msgs.values()])
+    n_em = max([2] + [len(v) for v in mails.values()])
+    cols = ["#", "Name", "First Name", "Last Name", "Designation", "Department", "Company", "Email", "Phone",
+            "Country", "LinkedIn", "Lead Status", "LI Status",
+            *[f"LI {_nth(i + 1)} Msg" for i in range(n_li)], *[f"EM{i + 1}" for i in range(n_em)],
+            *[f"VM{i + 1}" for i in range(N_VOICEMAILS)]]
+    out = []
+    for n, e in enumerate(ens, start=1):
+        extra = json.loads(e["data"] or "{}")
+        status = e["lead_status"] or (f"Replied ({'LinkedIn' if e['reply_channel'] == 'linkedin' else 'email'})"
+                                      if e["status"] == "replied" else "Unsubscribed" if e["dnc"] else "")
+        li = "Already Connected" if e["li_state"] == "connected" and e["was_connected"] == 1 else LI_STATUS[e["li_state"]]
+        m, em = msgs.get(e["eid"], []), [x["text"] for x in mails.get(e["eid"], [])]
+        li_cells = (m + [""] * n_li)[:n_li]
+        if not m and e["li_state"] != "connected":
+            li_cells[0] = "-"  # can't message them yet
+        vms = (json.loads(e["voicemails"] or "[]") + [""] * N_VOICEMAILS)[:N_VOICEMAILS]
+        values = [n, f"{e['first_name']} {e['last_name']}".strip(), e["first_name"], e["last_name"], e["title"],
+                  extra.get("department", ""), e["company"], e["email"] or "", extra.get("phone", ""),
+                  extra.get("country", ""), e["linkedin_url"] or "", status, li,
+                  *li_cells,
+                  *(em + [""] * n_em)[:n_em], *vms]
+        out.append({"eid": e["eid"], "lead_id": e["id"], "manual_status": e["lead_status"],
+                    "cells": dict(zip(cols, values))})
+    return cols, out
+
+
+def _nth(i: int) -> str:
+    return {1: "1st", 2: "2nd", 3: "3rd"}.get(i, f"{i}th")

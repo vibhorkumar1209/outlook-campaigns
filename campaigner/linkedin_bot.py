@@ -38,6 +38,8 @@ ACTION_OF = {"li_view": "view", "li_connect": "connect", "li_message": "message"
 MAX_ATTEMPTS = 2
 REPLY_CHECK_EVERY = timedelta(minutes=10)  # LinkedIn inbox scan for replies to the bot's messages
 ACCEPT_CHECK_EVERY = timedelta(minutes=15)  # "recently added" connections scan for accepted invites
+ACCEPT_DEEP_EVERY = timedelta(days=1)       # once a day, read further back: catches older invites accepted
+ACCEPT_LIMIT, ACCEPT_DEEP_LIMIT = 40, 300
 APPROVAL_TIMEOUT = timedelta(days=3)  # unapproved comment drafts expire; the like still counts
 class _ProfileLock:
     """One Chrome profile can only be open once. A file lock, so the dashboard's runs, its sign-in window and
@@ -311,8 +313,13 @@ def accept_candidates(conn) -> list[dict]:
 
 
 def check_accepts(conn, driver, invited: list[dict], now: datetime, log) -> None:
-    """Mark invited prospects who appear in your newest connections as connected (an on-accept message follows)."""
-    recent = set(driver.recent_connections())
+    """Mark invited prospects who appear in your newest connections as connected (an on-accept message follows).
+    Usually the newest 40; once a day the newest 300, for invites accepted before the last quick look."""
+    last_deep = parse(db.get_setting(conn, "li_accept_deep_at"))
+    deep = not last_deep or now - last_deep >= ACCEPT_DEEP_EVERY
+    recent = set(driver.recent_connections(ACCEPT_DEEP_LIMIT if deep else ACCEPT_LIMIT))
+    if deep:
+        db.set_setting(conn, "li_accept_deep_at", iso(now))
     for lead in invited:
         if ChromeDriver._slug(lead["linkedin_url"]) in recent:
             if engine.set_connected(conn, lead["lead_id"], now, source="accepted the invite (seen by bot)"):
@@ -649,10 +656,26 @@ class ChromeDriver:
       return out;
     }"""
 
-    def recent_connections(self, limit: int = 40) -> list[str]:
-        """Profile slugs of your newest connections (LinkedIn lists them most recently added first)."""
+    def recent_connections(self, limit: int = ACCEPT_LIMIT) -> list[str]:
+        """Profile slugs of your newest connections (LinkedIn lists them most recently added first). The list
+        scrolls inside <main> and loads ~10 more each time its last entry comes into view; read until `limit`
+        are loaded or it stops growing."""
         self._goto(self.base + "/mynetwork/invite-connect/connections/")
-        return self.page.evaluate(self._CONNECTIONS_JS)[:limit]
+        slugs = self.page.evaluate(self._CONNECTIONS_JS)
+        for _ in range(limit // 10 + 2):
+            if len(slugs) >= limit:
+                break
+            more = self._button_named(r"^(Show|Load) more")
+            if more:
+                more.click()
+            else:
+                self.page.locator("main a[href*='/in/']").last.scroll_into_view_if_needed()
+            self._pause(1.8, 2.8)
+            grown = self.page.evaluate(self._CONNECTIONS_JS)
+            if len(grown) <= len(slugs):
+                break
+            slugs = grown
+        return slugs[:limit]
 
     def _message_control(self):
         """This profile's own Message control is labelled exactly "Message" (others say "Message <name>")."""

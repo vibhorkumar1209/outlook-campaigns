@@ -203,3 +203,18 @@ $$("[data-rename]").forEach((b) => b.addEventListener("click", () => {
   });
   input.addEventListener("blur", () => finish(true));
 }));
+
+// Campaign Status: Lead Status and VM1..VM3 save as you type.
+$$("[data-tracker]").forEach((inp) => {
+  let timer;
+  inp.addEventListener("input", () => {
+    clearTimeout(timer);
+    timer = setTimeout(async () => {
+      const eid = inp.dataset.tracker;
+      const body = inp.dataset.field === "lead_status" ? { lead_status: inp.value }
+        : { voicemails: $$(`[data-tracker="${eid}"][data-field="vm"]`).map((x) => x.value) };
+      try { await api(`/api/enrollments/${eid}/tracker`, body); inp.classList.remove("err"); }
+      catch (err) { inp.classList.add("err"); toast(err.message, true); }
+    }, 500);
+  });
+});

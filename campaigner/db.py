@@ -173,7 +173,9 @@ MIGRATIONS = [
     ("leads", "email_updated_at", "TEXT"),
     ("steps", "attachments", "TEXT NOT NULL DEFAULT '[]'"),        # [{id, name, size, type}] for email steps
     ("leads", "reply_ignored_before", "TEXT"),
-    ("enrollments", "was_connected", "INTEGER"),                   # start branch: 1 already connected, 0 needed an invite                     # 'Not a reply': messages up to here don't count
+    ("enrollments", "was_connected", "INTEGER"),
+    ("leads", "lead_status", "TEXT NOT NULL DEFAULT ''"),          # your own label, e.g. "Demo Scheduled"
+    ("enrollments", "voicemails", "TEXT NOT NULL DEFAULT '[]'"),   # Campaign Status VM1..VM3, logged by you                   # start branch: 1 already connected, 0 needed an invite                     # 'Not a reply': messages up to here don't count
 ]
 
 

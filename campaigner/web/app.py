@@ -1,15 +1,18 @@
 """Local dashboard. FastAPI + server-rendered Jinja. Listens on 127.0.0.1 only."""
 from __future__ import annotations
 
+import csv
+import io
 import json
 import os
+import re
 import secrets
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo, available_timezones
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from jinja2 import TemplateError, TemplateSyntaxError
@@ -291,6 +294,8 @@ def campaign(request: Request, cid: int, tab: str = "overview", status: str | No
             sql += " AND e.status = ?"
             args.append(status)
         ctx.update(enrollments=rows(conn, sql + " ORDER BY e.id LIMIT 1000", *args), status=status)
+    elif tab == "status":
+        ctx["status_cols"], ctx["status_rows"] = stats.campaign_status(conn, cid, local_tz())
     elif tab == "settings":
         tz = engine.tz_of(c)
         start = parse(c["start_at"])
@@ -509,6 +514,57 @@ def stop(eid: int):
     conn = db.connect()
     engine.stop_enrollment(conn, eid)
     return {"ok": True}
+
+
+@app.post("/api/enrollments/{eid}/tracker")
+async def tracker_fields(eid: int, request: Request):
+    """Campaign Status columns you fill in yourself: Lead Status (a label) and voicemails VM1..VM3."""
+    p = await request.json()
+    conn = db.connect()
+    e = one(conn, "SELECT id, lead_id FROM enrollments WHERE id = ?", eid)
+    if not e:
+        raise HTTPException(404)
+    if "lead_status" in p:
+        conn.execute("UPDATE leads SET lead_status = ? WHERE id = ?", (str(p["lead_status"] or "").strip()[:80], e["lead_id"]))
+    if "voicemails" in p:
+        vms = [str(v or "").strip()[:40] for v in (p["voicemails"] or [])][:stats.N_VOICEMAILS]
+        conn.execute("UPDATE enrollments SET voicemails = ? WHERE id = ?", (json.dumps(vms), eid))
+    return {"ok": True}
+
+
+@app.get("/campaigns/{cid}/status.{fmt}")
+def campaign_status_export(cid: int, fmt: str):
+    conn = db.connect()
+    c = get_campaign(conn, cid)
+    cols, items = stats.campaign_status(conn, cid, local_tz())
+    name = re.sub(r"[^\w\- ]+", "", c["name"]).strip() or "campaign"
+    if fmt == "csv":
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(cols)
+        w.writerows([r["cells"][k] for k in cols] for r in items)
+        return Response("\ufeff" + buf.getvalue(), media_type="text/csv",  # BOM: Excel reads it as UTF-8
+                        headers={"Content-Disposition": f'attachment; filename="{name} - Campaign Status.csv"'})
+    if fmt != "xlsx":
+        raise HTTPException(404)
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Campaign Status"
+    ws.append(cols)
+    for cell in ws[1]:
+        cell.font, cell.fill = Font(bold=True, color="FFFFFF"), PatternFill("solid", fgColor="1F4E79")
+    for r in items:
+        ws.append([r["cells"][k] for k in cols])
+    ws.freeze_panes = "C2"
+    for col in ws.columns:
+        ws.column_dimensions[col[0].column_letter].width = min(40, max(6, *(len(str(x.value or "")) + 2 for x in col)))
+    buf = io.BytesIO()
+    wb.save(buf)
+    return Response(buf.getvalue(), media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    headers={"Content-Disposition": f'attachment; filename="{name} - Campaign Status.xlsx"'})
 
 
 # ---------- leads ----------
