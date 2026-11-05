@@ -266,6 +266,26 @@ def resume_enrollment(conn, enrollment_id: int, now: datetime | None = None) -> 
     return how
 
 
+def copy_campaign(conn, cid: int, now: datetime | None = None) -> int:
+    """A new draft with the same settings and sequence (attachments included), no leads. Returns its id."""
+    c = one(conn, "SELECT * FROM campaigns WHERE id = ?", cid)
+    if not c:
+        raise ValueError("not found")
+    names = {r["name"] for r in rows(conn, "SELECT name FROM campaigns")}
+    name, n = f"{c['name']} (copy)", 2
+    while name in names:
+        name, n = f"{c['name']} (copy {n})", n + 1
+    keep = [k for k in c if k not in ("id", "name", "status", "start_at", "created_at")]
+    cols = ["name", "status", "created_at", *keep]
+    cur = conn.execute(f"INSERT INTO campaigns ({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})",
+                       (name, "draft", iso(now or utcnow()), *(c[k] for k in keep)))
+    new = cur.lastrowid
+    st_cols = [r["name"] for r in rows(conn, "PRAGMA table_info(steps)") if r["name"] not in ("id", "campaign_id")]
+    conn.execute(f"INSERT INTO steps (campaign_id, {', '.join(st_cols)}) "
+                 f"SELECT ?, {', '.join(st_cols)} FROM steps WHERE campaign_id = ? ORDER BY pos", (new, cid))
+    return new
+
+
 def undo_reply(conn, lead_id: int, now: datetime | None = None) -> int:
     """'Not a reply': put a lead back into the sequences their last reply stopped, from where they were.
     Messages up to now are ignored from then on. Returns how many sequences restart; ValueError if none."""
