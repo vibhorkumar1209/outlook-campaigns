@@ -306,3 +306,12 @@ code, .code { background: #02090e; border: 1px solid var(--line); border-radius:
   .fadd { left: calc(50% + 44px); }
   .fmenu { left: auto; right: 0; }
 }
+
+/* Campaign Status: a wide tracker sheet */
+.status-wrap { max-height: 70vh; overflow: auto; }
+.status-t th { position: sticky; top: 0; background: var(--panel); z-index: 1; }
+.status-t td { white-space: nowrap; font-size: 12px; padding: 6px 8px; }
+.status-t td.good { color: var(--good); }
+.status-t td.bad { color: var(--critical); }
+.status-t .cell-in { font: inherit; font-size: 12px; padding: 2px 6px; width: 130px; }
+.status-t .cell-in.vm { width: 84px; }

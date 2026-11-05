@@ -557,6 +557,88 @@ class OnAcceptTest(Base):
         self.assertEqual(self.subjects(), ["Intro"])
         self.assertIsNone(self.task("jane@x.com"))
 
+
+class HistoryImportTest(Base):
+    """Leads already worked outside the app (tracker sheet) start where they are, with nothing repeated."""
+    SEQ = [("li_connect", 0, None, "Hi {{ first_name }}", "if_not_connected"),
+           ("email", 0, "Intro", "Hello {{ first_name }}", "if_was_connected"),
+           ("email", 0, "Intro", "Hello {{ first_name }}", "if_was_invited"),
+           ("li_message", 0, None, "Good to connect, {{ first_name }}", "on_accept"),
+           ("email", 4, "Value", "Value {{ first_name }}", "always"),
+           ("li_message", 3, None, "Demo, {{ first_name }}?", "if_connected"),
+           ("email", 3, "Spend", "Spend {{ first_name }}", "always")]
+    COLS = ["Name", "First Name", "Last Name", "Email", "LinkedIn", "Department", "Phone", "Lead Status", "LI Status",
+            "LI 1st Msg", "LI 2nd Msg", "EM1", "EM2"]
+    OCT9 = datetime(2026, 10, 9, 16, tzinfo=timezone.utc)
+
+    def setUp(self):
+        super().setUp()
+        self.conn.execute("UPDATE campaigns SET status = 'paused' WHERE id = ?", (self.cid,))
+        self.cid = self.campaign([x[:4] for x in self.SEQ], name="hist")
+        for i, x in enumerate(self.SEQ):
+            self.conn.execute("UPDATE steps SET condition = ?, in_thread = 0 WHERE campaign_id = ? AND pos = ?", (x[4], self.cid, i))
+
+    def load(self, *people):
+        rows_ = [dict(zip(self.COLS, p)) for p in people]
+        return importer.import_rows(self.conn, rows_, importer.guess_mapping(self.COLS), self.cid)
+
+    def en(self, email):
+        return one(self.conn, "SELECT e.*, l.li_state, l.stage, l.email_bounced, l.last_name, l.company FROM enrollments e "
+                              "JOIN leads l ON l.id = e.lead_id WHERE l.email = ? AND e.campaign_id = ?", email, self.cid)
+
+    def test_mapping_and_cleanup(self):
+        m = importer.guess_mapping(self.COLS)
+        self.assertEqual((m["li_status"], m["li_msg_1"], m["li_msg_2"], m["email_1"], m["email_2"], m["lead_status"]),
+                         ("LI Status", "LI 1st Msg", "LI 2nd Msg", "EM1", "EM2", "Lead Status"))
+        self.assertEqual([importer.clean_last_name(l, f) for l, f in [("KK)", "Krishna Kumaraswamy (KK)"),
+                          ("Nats]", "Natarajan Venkataraman [Nats]"), ("PE", "Matt Gautreaux, PE"), ("Gupta", "Somil Gupta")]],
+                         ["Kumaraswamy", "Venkataraman", "Gautreaux", "Gupta"])
+
+    def test_invite_pending_after_email_1(self):
+        self.load(("Ann Lee", "Ann ", "Lee", "ann@x.com", "linkedin.com/in/annlee", "Sales", "1555", "", "Request Sent", "-", "", "09-Oct-26", ""))
+        e = self.en("ann@x.com")
+        self.assertEqual((e["li_state"], e["was_connected"], e["step_pos"], e["status"]), ("invited", 0, 2, "active"))  # after Email 1
+        self.assertEqual(e["last_step_at"], iso(self.OCT9))
+        self.tick(MON + timedelta(days=30))                       # next is Email 2 ("Value"), overdue: goes now
+        self.assertEqual([x[2] for x in self.g.sent if x[1] == "ann@x.com"], ["Value"])
+        self.assertIsNone(self.task("ann@x.com"))                 # no second invite, no message (not accepted)
+
+    def test_accepted_without_message_gets_the_accept_message(self):
+        self.load(("Bo Tan", "Bo", "Tan", "bo@x.com", "linkedin.com/in/botan", "", "", "", "Request Accepted", "-", "", "09-Oct-26", ""))
+        self.tick(MON + timedelta(days=30))
+        t = self.task("bo@x.com")
+        self.assertEqual((t["channel"], t["body"]), ("li_message", "Good to connect, Bo"))
+
+    def test_second_message_already_sent_is_skipped_later(self):
+        self.load(("Cy Wu", "Cy", "Wu", "cy@x.com", "linkedin.com/in/cywu", "", "", "", "Request Accepted", "29-Sep-26", "09-Oct-26", "09-Oct-26", ""))
+        now = MON + timedelta(days=30)
+        self.tick(now)                                             # Email 2 now; the on-accept message was done
+        self.assertIsNone(self.task("cy@x.com"))
+        for d in (1, 3, 4, 7):
+            self.tick(now + timedelta(days=d, minutes=1))
+        self.assertIsNone(self.task("cy@x.com"))                   # "Demo" message counted as LI 2nd Msg: not resent
+        self.assertEqual([x[2] for x in self.g.sent if x[1] == "cy@x.com"], ["Value", "Spend"])
+
+    def test_undelivered_ooo_and_lead_status(self):
+        s = self.load(("Di Ko", "Di", "Ko", "di@x.com", "linkedin.com/in/diko", "", "", "", "Request Accepted", "09-Oct-26", "", "Undelivered", ""),
+                      ("Ed Po", "Ed", "Po", "ed@x.com", "linkedin.com/in/edpo", "", "", "", "Request Sent", "-", "", "12-Oct-26", "OOO"),
+                      ("Fa Ru", "Fa", "Ru", "fa@x.com", "linkedin.com/in/faru", "", "", "Demo Scheduled", "Request Sent", "-", "", "09-Oct-26", ""))
+        self.assertEqual(s["with_history"], 3)
+        self.assertEqual(self.en("di@x.com")["email_bounced"], 1)  # LinkedIn goes on; emails skip
+        self.assertEqual(scalar(self.conn, "SELECT COUNT(*) FROM events WHERE type = 'auto_reply'"), 1)
+        fa = self.en("fa@x.com")
+        self.assertEqual((fa["stage"], fa["status"]), ("lead", "stopped"))
+        cols, rows_ = stats.campaign_status(self.conn, self.cid, timezone.utc)
+        cells = {r["cells"]["Email"]: r["cells"] for r in rows_}
+        self.assertEqual((cells["di@x.com"]["LI Status"], cells["di@x.com"]["LI 1st Msg"], cells["di@x.com"]["EM1"]),
+                         ("Request Accepted", "09-Oct-26", "Undelivered"))
+        self.assertEqual((cells["ed@x.com"]["LI 1st Msg"], cells["ed@x.com"]["EM1"]), ("-", "12-Oct-26 (OOO)"))
+        self.assertEqual(cells["fa@x.com"]["Lead Status"], "Demo Scheduled")
+        self.assertEqual(cols[-3:], ["VM1", "VM2", "VM3"])
+
+    def test_resume_after_bounce_still_resends(self):
+        self.assertFalse(engine._done_before(self.conn, {"id": 999}, 2))
+
 class MailboxTest(Base):
     EMAIL_ONLY = [("email", 0, "Hi {{ company }}", "Hello {{ first_name }}"), ("email", 2, None, "Bump")]
 
@@ -837,8 +919,8 @@ class FakeDriver:
         self.calls, self.posts, self.connect_result, self.message_result, self.blocked = [], list(posts), connect, message, blocked
         self.connections = list(connections)
 
-    def recent_connections(self):
-        self._gate(); self.calls.append("connections"); return self.connections
+    def recent_connections(self, limit=40):
+        self._gate(); self.calls.append(("connections", limit)); return self.connections
 
     def _gate(self):
         if self.blocked:
@@ -915,11 +997,13 @@ class BotTest(Base):
         self.tick(MON)
         self.bot()                                                          # invites Jane
         self.assertEqual(one(self.conn, "SELECT li_state FROM leads WHERE email = 'jane@x.com'")["li_state"], "invited")
-        d = self.bot(FakeDriver(connections=["someone-else", "janedoe"]), at=MON + timedelta(minutes=20))
-        self.assertIn("connections", d.calls)
+        d = self.bot(FakeDriver(connections=["someone-else"]), at=MON + timedelta(minutes=20))
+        self.assertIn(("connections", 300), d.calls)                     # first look of the day goes deep
+        d = self.bot(FakeDriver(connections=["someone-else", "janedoe"]), at=MON + timedelta(minutes=40))
+        self.assertIn(("connections", 40), d.calls)                      # then the newest 40
         self.assertEqual(one(self.conn, "SELECT li_state FROM leads WHERE email = 'jane@x.com'")["li_state"], "connected")
-        d = self.bot(FakeDriver(), at=MON + timedelta(minutes=25))      # nobody invited left: no scan
-        self.assertNotIn("connections", d.calls)
+        d = self.bot(FakeDriver(), at=MON + timedelta(minutes=60))      # nobody invited left: no scan
+        self.assertFalse([c for c in d.calls if c[0] == "connections"])
 
     def test_connect_with_note(self):
         self.tick(MON)

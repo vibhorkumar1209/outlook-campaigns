@@ -15,6 +15,7 @@
   {{ tile("Enrolled", s.enrolled) }}
   {{ tile("Already in campaign", s.already_enrolled) }}
   {{ tile("Not enrolled", s.not_enrolled, "leads, unsubscribed, or in another sequence") }}
+  {% if s.with_history %}{{ tile("With history", s.with_history, "placed after what was already done") }}{% endif %}
   {{ tile("Skipped rows", s.skipped_rows) }}
 </section>
 {% if s.skipped %}
