@@ -33,7 +33,11 @@ TASK_LABELS = {**CHANNELS, ENGAGE: "Like + comment"}
 ENGAGE_DEFAULTS = {"engage_every_days": 7, "engage_lookback_months": 6}
 CONDITIONS = {"always": "Always", "if_connected": "Only if already connected", "if_not_connected": "Only if not connected",
               "if_was_connected": "Only if connected at the start (no invite needed)",
-              "if_was_invited": "Only if they needed an invite"}
+              "if_was_invited": "Only if they needed an invite",
+              "on_accept": "As soon as they accept the invite (alongside the sequence)"}
+# on_accept: a LinkedIn message outside the step-by-step order. It's sent once, the moment someone we invited
+# accepts, while their other steps keep their own timing.
+ON_ACCEPT = "on_accept"
 # Start-branch conditions: decided once per lead (after any Connect step) and kept, so someone who accepts the
 # invite later stays on the "needed an invite" path.
 START_BRANCH = ("if_was_connected", "if_was_invited")
@@ -348,7 +352,10 @@ def complete_task(conn, task_id: int, action: str, body: str | None = None, now:
                  (status, body, iso(now), task_id))
     if status == "done" and t["channel"] == "li_connect":
         conn.execute("UPDATE leads SET li_state = 'invited' WHERE id = ? AND li_state = 'none'", (e["lead_id"],))
-    _advance(conn, e, t["step_pos"], now)
+    on_accept = scalar(conn, "SELECT condition FROM steps WHERE campaign_id = ? AND pos = ?",
+                       e["campaign_id"], t["step_pos"]) == ON_ACCEPT
+    if not on_accept:  # an on-accept message runs alongside: it doesn't move the sequence
+        _advance(conn, e, t["step_pos"], now)
     event(conn, e["lead_id"], "task_done" if status == "done" else "task_skipped", enrollment=e,
           channel=t["channel"], step_pos=t["step_pos"],
           detail=_by(actor, (body or t["body"])[:300] if status == "done" else action), at=now)
@@ -608,7 +615,20 @@ ENROLLED_SQL = """
     FROM enrollments e JOIN leads l ON l.id = e.lead_id
     WHERE e.campaign_id = ? AND e.status IN ('pending', 'active')
       AND NOT EXISTS (SELECT 1 FROM tasks t WHERE t.enrollment_id = e.id AND t.status = 'open'
-                      AND t.channel != 'li_engage')
+                      AND t.channel != 'li_engage'
+                      AND NOT EXISTS (SELECT 1 FROM steps s WHERE s.campaign_id = e.campaign_id
+                                      AND s.pos = t.step_pos AND s.condition = 'on_accept'))
+    ORDER BY e.id
+"""
+
+# Invited leads who've just connected and haven't had a given on-accept step yet.
+ACCEPTED_SQL = """
+    SELECT e.*, l.email, l.linkedin_url, l.first_name, l.last_name, l.company, l.title, l.data, l.li_state, l.dnc,
+           l.email_bounced
+    FROM enrollments e JOIN leads l ON l.id = e.lead_id
+    WHERE e.campaign_id = ? AND e.status IN ('pending', 'active') AND l.li_state = 'connected' AND l.dnc = 0
+      AND l.linkedin_url IS NOT NULL AND COALESCE(e.was_connected, -1) != 1
+      AND NOT EXISTS (SELECT 1 FROM tasks t WHERE t.enrollment_id = e.id AND t.step_pos = ?)
     ORDER BY e.id
 """
 
@@ -638,6 +658,24 @@ def process_campaign(conn, c: dict, boxes: Mailboxes, tracker, now: datetime, se
     li_today = scalar(conn, "SELECT COUNT(*) FROM events WHERE campaign_id = ? AND type = 'task_created' AND at >= ?",
                       c["id"], today)
     queue = []
+    # Acceptances first: a message right after someone accepts matters more than starting someone new.
+    for st in (s for s in steps if s["condition"] == ON_ACCEPT and s["channel"] == "li_message"):
+        for e in rows(conn, ACCEPTED_SQL, c["id"], st["pos"]):
+            if e["was_connected"] is None:  # never had a Connect step: decide now, once
+                e["was_connected"] = was_connected(conn, e)
+                conn.execute("UPDATE enrollments SET was_connected = ? WHERE id = ?", (e["was_connected"], e["id"]))
+            if e["was_connected"] or li_today >= c["li_daily_cap"]:
+                continue
+            try:
+                body = linkedin_text(render_text(st["body"], lead_context(e)))
+            except TemplateError as ex:
+                log(f"{c['name']}: on-accept message template: {ex}")
+                break
+            conn.execute("INSERT INTO tasks (enrollment_id, step_pos, channel, body, created_at) VALUES (?, ?, ?, ?, ?)",
+                         (e["id"], st["pos"], st["channel"], body, iso(now)))
+            event(conn, e["lead_id"], "task_created", enrollment=e, channel=st["channel"], step_pos=st["pos"],
+                  detail="they accepted the invite", at=now)
+            li_today += 1
     for e in rows(conn, ENROLLED_SQL, c["id"]):
         if e["dnc"]:
             stop_enrollment(conn, e["id"], "do not contact", now)
@@ -648,6 +686,10 @@ def process_campaign(conn, c: dict, boxes: Mailboxes, tracker, now: datetime, se
                 conn.execute("UPDATE enrollments SET status = 'done' WHERE id = ?", (e["id"],))
                 break
             st = steps[k]
+            if st["condition"] == ON_ACCEPT:  # not part of the step-by-step order: pass it, timing unchanged
+                conn.execute("UPDATE enrollments SET step_pos = ? WHERE id = ?", (k, e["id"]))
+                e["step_pos"] = k
+                continue
             base = parse(e["last_step_at"]) or max(d for d in (start, parse(e["enrolled_at"])) if d)
             due = base + step_delay(c, steps, k)
             if now < due:

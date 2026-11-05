@@ -493,6 +493,62 @@ class StartBranchTest(Base):
             self.tick(MON + timedelta(days=d, minutes=10))
         self.assertEqual(self.subjects(), ["Intro", "Value"])
 
+
+class OnAcceptTest(Base):
+    SEQ = [("li_connect", 0, None, "Hi {{ first_name }}", "if_not_connected"),
+           ("email", 0, "Intro", "Hello {{ first_name }}", "always"),
+           ("li_message", 0, None, "Thanks for connecting, {{ first_name }}", "on_accept"),
+           ("email", 4, "Value", "Value {{ first_name }}", "always")]
+
+    def setUp(self):
+        super().setUp()
+        self.conn.execute("UPDATE campaigns SET status = 'paused' WHERE id = ?", (self.cid,))
+        self.cid = self.campaign([s[:4] for s in self.SEQ], name="accept")
+        for i, s in enumerate(self.SEQ):
+            self.conn.execute("UPDATE steps SET condition = ?, in_thread = 0 WHERE campaign_id = ? AND pos = ?", (s[4], self.cid, i))
+        lead = one(self.conn, "SELECT id FROM leads WHERE email = 'jane@x.com'")["id"]
+        self.conn.execute("INSERT INTO enrollments (campaign_id, lead_id, enrolled_at) VALUES (?, ?, ?)", (self.cid, lead, iso(MON)))
+        self.lead = lead
+
+    def subjects(self):
+        return [x[2] for x in self.g.sent if x[1] == "jane@x.com"]
+
+    def test_message_goes_out_when_they_accept_and_the_sequence_keeps_its_timing(self):
+        self.tick(MON)
+        engine.complete_task(self.conn, self.task("jane@x.com")["id"], "done", now=MON)   # invite sent
+        self.tick(MON + timedelta(minutes=1))
+        self.assertEqual(self.subjects(), ["Intro"])                                       # email right after the invite
+        self.tick(MON + timedelta(days=1))
+        self.assertIsNone(self.task("jane@x.com"))                                         # not accepted yet: nothing
+        engine.set_connected(self.conn, self.lead, MON + timedelta(days=1, hours=1))
+        self.tick(MON + timedelta(days=1, hours=1, minutes=1))
+        t = self.task("jane@x.com")
+        self.assertEqual((t["channel"], t["body"]), ("li_message", "Thanks for connecting, Jane"))
+        e = self.enr("jane@x.com")
+        engine.complete_task(self.conn, t["id"], "done", now=MON + timedelta(days=1, hours=2))
+        self.assertEqual(self.enr("jane@x.com")["step_pos"], e["step_pos"])               # didn't move the sequence
+        for d in (2, 3):
+            self.tick(MON + timedelta(days=d))
+        self.assertEqual(self.subjects(), ["Intro"])
+        self.tick(MON + timedelta(days=4, minutes=2))                                      # 4 days after Intro, as set
+        self.assertEqual(self.subjects(), ["Intro", "Value"])
+        self.assertEqual(scalar(self.conn, "SELECT COUNT(*) FROM tasks WHERE channel = 'li_message'"), 1)  # once only
+
+    def test_open_on_accept_message_doesnt_hold_up_email(self):
+        self.tick(MON)
+        engine.complete_task(self.conn, self.task("jane@x.com")["id"], "done", now=MON)
+        engine.set_connected(self.conn, self.lead, MON)                                    # accepts at once
+        self.tick(MON + timedelta(minutes=1))
+        self.assertEqual(self.task("jane@x.com")["channel"], "li_message")                 # still open
+        self.assertEqual(self.subjects(), ["Intro"])                                       # email went anyway
+
+    def test_already_connected_lead_doesnt_get_it(self):
+        self.conn.execute("UPDATE leads SET li_state = 'connected' WHERE id = ?", (self.lead,))
+        for m in (0, 1, 2):
+            self.tick(MON + timedelta(minutes=m))
+        self.assertEqual(self.subjects(), ["Intro"])
+        self.assertIsNone(self.task("jane@x.com"))
+
 class MailboxTest(Base):
     EMAIL_ONLY = [("email", 0, "Hi {{ company }}", "Hello {{ first_name }}"), ("email", 2, None, "Bump")]
 
@@ -769,8 +825,12 @@ class DraftTest(unittest.TestCase):
 
 
 class FakeDriver:
-    def __init__(self, posts=(), connect="sent", message="sent", blocked=False):
+    def __init__(self, posts=(), connect="sent", message="sent", blocked=False, connections=()):
         self.calls, self.posts, self.connect_result, self.message_result, self.blocked = [], list(posts), connect, message, blocked
+        self.connections = list(connections)
+
+    def recent_connections(self):
+        self._gate(); self.calls.append("connections"); return self.connections
 
     def _gate(self):
         if self.blocked:
@@ -842,6 +902,16 @@ class BotTest(Base):
         self.bot(Flaky(), at=MON + timedelta(minutes=5))
         self.assertEqual(self.task("jane@x.com")["bot_attempts"], 2)       # limit reached: left for you
         self.assertNotIn("open", self.bot(Flaky(), at=MON + timedelta(minutes=10)).calls)
+
+    def test_bot_sees_accepted_invites(self):
+        self.tick(MON)
+        self.bot()                                                          # invites Jane
+        self.assertEqual(one(self.conn, "SELECT li_state FROM leads WHERE email = 'jane@x.com'")["li_state"], "invited")
+        d = self.bot(FakeDriver(connections=["someone-else", "janedoe"]), at=MON + timedelta(minutes=20))
+        self.assertIn("connections", d.calls)
+        self.assertEqual(one(self.conn, "SELECT li_state FROM leads WHERE email = 'jane@x.com'")["li_state"], "connected")
+        d = self.bot(FakeDriver(), at=MON + timedelta(minutes=25))      # nobody invited left: no scan
+        self.assertNotIn("connections", d.calls)
 
     def test_connect_with_note(self):
         self.tick(MON)
@@ -929,6 +999,7 @@ class BotTest(Base):
         self.assertIn(("like", "https://li/p/mid"), d.calls)
         t = one(self.conn, "SELECT * FROM tasks WHERE id = ?", t["id"])
         self.assertEqual((t["status"], t["comment_status"], t["body"]), ("open", "needs_approval", "Draft about: We cut SaaS "))
+        db.set_setting(self.conn, "li_accept_checked_at", iso(MON + timedelta(hours=3)))  # acceptance scan not due
         self.assertEqual(self.bot(at=MON + timedelta(hours=3)).calls, [])  # waits for you; nothing else due
         self.conn.execute("UPDATE tasks SET body = 'Edited comment', comment_status = 'approved' WHERE id = ?", (t["id"],))
         d2 = self.bot(at=MON + timedelta(hours=4))
