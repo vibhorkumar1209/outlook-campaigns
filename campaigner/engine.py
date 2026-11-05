@@ -31,7 +31,12 @@ LI = ("li_view", "li_connect", "li_message")
 ENGAGE = "li_engage"
 TASK_LABELS = {**CHANNELS, ENGAGE: "Like + comment"}
 ENGAGE_DEFAULTS = {"engage_every_days": 7, "engage_lookback_months": 6}
-CONDITIONS = {"always": "Always", "if_connected": "Only if already connected", "if_not_connected": "Only if not connected"}
+CONDITIONS = {"always": "Always", "if_connected": "Only if already connected", "if_not_connected": "Only if not connected",
+              "if_was_connected": "Only if connected at the start (no invite needed)",
+              "if_was_invited": "Only if they needed an invite"}
+# Start-branch conditions: decided once per lead (after any Connect step) and kept, so someone who accepts the
+# invite later stays on the "needed an invite" path.
+START_BRANCH = ("if_was_connected", "if_was_invited")
 DAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 OPEN = ("pending", "active", "done")
 REPLY_LOOKBACK = timedelta(days=30)   # keep watching finished sequences this long
@@ -560,8 +565,14 @@ def gate(st: dict, e: dict, now: datetime, due: datetime,
         return "email address bounced (fix it on the contact to resume email)", False
     if ch in LI and not e["linkedin_url"]:
         return "no LinkedIn URL", False
-    if st["condition"] == "if_connected" and li_state != "connected":
+    if st["condition"] == "if_was_connected" and not e.get("was_connected"):
+        return "needed an invite (other branch)", False
+    if st["condition"] == "if_was_invited" and e.get("was_connected"):
+        return "connected at the start (other branch)", False
+    if st["condition"] != "always" and ch == "li_message" and li_state != "connected":
         return "not connected", False  # an explicit branch: decide now, don't wait
+    if st["condition"] == "if_connected" and li_state != "connected":
+        return "not connected", False
     if ch == "li_message" and li_state != "connected":
         # A plain LinkedIn message waits for the invite to be accepted, then gives up.
         return ("not connected", False) if now >= due + wait_for_connect else (None, True)
@@ -570,6 +581,16 @@ def gate(st: dict, e: dict, now: datetime, due: datetime,
     if ch == "li_connect" and li_state != "none":
         return "already connected" if li_state == "connected" else "invite already sent", False
     return None, False
+
+
+def was_connected(conn, e: dict) -> int:
+    """1 if the lead is connected and this sequence never had to invite them (no invite sent, none pending)."""
+    if e["li_state"] != "connected":
+        return 0
+    invited = scalar(conn, """SELECT 1 FROM tasks WHERE enrollment_id = ? AND channel = 'li_connect' AND status = 'done'
+                              UNION SELECT 1 FROM events WHERE enrollment_id = ? AND type = 'step_skipped'
+                              AND channel = 'li_connect' AND detail = 'invite already sent'""", e["id"], e["id"])
+    return 0 if invited else 1
 
 
 def _fail(conn, e: dict, k: int, msg: str, log, permanent: bool) -> None:
@@ -631,6 +652,9 @@ def process_campaign(conn, c: dict, boxes: Mailboxes, tracker, now: datetime, se
             due = base + step_delay(c, steps, k)
             if now < due:
                 break
+            if st["condition"] in START_BRANCH and e.get("was_connected") is None:
+                e["was_connected"] = was_connected(conn, e)
+                conn.execute("UPDATE enrollments SET was_connected = ? WHERE id = ?", (e["was_connected"], e["id"]))
             reason, wait = gate(st, e, now, due, DUMMY_WAIT_FOR_CONNECT if is_dummy(c) else WAIT_FOR_CONNECT)
             if wait:
                 break

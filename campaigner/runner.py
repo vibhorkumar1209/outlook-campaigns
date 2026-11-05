@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import fcntl
 import os
+import shutil
+import subprocess
 import threading
 import time
 from collections import deque
@@ -29,8 +31,34 @@ def tick_lock():
         yield True
 
 
+class KeepAwake:
+    """Holds macOS's "don't idle-sleep" assertion (caffeinate -i) while a campaign is active, so sequences keep
+    running with the screen off. It can't stop sleep when the lid closes: that needs power plus an external display."""
+
+    def __init__(self):
+        self.proc: subprocess.Popen | None = None
+
+    @property
+    def on(self) -> bool:
+        return bool(self.proc and self.proc.poll() is None)
+
+    def update(self, want: bool) -> None:
+        if want and not self.on and shutil.which("caffeinate"):
+            # -w: the assertion ends with this process, even if it's killed
+            self.proc = subprocess.Popen(["caffeinate", "-i", "-w", str(os.getpid())])
+        elif not want and self.on:
+            self.proc.terminate()
+            self.proc = None
+
+
+def wants_awake(conn) -> bool:
+    return bool(db.get_setting(conn, "keep_awake", True)) and bool(
+        db.scalar(conn, "SELECT 1 FROM campaigns WHERE status = 'active' LIMIT 1"))
+
+
 class Runner:
     def __init__(self):
+        self.awake = KeepAwake()
         self.logs: deque[str] = deque(maxlen=300)
         self.busy = False
         self.login_state = {"state": "idle", "error": None}
@@ -87,6 +115,14 @@ class Runner:
             time.sleep(5)
             last_full = 0.0
             while True:
+                try:
+                    conn = db.connect()
+                    try:
+                        self.awake.update(wants_awake(conn))
+                    finally:
+                        conn.close()
+                except Exception as e:
+                    self.log(f"keep-awake check failed: {e!r}")
                 full = time.monotonic() - last_full >= minutes * 60
                 if self.run_once(checks=full) and full:
                     last_full = time.monotonic()

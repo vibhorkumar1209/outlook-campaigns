@@ -24,6 +24,7 @@ from .db import iso, one, parse, rows, scalar, utcnow
 
 PROFILE_DIR = Path.home() / ".outlook-campaigns" / "linkedin-profile"
 BASE = "https://www.linkedin.com"
+SNAP_DIR = db.DB_PATH.parent / "bot-errors"   # screenshots of failed actions (git-ignored data/)
 DEFAULTS = {
     "li_mode": "assisted",                                  # assisted | bot
     "li_bot_caps": {"view": 40, "connect": 15, "message": 20, "like": 25, "comment": 8},  # per day; 0 = off
@@ -261,6 +262,18 @@ def run(conn, driver_factory, *, now: datetime | None = None, log=print, sleep=N
             except ValueError as e:  # completed by you between our check and the action finishing
                 log(f"LinkedIn bot: {t['first_name']} {t['last_name']}: {e}, skipped")
                 done += 1
+            except BlockedError:
+                raise
+            except Exception as e:  # page timeout, changed layout...: one attempt used; never stall the queue
+                note = f"{type(e).__name__}: {str(e).strip().splitlines()[0][:200] if str(e).strip() else 'no details'}"
+                _fail(conn, t, note, log)
+                _record(conn, action, t, False, note)
+                snap = getattr(driver, "snapshot", None)
+                if snap:
+                    snap(f"task-{t['id']}")
+                done += 1
+                if "has been closed" in str(e):  # the browser went away: stop this run
+                    break
     except BlockedError as e:  # from the reply check or any action: LinkedIn wants a person
         pause(conn, str(e))
         log(f"LinkedIn bot paused: {e}. Resolve it in the bot's Chrome window, then Resume in Settings.")
@@ -411,10 +424,24 @@ class ChromeDriver:
 
         self.profile_dir.mkdir(parents=True, exist_ok=True)
         self._pw = sync_playwright().start()
+        # chromium_sandbox: Playwright launches Chrome with --no-sandbox unless asked not to. Keep Chrome's
+        # sandbox on: LinkedIn pages are third-party content, and the warning bar goes away too.
         self.ctx = self._pw.chromium.launch_persistent_context(
-            str(self.profile_dir), channel="chrome", headless=self.headless, viewport={"width": 1280, "height": 900})
+            str(self.profile_dir), channel="chrome", headless=self.headless, chromium_sandbox=True,
+            viewport={"width": 1280, "height": 900})
         self.page = self.ctx.pages[0] if self.ctx.pages else self.ctx.new_page()
         self.page.set_default_timeout(15000)
+
+    def snapshot(self, name: str) -> None:
+        """Screenshot of a failed action, for troubleshooting (data/bot-errors, newest 50 kept)."""
+        try:
+            d = SNAP_DIR
+            d.mkdir(parents=True, exist_ok=True)
+            self.page.screenshot(path=str(d / f"{name}.png"))
+            for old in sorted(d.glob("*.png"), key=lambda p: p.stat().st_mtime)[:-50]:
+                old.unlink()
+        except Exception:
+            pass
 
     def close(self) -> None:
         try:
@@ -466,6 +493,28 @@ class ChromeDriver:
                 return locator.nth(i)
         return None
 
+    _HIT_JS = """el => { const r = el.getBoundingClientRect(), t = document.elementFromPoint(r.left + r.width / 2,
+                                                                                 r.top + r.height / 2);
+                      return !!t && (el === t || el.contains(t)); }"""
+
+    def _reachable(self, candidates):
+        """The first candidate a click would actually land on. LinkedIn repeats a profile's Connect/Message
+        controls in a compact header pinned under the site's top bar, where the click hits the top bar."""
+        for attempt in range(2):
+            for c in candidates:
+                try:
+                    c.scroll_into_view_if_needed(timeout=3000)
+                    if c.evaluate(self._HIT_JS):
+                        return c
+                except Exception:
+                    continue
+            self.page.evaluate("window.scrollTo(0, 0)")  # the pinned header only shows once you scroll
+            self.page.wait_for_timeout(600)
+        return None
+
+    def _all_visible(self, locator) -> list:
+        return [locator.nth(i) for i in range(locator.count()) if locator.nth(i).is_visible()]
+
     # Profile pages also list other people ("People also viewed", "People you may know") with their own
     # Message/Connect controls. Every control below is tied to the profile being worked on.
 
@@ -482,18 +531,19 @@ class ChromeDriver:
         """The invite link/button for THIS profile: LinkedIn links it as /preload/custom-invite/?vanityName=<slug>."""
         slug = self._slug(url)
         links = self.page.locator("a[href*='custom-invite']")
+        mine = []
         for i in range(links.count()):
             a = links.nth(i)
             m = re.search(r"vanityName=([^&]+)", a.get_attribute("href") or "")
             if m and m.group(1).lower() == slug and a.is_visible():
-                return a
-        return None
+                mine.append(a)
+        return self._reachable(mine) if mine else None
 
     def _connect_button(self, url: str):
         c = self._invite_control(url)
         if c:
             return c
-        more = self._visible(self._main().get_by_role("button", name=re.compile(r"^More( actions)?$", re.I)))
+        more = self._reachable(self._all_visible(self._main().get_by_role("button", name=re.compile(r"^More( actions)?$", re.I))))
         if more:
             more.click()
             self._pause(0.8, 1.6)
@@ -550,7 +600,7 @@ class ChromeDriver:
     def _message_control(self):
         """This profile's own Message control is labelled exactly "Message" (others say "Message <name>")."""
         for role in ("link", "button"):
-            c = self._visible(self._main().get_by_role(role, name="Message", exact=True))
+            c = self._reachable(self._all_visible(self._main().get_by_role(role, name="Message", exact=True)))
             if c:
                 return c
         return None

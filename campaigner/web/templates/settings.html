@@ -93,6 +93,12 @@
       <p>The dashboard runs everything every {{ tick_minutes }} min while it's open. To start it at login and keep it running:</p>
       <pre class="log">./oc install</pre>
       <p class="meta">Emails respect each campaign's send window and caps. The Mac has to be awake.</p>
+      <form method="post" action="/settings/keep-awake" class="stack-y" style="gap:8px">
+        <label><input type="checkbox" name="keep_awake" value="1" {{ 'checked' if keep_awake }} onchange="this.form.submit()">
+          Keep this Mac awake while a campaign is active</label>
+        <p class="meta">{% if awake_on %}<span class="dot on"></span> Holding the Mac awake now (a campaign is active).{% elif keep_awake %}Not holding it now: no campaign is active.{% else %}Off: the Mac sleeps on its usual schedule and campaigns pause until it wakes.{% endif %}
+          This stops idle sleep, including on battery. <b>Closing the lid still sleeps the Mac</b> unless it's on power with an external display. For lid-open, screen-off running on power, also turn on <i>System Settings → Battery → Options → Prevent automatic sleeping on power adapter when the display is off</i>. After any sleep, due steps run as soon as it wakes.</p>
+      </form>
     </section>
   </div>
 
