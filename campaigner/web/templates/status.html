@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block title %}Campaign Status{% endblock %}
+{% block main %}
+<header class="head">
+  <div>
+    <h1>Campaign Status <span class="meta">· {{ status_rows | length }} leads</span></h1>
+    <p class="sub">Your outreach tracker, kept up to date by the app: invite state, the date of every LinkedIn message and email, "Undelivered" for bounces, "(OOO)" for out-of-office replies. Lead Status and VM1–VM3 are yours to fill in; they save as you type.</p>
+  </div>
+  <div class="actions">
+    <form method="get" action="/status">
+      <select name="campaign" onchange="this.form.submit()" aria-label="Campaign">
+        <option value="all" {{ 'selected' if not selected }}>All campaigns</option>
+        {% for c in campaigns %}<option value="{{ c.id }}" {{ 'selected' if selected == c.id }}>{{ c.name }} ({{ c.status }})</option>{% endfor %}
+      </select>
+    </form>
+    <a class="btn" href="/status/export.xlsx?campaign={{ selected or 'all' }}">Download Excel</a>
+    <a class="btn ghost" href="/status/export.csv?campaign={{ selected or 'all' }}">CSV</a>
+  </div>
+</header>
+<section class="card">
+  {% if status_rows %}
+    {% include "_status_table.html" %}
+  {% else %}
+    <div class="empty">No leads in {{ "this campaign" if selected else "any campaign" }} yet. <a href="/import">Import leads</a></div>
+  {% endif %}
+</section>
+{% endblock %}

@@ -190,12 +190,14 @@ LI_STATUS = {"none": "-", "invited": "Request Sent", "connected": "Request Accep
 N_VOICEMAILS = 3
 
 
-def campaign_status(conn, campaign_id: int, tz) -> tuple[list[str], list[dict]]:
-    """Columns and rows like a hand-kept tracker: one row per lead, a date per LinkedIn message and email."""
+def campaign_status(conn, campaign_id: int | None, tz) -> tuple[list[str], list[dict]]:
+    """Columns and rows like a hand-kept tracker: one row per lead, a date per LinkedIn message and email.
+    campaign_id None: every campaign, with a Campaign column."""
     day = lambda s: parse(s).astimezone(tz).strftime("%d-%b-%y") if s else ""  # noqa: E731
-    ens = rows(conn, """SELECT e.id eid, e.status, e.reply_channel, e.was_connected, e.voicemails, l.*
-                        FROM enrollments e JOIN leads l ON l.id = e.lead_id WHERE e.campaign_id = ? ORDER BY e.id""",
-               campaign_id)
+    ens = rows(conn, f"""SELECT e.id eid, e.status, e.reply_channel, e.was_connected, e.voicemails, c.name campaign, l.*
+                         FROM enrollments e JOIN leads l ON l.id = e.lead_id JOIN campaigns c ON c.id = e.campaign_id
+                         {"WHERE e.campaign_id = ?" if campaign_id else ""} ORDER BY c.id, e.id""",
+               *([campaign_id] if campaign_id else []))
     ids = [e["eid"] for e in ens] or [0]
     marks = ",".join("?" * len(ids))
     msgs, mails = {}, {}
@@ -215,7 +217,7 @@ def campaign_status(conn, campaign_id: int, tz) -> tuple[list[str], list[dict]]:
             out[-1]["text"] += " (OOO)"
     n_li = max([2] + [len(v) for v in msgs.values()])
     n_em = max([2] + [len(v) for v in mails.values()])
-    cols = ["#", "Name", "First Name", "Last Name", "Designation", "Department", "Company", "Email", "Phone",
+    cols = ["#", *([] if campaign_id else ["Campaign"]), "Name", "First Name", "Last Name", "Designation", "Department", "Company", "Email", "Phone",
             "Country", "LinkedIn", "Lead Status", "LI Status",
             *[f"LI {_nth(i + 1)} Msg" for i in range(n_li)], *[f"EM{i + 1}" for i in range(n_em)],
             *[f"VM{i + 1}" for i in range(N_VOICEMAILS)]]
@@ -230,7 +232,7 @@ def campaign_status(conn, campaign_id: int, tz) -> tuple[list[str], list[dict]]:
         if not m and e["li_state"] != "connected":
             li_cells[0] = "-"  # can't message them yet
         vms = (json.loads(e["voicemails"] or "[]") + [""] * N_VOICEMAILS)[:N_VOICEMAILS]
-        values = [n, f"{e['first_name']} {e['last_name']}".strip(), e["first_name"], e["last_name"], e["title"],
+        values = [n, *([] if campaign_id else [e["campaign"]]), f"{e['first_name']} {e['last_name']}".strip(), e["first_name"], e["last_name"], e["title"],
                   extra.get("department", ""), e["company"], e["email"] or "", extra.get("phone", ""),
                   extra.get("country", ""), e["linkedin_url"] or "", status, li,
                   *li_cells,

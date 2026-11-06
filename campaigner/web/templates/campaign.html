@@ -159,27 +159,10 @@
 {% elif tab == "status" %}
   <section class="card">
     <div class="card-head"><h2>Campaign Status</h2>
-      <div class="actions"><a class="btn" href="/campaigns/{{ c.id }}/status.xlsx">Download Excel</a><a class="btn ghost" href="/campaigns/{{ c.id }}/status.csv">CSV</a></div></div>
+      <div class="actions"><a class="btn ghost" href="/status?campaign={{ c.id }}">Open in Campaign Status →</a><a class="btn" href="/campaigns/{{ c.id }}/status.xlsx">Download Excel</a><a class="btn ghost" href="/campaigns/{{ c.id }}/status.csv">CSV</a></div></div>
     <p class="meta">Filled in from what the app did (and any history you imported): invite state, the date of each LinkedIn message and email, "Undelivered" for bounces, "(OOO)" for out-of-office replies. Lead Status and VM1–VM3 are yours to fill in; they save as you type.</p>
     {% if status_rows %}
-    <div class="tbl-wrap status-wrap"><table class="t status-t">
-      <thead><tr>{% for k in status_cols %}<th>{{ k }}</th>{% endfor %}</tr></thead>
-      <tbody>
-      {% for r in status_rows %}
-        <tr>
-        {% for k in status_cols %}{% set v = r.cells[k] %}
-          {% if k == "Name" %}<td><a href="/leads/{{ r.lead_id }}">{{ v }}</a></td>
-          {% elif k == "LinkedIn" %}<td>{% if v %}<a href="{{ v }}" target="_blank" rel="noopener">profile</a>{% endif %}</td>
-          {% elif k == "Lead Status" %}<td><input class="cell-in" data-tracker="{{ r.eid }}" data-field="lead_status" value="{{ r.manual_status }}" placeholder="{{ v if not r.manual_status }}" aria-label="Lead status for {{ r.cells['Name'] }}"></td>
-          {% elif k.startswith("VM") %}<td><input class="cell-in vm" data-tracker="{{ r.eid }}" data-field="vm" data-i="{{ k[2:] | int - 1 }}" value="{{ v }}" placeholder="date" aria-label="{{ k }} for {{ r.cells['Name'] }}"></td>
-          {% elif k in ("LI Status",) %}<td class="{{ 'good' if v in ('Request Accepted', 'Already Connected') }}">{{ v }}</td>
-          {% elif v == "Undelivered" %}<td class="bad">{{ v }}</td>
-          {% else %}<td class="{{ 'meta' if k in ('#', 'Phone', 'Country') }}">{{ v }}</td>{% endif %}
-        {% endfor %}
-        </tr>
-      {% endfor %}
-      </tbody>
-    </table></div>
+    {% include "_status_table.html" %}
     {% else %}<div class="empty">No leads yet. <a href="/import?campaign={{ c.id }}">Import leads</a></div>{% endif %}
   </section>
 

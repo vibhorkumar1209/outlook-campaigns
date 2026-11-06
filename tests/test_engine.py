@@ -635,6 +635,9 @@ class HistoryImportTest(Base):
         self.assertEqual((cells["ed@x.com"]["LI 1st Msg"], cells["ed@x.com"]["EM1"]), ("-", "12-Oct-26 (OOO)"))
         self.assertEqual(cells["fa@x.com"]["Lead Status"], "Demo Scheduled")
         self.assertEqual(cols[-3:], ["VM1", "VM2", "VM3"])
+        all_cols, all_rows = stats.campaign_status(self.conn, None, timezone.utc)   # every campaign
+        self.assertEqual(all_cols[:3], ["#", "Campaign", "Name"])
+        self.assertEqual({r["cells"]["Campaign"] for r in all_rows}, {"c", "hist"})
 
     def test_resume_after_bounce_still_resends(self):
         self.assertFalse(engine._done_before(self.conn, {"id": 999}, 2))
