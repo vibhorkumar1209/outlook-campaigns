@@ -11,7 +11,7 @@
   <aside class="side">
     <div class="brand"><b>▌</b>outreach</div>
     <nav class="nav">
-      {% set nav = [("/", "Overview"), ("/tasks", "LinkedIn queue"), ("/campaigns", "Campaigns"), ("/leads", "Leads"), ("/prospects", "Prospects"), ("/senders", "Senders"), ("/import", "Import"), ("/settings", "Settings")] %}
+      {% set nav = [("/", "Overview"), ("/tasks", "LinkedIn queue"), ("/campaigns", "Campaigns"), ("/status", "Campaign Status"), ("/leads", "Leads"), ("/prospects", "Prospects"), ("/senders", "Senders"), ("/import", "Import"), ("/settings", "Settings")] %}
       {% for href, label in nav %}
         {% set here = active or path %}
         {% set on = here == href or (href != "/" and here.startswith(href)) %}

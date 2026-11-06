@@ -532,10 +532,29 @@ async def tracker_fields(eid: int, request: Request):
     return {"ok": True}
 
 
-@app.get("/campaigns/{cid}/status.{fmt}")
-def campaign_status_export(cid: int, fmt: str):
+@app.get("/status")
+def status_page(request: Request, campaign: str = ""):
     conn = db.connect()
-    c = get_campaign(conn, cid)
+    campaigns = rows(conn, "SELECT id, name, status FROM campaigns ORDER BY status = 'active' DESC, id DESC")
+    if campaign == "all":
+        selected = None
+    elif campaign.isdigit():
+        selected = int(get_campaign(conn, int(campaign))["id"])
+    else:  # default: the newest active campaign
+        selected = campaigns[0]["id"] if campaigns else None
+    cols, items = stats.campaign_status(conn, selected, local_tz())
+    return page(request, "status.html", conn, campaigns=campaigns, selected=selected, status_cols=cols, status_rows=items)
+
+
+@app.get("/status/export.{fmt}")
+def status_export(fmt: str, campaign: str = "all"):
+    return campaign_status_export(int(campaign) if campaign.isdigit() else None, fmt)
+
+
+@app.get("/campaigns/{cid}/status.{fmt}")
+def campaign_status_export(cid: int | None, fmt: str):
+    conn = db.connect()
+    c = get_campaign(conn, cid) if cid else {"name": "All campaigns"}
     cols, items = stats.campaign_status(conn, cid, local_tz())
     name = re.sub(r"[^\w\- ]+", "", c["name"]).strip() or "campaign"
     if fmt == "csv":

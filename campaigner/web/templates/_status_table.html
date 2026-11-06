@@ -1,0 +1,19 @@
+{# Campaign Status table: status_cols, status_rows. Used by the Campaign Status page and the campaign tab. #}
+    <div class="tbl-wrap status-wrap"><table class="t status-t">
+      <thead><tr>{% for k in status_cols %}<th>{{ k }}</th>{% endfor %}</tr></thead>
+      <tbody>
+      {% for r in status_rows %}
+        <tr>
+        {% for k in status_cols %}{% set v = r.cells[k] %}
+          {% if k == "Name" %}<td><a href="/leads/{{ r.lead_id }}">{{ v }}</a></td>
+          {% elif k == "LinkedIn" %}<td>{% if v %}<a href="{{ v }}" target="_blank" rel="noopener">profile</a>{% endif %}</td>
+          {% elif k == "Lead Status" %}<td><input class="cell-in" data-tracker="{{ r.eid }}" data-field="lead_status" value="{{ r.manual_status }}" placeholder="{{ v if not r.manual_status }}" aria-label="Lead status for {{ r.cells['Name'] }}"></td>
+          {% elif k.startswith("VM") %}<td><input class="cell-in vm" data-tracker="{{ r.eid }}" data-field="vm" data-i="{{ k[2:] | int - 1 }}" value="{{ v }}" placeholder="date" aria-label="{{ k }} for {{ r.cells['Name'] }}"></td>
+          {% elif k in ("LI Status",) %}<td class="{{ 'good' if v in ('Request Accepted', 'Already Connected') }}">{{ v }}</td>
+          {% elif v == "Undelivered" %}<td class="bad">{{ v }}</td>
+          {% else %}<td class="{{ 'meta' if k in ('#', 'Phone', 'Country') }}">{{ v }}</td>{% endif %}
+        {% endfor %}
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table></div>
