@@ -39,7 +39,7 @@
       <div class="meta"><span class="pill warning">bot couldn't</span> {{ t.bot_note }}. Over to you.</div>
     {% endif %}
     {% if t.comment_status == "needs_approval" %}
-      <div class="meta">The bot liked this post{% if t.post_url %} (<a href="{{ t.post_url }}" target="_blank" rel="noopener">open</a>){% endif %}. Approve a comment and it posts it next run; unapproved drafts expire after 3 days.</div>
+      <div class="meta">The bot liked this post{% if t.post_url %} (<a href="{{ t.post_url }}" target="_blank" rel="noopener">open</a>){% endif %}. Approve a comment and it posts it next run; unapproved drafts expire after 7 days.</div>
       {% if t.post_text %}<blockquote class="post-quote">{{ t.post_text[:600] }}{% if t.post_text | length > 600 %}…{% endif %}</blockquote>{% endif %}
       <textarea class="task-body" rows="3" placeholder="Write the comment to post" aria-label="Comment">{{ t.body }}</textarea>
     {% elif t.channel == "li_engage" %}

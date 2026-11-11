@@ -40,7 +40,7 @@ REPLY_CHECK_EVERY = timedelta(minutes=10)  # LinkedIn inbox scan for replies to 
 ACCEPT_CHECK_EVERY = timedelta(minutes=15)  # "recently added" connections scan for accepted invites
 ACCEPT_DEEP_EVERY = timedelta(days=1)       # once a day, read further back: catches older invites accepted
 ACCEPT_LIMIT, ACCEPT_DEEP_LIMIT = 40, 300
-APPROVAL_TIMEOUT = timedelta(days=3)  # unapproved comment drafts expire; the like still counts
+APPROVAL_TIMEOUT = timedelta(days=7)  # unapproved comment drafts expire; the like still counts
 class _ProfileLock:
     """One Chrome profile can only be open once. A file lock, so the dashboard's runs, its sign-in window and
     CLI commands (`linkedin-login`, `linkedin-check`) in other processes never open it at the same time."""
@@ -832,6 +832,7 @@ class ChromeDriver:
             # Drop the header (name, headline, stamp) and the action bar; keep the post's own words.
             if r["stamp"] and r["stamp"] in body:
                 body = body.split(r["stamp"], 1)[1]
+            body = re.sub(r"^\s*(?:•\s*)?(?:Follow|Connect|Visit my website)\s*\n", "", body)  # header button
             body = re.split(r"\n(?:Like|Comment|Repost|Send)\n", body)[0]
             body = re.sub(r"(?:…|\.\.\.)\s*more\s*$", "", body.strip()).strip()
             key = "post:" + hashlib.sha1(re.sub(r"\s+", " ", body[:400]).lower().encode()).hexdigest()[:16]
