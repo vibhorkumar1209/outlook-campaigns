@@ -1,0 +1,131 @@
+{
+ "name": "US Large Deals Campaign 1",
+ "campaign": {
+  "window_days": "mon,tue,wed,thu,fri",
+  "window_start": "10:30",
+  "window_end": "17:00",
+  "email_daily_cap": 30,
+  "li_daily_cap": 40,
+  "gap_min": 10,
+  "gap_max": 30,
+  "signature": "Best,\r\n\r\nVibhor Kumar\r\n\r\nChief Business Officer\r\n\r\n📱: +1 818 251 6587\r\n📱: +91 995 854 5605\r\n🌐: www.refractone.com \r\n🔗: LinkedIn | Facebook | X | Instagram | YouTube",
+  "track_opens": 1,
+  "track_clicks": 1,
+  "li_engage": 1
+ },
+ "steps": [
+  {
+   "channel": "li_connect",
+   "delay_days": 0.0,
+   "condition": "if_not_connected",
+   "body": ""
+  },
+  {
+   "channel": "email",
+   "delay_days": 0.0,
+   "condition": "if_was_connected",
+   "body": "Hi {{ first_name }},\n\nAs {{ title | default('a leader there', true) }} at {{ company }}, **is there a target account your team is pursuing? Pick one, and I’ll walk you through RefractOne live in 25 minutes**, using real-time information to uncover account intelligence, technology spend, key decision-makers, relationships, and potential opportunities.\nYou’ll see the quality of the insights for yourself, not just another product demo.\n\n\nYou know how much work goes into preparing for a large deal before the first serious conversation. Researching the account, understanding its technology spend, identifying decision-makers, mapping relationships, and figuring out the right approach. It can take hours, with information scattered across multiple tools.\n\nWe built RefractOne to bring all of this together, so your team can spend less time researching and more time moving deals forward.\n\nHere’s where it makes a difference:\n**Time**: Get a detailed account view in minutes, covering financials, tech stack, technology spend, deal intelligence, key contacts, and account plans.\n**Cost**: Replace multiple subscriptions for market research, account intelligence, and contact data with one platform, starting at $99/month. All modules are included, with no extra charges for new industries or geographies.\n**Confidence**: Access high-quality insights from credible sources and understand the people behind the buying decision before you engage.\n**Execution**: Turn research into relevant email and LinkedIn outreach without starting from scratch.\n\n\nWould you be open to a quick 25-minute session early next week? Just share the preferred time slot and I will share a Teams invite.",
+   "subject": "{{ first_name }}, Pick an account. Let’s see what we can uncover.",
+   "in_thread": false
+  },
+  {
+   "channel": "li_message",
+   "delay_days": 0.0,
+   "condition": "if_was_connected",
+   "body": "Hi {{ first_name }},\n\nIt is good to be connected.\n\nCurious – when your team pursues a large enterprise account, how do they bring together intelligence on technology spend, decision-makers, executive relationships, and potential buying opportunities?\n\nWe built RefractOne to bring all of this together in one platform.\n\nWould be interesting to hear how your team approaches this today."
+  },
+  {
+   "channel": "email",
+   "delay_days": 0.0,
+   "condition": "if_was_invited",
+   "body": "Hi {{ first_name }},\n\nAs {{ title | default('a leader there', true) }} at {{ company }}, **is there a target account your team is pursuing? Pick one, and I’ll walk you through RefractOne live in 25 minutes**, using real-time information to uncover account intelligence, technology spend, key decision-makers, relationships, and potential opportunities.\nYou’ll see the quality of the insights for yourself, not just another product demo.\n\n\nYou know how much work goes into preparing for a large deal before the first serious conversation. Researching the account, understanding its technology spend, identifying decision-makers, mapping relationships, and figuring out the right approach. It can take hours, with information scattered across multiple tools.\n\nWe built RefractOne to bring all of this together, so your team can spend less time researching and more time moving deals forward.\n\nHere’s where it makes a difference:\n**Time**: Get a detailed account view in minutes, covering financials, tech stack, technology spend, deal intelligence, key contacts, and account plans.\n**Cost**: Replace multiple subscriptions for market research, account intelligence, and contact data with one platform, starting at $99/month. All modules are included, with no extra charges for new industries or geographies.\n**Confidence**: Access high-quality insights from credible sources and understand the people behind the buying decision before you engage.\n**Execution**: Turn research into relevant email and LinkedIn outreach without starting from scratch.\n\n\nWould you be open to a quick 25-minute session early next week? Just share the preferred time slot and I will share a Teams invite.",
+   "subject": "{{ first_name }}, Pick an account. Let’s see what we can uncover.",
+   "in_thread": false
+  },
+  {
+   "channel": "li_message",
+   "delay_days": 0.0,
+   "condition": "on_accept",
+   "body": "Hi {{ first_name }},\n\nIt is good to be connected.\n\nCurious – when your team pursues a large enterprise account, how do they bring together intelligence on technology spend, decision-makers, executive relationships, and potential buying opportunities?\n\nWe built RefractOne to bring all of this together in one platform.\n\nWould be interesting to hear how your team approaches this today."
+  },
+  {
+   "channel": "email",
+   "delay_days": 4.0,
+   "condition": "always",
+   "body": "Hi {{ first_name }},\n\nOne challenge with large-account pursuits is the time spent connecting information from multiple sources before the team can make an informed move.\n\nRefractOne brings industry, account, technology spend, executive, and relationship intelligence together in one platform.\n\nThe objective is to reduce research time while helping sales teams make better-informed decisions.\n\nWould you be open to exploring how this could work for your team?",
+   "subject": "What does account research cost your sales team?",
+   "in_thread": true
+  },
+  {
+   "channel": "li_message",
+   "delay_days": 3.0,
+   "condition": "if_connected",
+   "body": "Hi {{ first_name }},\n\nRather than explain what RefractOne does, I'd suggest we put it to a practical test.\n\nGive me one account your team is pursuing. I'll show you its technology landscape, spending intelligence, key decision-makers, relationships, and potential opportunities.\n\n20 minutes, using a real account of your choice.\n\nWould you be open to that?"
+  },
+  {
+   "channel": "email",
+   "delay_days": 3.0,
+   "condition": "always",
+   "body": "Hi {{ first_name }},\n\nMost account research tells you what technology a company uses. But understanding its technology investments, spending patterns, technology partners, hiring priorities, and emerging initiatives can reveal much stronger sales opportunities.\n\nRefractOne connects technology landscape and spending intelligence with account-level insights, helping sales teams identify where conversations could lead to real opportunities.\n\nWould it be useful to see this for one of your strategic accounts?",
+   "subject": "What's happening behind your target accounts?",
+   "in_thread": true
+  },
+  {
+   "channel": "li_message",
+   "delay_days": 4.0,
+   "condition": "if_connected",
+   "body": "Hi {{ first_name }},\n\nDoes your team have visibility into what's changing within its strategic accounts beyond what's captured in the CRM?\n\nExecutive movements, technology investments, emerging initiatives, competitive positioning, and buying triggers can all influence a large deal.\n\nRefractOne helps bring these external intelligence signals into your account planning.\n\nCurious how your team currently approaches this."
+  },
+  {
+   "channel": "email",
+   "delay_days": 4.0,
+   "condition": "always",
+   "body": "Hi {{ first_name }},\n\nIn large enterprise deals, reaching the right executive is only half the challenge.\n\nUnderstanding who influences that executive, how the buying organization is structured, who owns the technology agenda, and where the decision-making power sits can be equally important.\n\nRefractOne helps map executive hierarchies, decision-makers, relationships, influence, and relevant buying stakeholders.\n\nI'd be happy to demonstrate this using an account your team is pursuing.\n\nWould 25 minutes work?",
+   "subject": "Are you reaching the right decision-makers?",
+   "in_thread": true
+  },
+  {
+   "channel": "li_message",
+   "delay_days": 4.0,
+   "condition": "if_connected",
+   "body": "Hi {{ first_name }},\n\nOne final point worth sharing: RefractOne brings multiple intelligence capabilities into one platform, starting at $99/month.\n\nAll modules are included, with no additional charges for new industries or geographies.\n\nFor teams currently using multiple subscriptions for research, account intelligence, and contact discovery, this could be worth evaluating.\n\nHappy to demonstrate it using one of your target accounts."
+  },
+  {
+   "channel": "email",
+   "delay_days": 4.0,
+   "condition": "always",
+   "body": "Hi {{ first_name }},\n\nHere's a practical suggestion.\n\nShare one enterprise account your team is pursuing. I'll use RefractOne to uncover its business and technology landscape, spending intelligence, decision-makers, executive relationships, and potential opportunities.\n\nWe'll review the findings together in 20–25 minutes.\n\nNo generic product presentation. Just intelligence relevant to an account you actually want to win.\n\nWhich account should we explore?",
+   "subject": "Let's explore one of your target accounts",
+   "in_thread": true
+  },
+  {
+   "channel": "li_message",
+   "delay_days": 2.0,
+   "condition": "if_connected",
+   "body": "Hi {{ first_name }},\n\nI've reached out a couple of times, so I'll keep this brief.\n\nI believe RefractOne can help enterprise sales teams move beyond conventional account research and get a much deeper understanding of the accounts they want to win.\n\nIf improving strategic account intelligence is relevant to your priorities, I'd be happy to show you what we can uncover using an account of your choice.\n\nWould a quick conversation make sense?"
+  }
+ ],
+ "settings": {
+  "li_mode": "bot",
+  "li_bot_caps": {
+   "view": 40,
+   "connect": 20,
+   "message": 20,
+   "like": 25,
+   "comment": 8
+  },
+  "li_bot_week_invites": 80,
+  "li_bot_gap": [
+   45,
+   120
+  ],
+  "li_bot_hours": [
+   "09:00",
+   "17:00"
+  ],
+  "li_bot_days": "mon,tue,wed,thu,fri",
+  "engage_every_days": 7,
+  "engage_lookback_months": 6
+ },
+ "mailbox_daily_cap": 60
+}
