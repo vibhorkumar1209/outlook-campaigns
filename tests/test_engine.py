@@ -1094,6 +1094,7 @@ class BotTest(Base):
         self.assertIn(("like", "https://li/p/mid"), d.calls)
         t = one(self.conn, "SELECT * FROM tasks WHERE id = ?", t["id"])
         self.assertEqual((t["status"], t["comment_status"], t["body"]), ("open", "needs_approval", "Draft about: We cut SaaS "))
+        self.assertEqual(self.tracker("jane@x.com", "LI Likes", "LI Comments"), ("19-Oct-26", "Waiting for you"))
         db.set_setting(self.conn, "li_accept_checked_at", iso(MON + timedelta(hours=3)))  # acceptance scan not due
         self.assertEqual(self.bot(at=MON + timedelta(hours=3)).calls, [])  # waits for you; nothing else due
         self.conn.execute("UPDATE tasks SET body = 'Edited comment', comment_status = 'approved' WHERE id = ?", (t["id"],))
@@ -1101,11 +1102,18 @@ class BotTest(Base):
         self.assertIn(("comment", "https://li/p/mid", "Edited comment"), d2.calls)
         g = one(self.conn, "SELECT * FROM engagements WHERE task_id = ?", t["id"])
         self.assertEqual((g["post_url"], g["liked"], g["commented"], g["comment"]), ("https://li/p/mid", 1, 1, "Edited comment"))
+        self.assertEqual(self.tracker("jane@x.com", "LI Likes", "LI Comments"), ("19-Oct-26", "19-Oct-26"))
+
+    def tracker(self, email, *cols):
+        _, items = stats.campaign_status(self.conn, self.cid, timezone.utc)
+        cells = next(r["cells"] for r in items if r["cells"]["Email"] == email)
+        return tuple(cells[c] for c in cols)
 
     def test_no_posts_in_window_and_expiry(self):
         t = self.engage_task()
         self.bot(FakeDriver(posts=[linkedin_bot.Post("a", "https://li/p/old", 400, "old", False)]), at=MON + timedelta(hours=2))
         self.assertEqual(one(self.conn, "SELECT status FROM tasks WHERE id = ?", t["id"])["status"], "skipped")
+        self.assertEqual(self.tracker("jane@x.com", "LI Likes"), ("No recent posts",))
         # A draft nobody approves expires into a like-only engagement.
         self.tick(MON + timedelta(days=8))
         t2 = self.task("jane@x.com", "li_engage")
