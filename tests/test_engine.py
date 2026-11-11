@@ -49,6 +49,9 @@ class FakeGraph:
     def conversation(self, cid):
         return [m for m in self.inbox if m["conversationId"] == cid]
 
+    def last_thread_with(self, email, since):
+        return getattr(self, "outside", {}).get(email)  # a thread sent by hand before import
+
     def inbound_from(self, email, since):
         return [m for m in self.inbox if m["from"]["emailAddress"]["address"] == email]
 
@@ -638,6 +641,20 @@ class HistoryImportTest(Base):
         all_cols, all_rows = stats.campaign_status(self.conn, None, timezone.utc)   # every campaign
         self.assertEqual(all_cols[:3], ["#", "Campaign", "Name"])
         self.assertEqual({r["cells"]["Campaign"] for r in all_rows}, {"c", "hist"})
+
+    def test_follow_up_replies_on_top_of_the_email_sent_by_hand(self):
+        self.load(("Ann Lee", "Ann", "Lee", "ann@x.com", "linkedin.com/in/annlee", "", "", "", "Request Sent", "-", "", "09-Oct-26", ""))
+        self.conn.execute("UPDATE steps SET in_thread = 1 WHERE campaign_id = ? AND pos > 2 AND channel = 'email'", (self.cid,))
+        self.g.outside = {"ann@x.com": "conv-by-hand"}
+        self.tick(MON + timedelta(days=30))
+        self.assertEqual([x[:2] for x in self.g.sent], [("thread", "ann@x.com")])   # on top of the hand-sent Email 1
+        self.assertEqual(self.en("ann@x.com")["conversation_id"], "conv-by-hand")
+
+    def test_follow_up_without_an_earlier_thread_starts_one(self):
+        self.load(("Bo Tan", "Bo", "Tan", "bo@x.com", "linkedin.com/in/botan", "", "", "", "Request Sent", "-", "", "09-Oct-26", ""))
+        self.conn.execute("UPDATE steps SET in_thread = 1 WHERE campaign_id = ? AND pos > 2 AND channel = 'email'", (self.cid,))
+        self.tick(MON + timedelta(days=30))
+        self.assertEqual([x[:3] for x in self.g.sent], [("new", "bo@x.com", "Value")])
 
     def test_resume_after_bounce_still_resends(self):
         self.assertFalse(engine._done_before(self.conn, {"id": 999}, 2))

@@ -232,6 +232,16 @@ class Graph:
         self._send_draft(draft["id"])
         return conversation_id
 
+    def last_thread_with(self, email: str, since: datetime) -> str | None:
+        """conversationId of the newest email you sent to `email` since `since` (e.g. one sent by hand before the
+        lead was imported), so a follow-up can reply on top of it. None if there isn't one."""
+        sent = self._list("/me/mailFolders/sentitems/messages", search=f'"to:{_q(email)}"',
+                          select="id,conversationId,sentDateTime,toRecipients", top="25")
+        mine = [m for m in sent if (m.get("sentDateTime") or "") >= _iso(since)
+                and any(((r.get("emailAddress") or {}).get("address") or "").lower() == email.lower()
+                        for r in m.get("toRecipients") or [])]
+        return max(mine, key=lambda m: m["sentDateTime"])["conversationId"] if mine else None
+
     def conversation(self, conversation_id: str) -> list[dict]:
         return self._list("/me/messages", filter=f"conversationId eq '{_q(conversation_id)}'", select=MSG_FIELDS)
 

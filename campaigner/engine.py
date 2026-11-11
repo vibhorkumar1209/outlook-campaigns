@@ -931,8 +931,12 @@ def send_emails(conn, c, steps, queue, boxes: Mailboxes, tracker, now, send, sle
                          if (w["acct"] or fallback) == acct]
                 if watch and check_lead_email(conn, graph, watch, log):
                     continue
-            if st["in_thread"] and e["conversation_id"]:
-                cid = graph.send_in_thread(e["conversation_id"], e["email"], ctx["name"], html, "Re: " + subject,
+            conv = e["conversation_id"]
+            if st["in_thread"] and not conv and e["first_email_at"]:
+                # Earlier emails went out before the app tracked this lead (imported history): find that thread.
+                conv = graph.last_thread_with(e["email"], parse(e["first_email_at"]) - timedelta(days=1))
+            if st["in_thread"] and conv:
+                cid = graph.send_in_thread(conv, e["email"], ctx["name"], html, "Re: " + subject,
                                            strip_pixels=tracker.base if tracker else None, attachments=files)
             else:
                 cid = graph.send_new(e["email"], ctx["name"], subject, html, attachments=files)
