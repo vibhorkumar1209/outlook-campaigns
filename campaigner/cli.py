@@ -146,6 +146,25 @@ def cmd_uninstall(a):
     print("Uninstalled")
 
 
+def cmd_campaign_export(a):
+    from . import db
+    from .campaign_file import export_campaign
+
+    data = export_campaign(db.connect(), a.id)
+    Path(a.file).write_text(json.dumps(data, ensure_ascii=False, indent=1) + "\n")
+    print(f"Wrote {data['name']} ({len(data['steps'])} steps) to {a.file}")
+
+
+def cmd_campaign_import(a):
+    from . import db
+    from .campaign_file import import_campaign
+
+    data = json.loads(Path(a.file).read_text())
+    cid = import_campaign(db.connect(), data, name=a.name, apply_settings=not a.no_settings)
+    print(f"Created draft campaign {cid}: {a.name or data.get('name')} ({len(data['steps'])} steps). "
+          "Import leads, then Activate it in the dashboard.")
+
+
 def cmd_demo(a):
     """Seed a DRAFT campaign with example.com leads so the dashboard has something to show. Never sends."""
     from . import db, engine
@@ -235,6 +254,17 @@ def main() -> None:
     s = sub.add_parser("tracker-setup", help="generate tracking secrets into .env and print Cloudflare deploy steps")
     s.add_argument("--domain", help="tracking subdomain, e.g. links.yourcompany.com")
     s.set_defaults(fn=cmd_tracker_setup)
+
+    s = sub.add_parser("campaign-export", help="save a campaign's sequence and settings to a JSON file")
+    s.add_argument("id", type=int, help="campaign id (in its dashboard URL)")
+    s.add_argument("file")
+    s.set_defaults(fn=cmd_campaign_export)
+
+    s = sub.add_parser("campaign-import", help="recreate a campaign from a JSON file, as a draft")
+    s.add_argument("file")
+    s.add_argument("--name", help='campaign name (put "Dummy" in it for the 25-minute test mode)')
+    s.add_argument("--no-settings", action="store_true", help="don't apply the bot, engagement and mailbox limits")
+    s.set_defaults(fn=cmd_campaign_import)
 
     s = sub.add_parser("demo", help="seed a draft demo campaign (example.com leads, never sends)")
     s.set_defaults(fn=cmd_demo)

@@ -1260,6 +1260,25 @@ class RepliesTest(Base):
             engine.undo_reply(self.conn, self.enr("jane@x.com")["lead_id"])
 
 
+class CampaignFileTest(Base):
+    def test_export_import_round_trip(self):
+        from campaigner.campaign_file import export_campaign, import_campaign
+        self.conn.execute("UPDATE campaigns SET signature = 'Best, V', window_start = '10:30' WHERE id = ?", (self.cid,))
+        self.conn.execute("UPDATE steps SET condition = 'on_accept', delay_days = 0 WHERE campaign_id = ? AND channel = 'li_message'", (self.cid,))
+        db.set_setting(self.conn, "li_bot_hours", ["09:00", "17:00"])
+        data = json.loads(json.dumps(export_campaign(self.conn, self.cid)))     # as written to and read from a file
+        db.set_setting(self.conn, "li_bot_hours", ["08:00", "18:00"])
+        new = import_campaign(self.conn, data, name="Copy - Dummy")
+        c = one(self.conn, "SELECT * FROM campaigns WHERE id = ?", new)
+        self.assertEqual((c["name"], c["status"], c["signature"], c["window_start"]), ("Copy - Dummy", "draft", "Best, V", "10:30"))
+        cols = "channel, delay_days, condition, subject, body, in_thread"
+        self.assertEqual([tuple(r.values()) for r in rows(self.conn, f"SELECT {cols} FROM steps WHERE campaign_id = ? ORDER BY pos", new)],
+                         [tuple(r.values()) for r in rows(self.conn, f"SELECT {cols} FROM steps WHERE campaign_id = ? ORDER BY pos", self.cid)])
+        self.assertEqual(db.get_setting(self.conn, "li_bot_hours"), ["09:00", "17:00"])
+        with self.assertRaises(ValueError):
+            import_campaign(self.conn, {"steps": [{"channel": "fax", "body": "x"}]})
+
+
 class ClassifyTest(unittest.TestCase):
     def test_kinds(self):
         self.assertEqual(engine.classify(mail("a@x.com"), ME), "reply")
