@@ -215,11 +215,13 @@ def campaign_status(conn, campaign_id: int | None, tz) -> tuple[list[str], list[
             match[-1]["text"] = "Undelivered"
         elif out and ev["type"] == "auto_reply" and "OOO" not in out[-1]["text"]:
             out[-1]["text"] += " (OOO)"
+    likes, comments, engage_state = _engagement(conn, ids, marks, day)
     n_li = max([2] + [len(v) for v in msgs.values()])
     n_em = max([2] + [len(v) for v in mails.values()])
     cols = ["#", *([] if campaign_id else ["Campaign"]), "Name", "First Name", "Last Name", "Designation", "Department", "Company", "Email", "Phone",
             "Country", "LinkedIn", "Lead Status", "LI Status",
-            *[f"LI {_nth(i + 1)} Msg" for i in range(n_li)], *[f"EM{i + 1}" for i in range(n_em)],
+            *[f"LI {_nth(i + 1)} Msg" for i in range(n_li)], "LI Likes", "LI Comments",
+            *[f"EM{i + 1}" for i in range(n_em)],
             *[f"VM{i + 1}" for i in range(N_VOICEMAILS)]]
     out = []
     for n, e in enumerate(ens, start=1):
@@ -235,11 +237,48 @@ def campaign_status(conn, campaign_id: int | None, tz) -> tuple[list[str], list[
         values = [n, *([] if campaign_id else [e["campaign"]]), f"{e['first_name']} {e['last_name']}".strip(), e["first_name"], e["last_name"], e["title"],
                   extra.get("department", ""), e["company"], e["email"] or "", extra.get("phone", ""),
                   extra.get("country", ""), e["linkedin_url"] or "", status, li,
-                  *li_cells,
+                  *li_cells, _dates(likes.get(e["eid"], [])) or engage_state.get(e["eid"], {}).get("likes", ""),
+                  _dates(comments.get(e["eid"], [])) or engage_state.get(e["eid"], {}).get("comments", ""),
                   *(em + [""] * n_em)[:n_em], *vms]
         out.append({"eid": e["eid"], "lead_id": e["id"], "manual_status": e["lead_status"],
                     "cells": dict(zip(cols, values))})
     return cols, out
+
+
+def _engagement(conn, ids: list[int], marks: str, day) -> tuple[dict, dict, dict]:
+    """Per enrollment: like dates, comment dates, and a word for what's pending when there's no date yet."""
+    likes, comments, state = {}, {}, {}
+    # Likes: the bot's like actions, plus likes you marked yourself on Engage tasks.
+    for r in rows(conn, f"""SELECT t.enrollment_id, b.at FROM bot_actions b JOIN tasks t ON t.id = b.task_id
+                            WHERE t.enrollment_id IN ({marks}) AND b.action = 'like' AND b.ok = 1
+                            UNION ALL
+                            SELECT t.enrollment_id, g.at FROM engagements g JOIN tasks t ON t.id = g.task_id
+                            WHERE t.enrollment_id IN ({marks}) AND g.liked = 1 AND NOT EXISTS (
+                              SELECT 1 FROM bot_actions b WHERE b.task_id = g.task_id AND b.action = 'like' AND b.ok = 1)
+                            ORDER BY 2""", *ids, *ids):
+        likes.setdefault(r["enrollment_id"], []).append(day(r["at"]))
+    for r in rows(conn, f"""SELECT t.enrollment_id, g.at FROM engagements g JOIN tasks t ON t.id = g.task_id
+                            WHERE t.enrollment_id IN ({marks}) AND g.commented = 1 ORDER BY g.at""", *ids):
+        comments.setdefault(r["enrollment_id"], []).append(day(r["at"]))
+    # Latest Engage task per enrollment: a comment waiting on you, or "nothing to like" when they don't post.
+    for r in rows(conn, f"""SELECT t.enrollment_id, t.status, t.comment_status, t.done_at FROM tasks t
+                            WHERE t.enrollment_id IN ({marks}) AND t.channel = 'li_engage' AND t.id = (
+                              SELECT MAX(id) FROM tasks t2 WHERE t2.enrollment_id = t.enrollment_id
+                              AND t2.channel = 'li_engage')""", *ids):
+        s = {}
+        if r["status"] == "open" and r["comment_status"] == "needs_approval":
+            s["comments"] = "Waiting for you"
+        elif r["status"] == "open" and r["comment_status"] == "approved":
+            s["comments"] = "Approved, posting"
+        elif r["status"] == "skipped":
+            s["likes"] = "No recent posts"
+        state[r["enrollment_id"]] = s
+    return likes, comments, state
+
+
+def _dates(ds: list[str]) -> str:
+    """'10-Nov-26', or '3 · last 10-Nov-26' when there are several."""
+    return "" if not ds else ds[0] if len(ds) == 1 else f"{len(ds)} · last {ds[-1]}"
 
 
 def _nth(i: int) -> str:
