@@ -1,11 +1,11 @@
-name = "outreach-tracker"
+name = "links"   # public: links.<account>.workers.dev or your custom domain
 main = "src/index.js"
 compatibility_date = "2025-09-01"
 
 [[d1_databases]]
 binding = "DB"
 database_name = "outreach-tracker"
-database_id = "REPLACE_WITH_DATABASE_ID"   # from: npx wrangler d1 create outreach-tracker
+database_id = "c0beca1e-b3ea-447f-b4cc-1436f4986bd5"   # from: npx wrangler d1 create outreach-tracker
 
 # Drop events older than 180 days, nightly.
 [triggers]

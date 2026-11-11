@@ -1110,7 +1110,9 @@ class BotTest(Base):
         self.tick(MON + timedelta(days=8))
         t2 = self.task("jane@x.com", "li_engage")
         self.bot(FakeDriver(posts=[linkedin_bot.Post("b", "https://li/p/x", 1, "text", True)]), at=MON + timedelta(days=8))
-        self.bot(at=MON + timedelta(days=12))
+        self.bot(at=MON + timedelta(days=12))                              # still waiting for you after 4 days
+        self.assertIsNone(one(self.conn, "SELECT * FROM engagements WHERE task_id = ?", t2["id"]))
+        self.bot(at=MON + timedelta(days=16))                              # expired after 7
         g = one(self.conn, "SELECT * FROM engagements WHERE task_id = ?", t2["id"])
         self.assertEqual((g["liked"], g["commented"]), (1, 0))
 
