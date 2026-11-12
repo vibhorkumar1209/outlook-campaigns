@@ -1,54 +1,33 @@
 """Runs engine ticks: on a timer inside the dashboard, or once from the CLI. One run at a time across processes."""
 from __future__ import annotations
 
-import fcntl
 import os
-import shutil
-import subprocess
 import threading
 import time
 from collections import deque
 from contextlib import contextmanager
 from datetime import datetime
 
-from . import ai, db, engine, linkedin_bot
+from . import ai, db, engine, linkedin_bot, updater
 from .db import iso, utcnow
 from .graph import Graph, accounts, login, logout
+from .osutil import KeepAwake, open_lock, try_lock, unlock
 from .tracking import Tracker
 
 LOCK_PATH = db.DB_PATH.parent / ".tick.lock"
+UPDATE_CHECK_EVERY = 6 * 3600  # seconds between `git fetch`es to see if GitHub has a newer version
 
 
 @contextmanager
 def tick_lock():
-    LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with open(LOCK_PATH, "w") as f:
-        try:
-            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
+    with open_lock(LOCK_PATH) as f:
+        if not try_lock(f):
             yield False
             return
-        yield True
-
-
-class KeepAwake:
-    """Holds macOS's "don't idle-sleep" assertion (caffeinate -i) while a campaign is active, so sequences keep
-    running with the screen off. It can't stop sleep when the lid closes: that needs power plus an external display."""
-
-    def __init__(self):
-        self.proc: subprocess.Popen | None = None
-
-    @property
-    def on(self) -> bool:
-        return bool(self.proc and self.proc.poll() is None)
-
-    def update(self, want: bool) -> None:
-        if want and not self.on and shutil.which("caffeinate"):
-            # -w: the assertion ends with this process, even if it's killed
-            self.proc = subprocess.Popen(["caffeinate", "-i", "-w", str(os.getpid())])
-        elif not want and self.on:
-            self.proc.terminate()
-            self.proc = None
+        try:
+            yield True
+        finally:
+            unlock(f)
 
 
 def wants_awake(conn) -> bool:
@@ -59,11 +38,18 @@ def wants_awake(conn) -> bool:
 class Runner:
     def __init__(self):
         self.awake = KeepAwake()
+        self.update_info: dict | None = None  # latest updater.status(), refreshed every few hours
+        self.restarting = False
         self.logs: deque[str] = deque(maxlen=300)
         self.busy = False
         self.login_state = {"state": "idle", "error": None}
         self.li_login_state = {"state": "idle", "error": None}
         self._lock = threading.Lock()
+
+    def request_restart(self) -> None:
+        if not self.restarting:
+            self.restarting = True
+            updater.exit_when_idle(self)
 
     def log(self, msg: str) -> None:
         line = f"{datetime.now():%Y-%m-%d %H:%M:%S} {msg}"
@@ -113,8 +99,14 @@ class Runner:
         LinkedIn bot: its own pass every 3 minutes (it only opens Chrome when there's work in its hours)."""
         def email_loop():
             time.sleep(5)
-            last_full = 0.0
+            last_full = last_update_check = 0.0
             while True:
+                if time.monotonic() - last_update_check >= UPDATE_CHECK_EVERY or not last_update_check:
+                    last_update_check = time.monotonic()
+                    try:
+                        self.update_info = updater.status(fetch=True)
+                    except Exception as e:
+                        self.log(f"update check failed: {e!r}")
                 try:
                     conn = db.connect()
                     try:

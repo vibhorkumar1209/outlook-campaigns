@@ -11,7 +11,7 @@ Email + LinkedIn outreach sequences, run from your own M365 Outlook, with a loca
 - **Detection:** email replies, bounces and out-of-office replies come from your mailbox. LinkedIn accepts and replies come from LinkedIn's notification emails in the same mailbox. A reply on any channel stops that lead in every campaign.
 - **Dashboard:** overview funnel and 14-day activity, per-campaign and per-step email metrics, sequence editor with live preview per lead, lead timeline, CSV/Excel import with column mapping.
 
-It runs on your Mac only (`127.0.0.1`). The data lives in `data/app.db`. It leaves the machine only as the emails you send, plus, if you enable tracking, anonymous send IDs in pixel and link URLs.
+It runs on your own Mac or Windows PC only (`127.0.0.1`). The data lives in `data/app.db`. It leaves the machine only as the emails you send, plus, if you enable tracking, anonymous send IDs in pixel and link URLs.
 
 ## Setup
 
@@ -24,19 +24,48 @@ The app signs in through Microsoft's own public app, "Microsoft Graph Command Li
 
 ### 2. Install and run
 
+You need Python 3.11+, Git, and Google Chrome (only for the LinkedIn bot).
+
+**macOS**
+
 ```bash
+git clone https://github.com/vibhorkumar1209/outlook-campaigns.git && cd outlook-campaigns
 cp .env.example .env
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 ./oc serve                 # http://127.0.0.1:8765
 ```
 
-Open **Senders → Connect a mailbox** and sign in. Repeat for each address you'll send from; on the Microsoft page, pick *Use another account*. Or run `./oc login` once per mailbox, adding `--device-code` if browser sign-in is blocked. Tokens are stored encrypted in your Keychain and refresh silently. The first mailbox becomes the default sender and the inbox that's read for LinkedIn notifications; both can be changed.
+**Windows** (PowerShell or Command Prompt). Install [Python](https://www.python.org/downloads/) (tick *Add python.exe to PATH*) and [Git](https://git-scm.com/download/win) first.
+
+```powershell
+git clone https://github.com/vibhorkumar1209/outlook-campaigns.git
+cd outlook-campaigns
+copy .env.example .env
+py -m venv .venv
+.venv\Scripts\pip install -r requirements.txt
+.\oc serve                 # http://127.0.0.1:8765
+```
+
+On Windows every command below is `.\oc …` instead of `./oc …`.
+
+Open **Senders → Connect a mailbox** and sign in. Repeat for each address you'll send from; on the Microsoft page, pick *Use another account*. Or run `./oc login` once per mailbox, adding `--device-code` if browser sign-in is blocked. Tokens are stored encrypted (Keychain on macOS, your Windows login's DPAPI on Windows) and refresh silently. The first mailbox becomes the default sender and the inbox that's read for LinkedIn notifications; both can be changed.
 
 To keep it running in the background and start it at login:
 
 ```bash
 ./oc install               # ./oc uninstall to remove
 ```
+
+On macOS that's a launchd agent; on Windows, a Task Scheduler task (*OutlookCampaigns*, runs at your logon with no console window). Either way it restarts the dashboard if it stops. The log is `data/dashboard.log`.
+
+### Getting updates
+
+Everyone running from a git clone gets new versions from GitHub:
+
+- **Settings → App updates** checks every 6 hours. *Update now* pulls the new code, installs any new requirements, and restarts the dashboard once it's idle (never in the middle of a send or a LinkedIn action).
+- Or from a terminal: `./oc update`.
+
+Your data (`data/`, `.env`, sign-ins) is never part of an update. If you've edited the code yourself, the update only goes through when your edits don't clash with the new ones; otherwise it stops and changes nothing.
 
 To explore first, run `./oc demo`. It seeds a **draft** campaign with example.com leads that never sends.
 
@@ -122,7 +151,7 @@ Waits count from the previous step being done or skipped. The first step counts 
 
 ## Limits and caveats
 
-- **The Mac must be awake.** Missed runs catch up when it wakes.
+- **The Mac or PC must be awake.** *Settings → Keep awake* stops idle sleep while a campaign is active; closing a laptop lid still sleeps it (see the note there). Missed runs catch up when it wakes.
 - **M365:** about 10k recipients a day and 30 messages a minute per mailbox. Keep the daily caps far below that, and ramp new mailboxes slowly. Keep bounce rate under 2%; the Senders page flags 2% and up as a warning and 5% and up as critical. This is for personal outreach, not bulk mail.
 - **LinkedIn:** about 100 invites a week. Free accounts get a few personalized notes a month, capped at 200 characters. Keep LinkedIn tasks per day ≤ 20.
 - **Detection is heuristic.** A missed out-of-office counts as a reply, which fails safe: no more follow-ups. A missed LinkedIn notification just means you mark it by hand.
@@ -130,9 +159,13 @@ Waits count from the previous step being done or skipped. The first step counts 
 
 ## Commands
 
+On Windows, `.\oc` instead of `./oc`.
+
 ```
 ./oc serve [--port 8765] [--every 10] [--no-ticker]   dashboard + scheduler
-./oc install / uninstall                              launchd: start at login, keep alive
+./oc install / uninstall                              start at login, keep alive (launchd / Task Scheduler)
+./oc update                                           pull the latest version, restart when idle
+./oc restart                                          restart the dashboard when idle
 ./oc login [--device-code]                            connect a mailbox (repeat per mailbox)
 ./oc tracker-setup [--domain links.you.com]           tracking secrets + Cloudflare deploy steps
 ./oc linkedin-login                                   sign the LinkedIn bot's Chrome profile in
@@ -144,5 +177,7 @@ Waits count from the previous step being done or skipped. The first step counts 
 ## Tests
 
 ```bash
-.venv/bin/python -m unittest discover tests
+.venv/bin/python -m unittest discover tests        # Windows: .venv\Scripts\python -m unittest discover tests
 ```
+
+GitHub Actions runs them on macOS and Windows for every PR.

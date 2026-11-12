@@ -2,23 +2,22 @@
 from __future__ import annotations
 
 import argparse
-import json
 import os
-import plistlib
 import subprocess
 import sys
-from pathlib import Path
+import time
 
-ROOT = Path(__file__).resolve().parent.parent
-LABEL = "com.outlook-campaigns.dashboard"
-PLIST = Path.home() / "Library/LaunchAgents" / f"{LABEL}.plist"
+from . import osutil
+from .osutil import ROOT, WINDOWS
+
+OC = r".\oc" if WINDOWS else "./oc"
 
 
 def load_env() -> None:
     f = ROOT / ".env"
     if not f.exists():
         return
-    for line in f.read_text().splitlines():
+    for line in f.read_text(encoding="utf-8-sig").splitlines():
         line = line.strip()
         if line and not line.startswith("#") and "=" in line:
             k, v = line.split("=", 1)
@@ -61,7 +60,7 @@ def cmd_linkedin_check(a):
         try:
             print(json.dumps(d.check(a.profile_url), indent=2))
         except linkedin_bot.BlockedError as e:
-            sys.exit(f"blocked: {e}. Run ./oc linkedin-login")
+            sys.exit(f"blocked: {e}. Run {OC} linkedin-login")
         finally:
             d.close()
 
@@ -71,15 +70,22 @@ def cmd_tracker_setup(a):
     import secrets
 
     env = ROOT / ".env"
-    text = env.read_text() if env.exists() else ""
+    text = env.read_text(encoding="utf-8-sig") if env.exists() else ""
     added = []
     for k in ("OC_TRACK_KEY", "OC_TRACK_SECRET"):
         if f"{k}=" not in text:
             text += ("" if text.endswith("\n") or not text else "\n") + f"{k}={secrets.token_urlsafe(32)}\n"
             added.append(k)
-    env.write_text(text)
-    env.chmod(0o600)
+    env.write_text(text, encoding="utf-8")
+    if not WINDOWS:
+        env.chmod(0o600)
     print(f"{'Added ' + ', '.join(added) + ' to' if added else 'Kept existing values in'} {env}\n")
+    if WINDOWS:
+        secret_steps = ("  npx wrangler secret put SIGNING_SECRET          # paste the OC_TRACK_SECRET value from .env\n"
+                        "  npx wrangler secret put API_KEY                 # paste the OC_TRACK_KEY value from .env\n")
+    else:
+        secret_steps = ("  grep '^OC_TRACK_SECRET=' ../.env | cut -d= -f2- | npx wrangler secret put SIGNING_SECRET\n"
+                        "  grep '^OC_TRACK_KEY=' ../.env | cut -d= -f2- | npx wrangler secret put API_KEY\n")
     print(f"""Deploy the tracker (one time, needs a free Cloudflare account; your domain must be on Cloudflare):
 
   cd "{ROOT / 'tracker'}"
@@ -87,12 +93,10 @@ def cmd_tracker_setup(a):
   npx wrangler login
   npx wrangler d1 create outreach-tracker        # paste the database_id into wrangler.toml
   npx wrangler d1 execute outreach-tracker --remote --file=schema.sql
-  grep '^OC_TRACK_SECRET=' ../.env | cut -d= -f2- | npx wrangler secret put SIGNING_SECRET
-  grep '^OC_TRACK_KEY=' ../.env | cut -d= -f2- | npx wrangler secret put API_KEY
-  # in wrangler.toml, uncomment routes and set your subdomain, e.g. links.yourdomain.com
+{secret_steps}  # in wrangler.toml, uncomment routes and set your subdomain, e.g. links.yourdomain.com
   npx wrangler deploy
 
-Only after the deploy works, add this line to .env and restart ./oc serve:
+Only after the deploy works, add this line to .env and restart {OC} serve:
 
   OC_TRACK_URL=https://{a.domain or '<your tracking subdomain>'}
 
@@ -100,14 +104,41 @@ Only after the deploy works, add this line to .env and restart ./oc serve:
 Settings → Open & click tracking should show "working".""")
 
 
+def _log_to(path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    f = open(path, "a", encoding="utf-8", buffering=1)
+    sys.stdout = sys.stderr = f
+
+
 def cmd_serve(a):
     import uvicorn
 
+    if a.log:
+        _log_to(a.log)
+    if a.parent_pid:
+        osutil.exit_with_parent(a.parent_pid)
     os.environ["OC_PORT"] = str(a.port)
     os.environ["OC_TICKER"] = "0" if a.no_ticker else "1"
     os.environ["OC_TICK_MINUTES"] = str(a.every)
     print(f"Dashboard: http://127.0.0.1:{a.port}", flush=True)
     uvicorn.run("campaigner.web.app:app", host="127.0.0.1", port=a.port, log_level="warning")
+
+
+def cmd_supervise(a):
+    """Windows' stand-in for launchd KeepAlive: run the dashboard, start it again whenever it exits
+    (a crash, or a restart after an update)."""
+    from pathlib import Path
+
+    log = Path(a.log)
+    _log_to(log)
+    env = dict(os.environ, OC_SUPERVISED="1", PYTHONPATH=str(ROOT))
+    while True:
+        started = time.monotonic()
+        code = subprocess.call([osutil.python_exe(windowless=True), "-m", "campaigner", "serve", "--port", str(a.port),
+                                "--every", str(a.every), "--log", str(log), "--parent-pid", str(os.getpid())],
+                               cwd=str(ROOT), env=env)
+        print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} dashboard exited ({code}), starting it again", flush=True)
+        time.sleep(2 if time.monotonic() - started > 60 else 30)  # back off if it keeps crashing at startup
 
 
 def cmd_tick(a):
@@ -121,29 +152,60 @@ def cmd_tick(a):
 
 
 def cmd_install(a):
-    PLIST.parent.mkdir(parents=True, exist_ok=True)
     log = ROOT / "data" / "dashboard.log"
-    log.parent.mkdir(exist_ok=True)
-    PLIST.write_bytes(plistlib.dumps({
-        "Label": LABEL,
-        "ProgramArguments": [str(ROOT / "oc"), "serve", "--port", str(a.port), "--every", str(a.every)],
-        "RunAtLoad": True,
-        "KeepAlive": True,
-        "StandardOutPath": str(log),
-        "StandardErrorPath": str(log),
-    }))
-    domain = f"gui/{os.getuid()}"
-    subprocess.run(["launchctl", "bootout", domain, str(PLIST)], capture_output=True)
-    subprocess.run(["launchctl", "bootstrap", domain, str(PLIST)], check=True)
+    osutil.install_service(["--port", str(a.port), "--every", str(a.every)], log)
     print(f"Installed. Dashboard at http://127.0.0.1:{a.port}, starts at login, runs every {a.every} min. Log: {log}")
 
 
 def cmd_uninstall(a):
-    if not PLIST.exists():
+    if not osutil.uninstall_service():
         sys.exit("not installed")
-    subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}", str(PLIST)], capture_output=True)
-    PLIST.unlink()
     print("Uninstalled")
+
+
+def _request_restart(port: int) -> bool:
+    """Ask the running dashboard to restart once it's idle. False if nothing is listening."""
+    import requests
+
+    url = f"http://127.0.0.1:{port}"
+    try:
+        r = requests.post(f"{url}/api/restart", headers={"Origin": url}, timeout=10)
+    except requests.ConnectionError:
+        return False
+    if r.status_code != 200:
+        sys.exit(f"The dashboard refused: {r.text}")
+    if not r.json().get("ok"):
+        sys.exit(r.json().get("error", "restart refused"))
+    return True
+
+
+def cmd_restart(a):
+    if _request_restart(a.port):
+        print("Restarting: it waits for the current run and the LinkedIn bot to finish, then comes back on its own.")
+    else:
+        print(f"Nothing running on port {a.port}. Start it with {OC} serve (or {OC} install).")
+
+
+def cmd_update(a):
+    from . import updater
+
+    st = updater.status()
+    if not st["ok"]:
+        sys.exit(st["error"])
+    if not st["behind"]:
+        print(f"Up to date ({st['version']}, branch {st['branch']}).")
+        return
+    print(f"{st['behind']} new change(s) on {st['branch']}:")
+    for c in st["changes"]:
+        print(f"  - {c}")
+    try:
+        print(updater.apply())
+    except RuntimeError as e:
+        sys.exit(f"Update failed: {e}")
+    if _request_restart(a.port):
+        print("The dashboard restarts on the new version as soon as it's idle.")
+    else:
+        print(f"Start the dashboard with {OC} serve to use it.")
 
 
 def cmd_demo(a):
@@ -201,25 +263,42 @@ def cmd_demo(a):
 
 
 def main() -> None:
+    for stream in (sys.stdout, sys.stderr):  # Windows consoles and pipes default to cp1252, which can't print "→"
+        if stream and hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
     load_env()
     p = argparse.ArgumentParser(prog="oc", description="Email + LinkedIn outreach from Outlook, with a local dashboard.")
-    sub = p.add_subparsers(dest="cmd", required=True)
+    sub = p.add_subparsers(dest="cmd", required=True, metavar="command")
 
     s = sub.add_parser("login", help="sign in to your M365 mailbox")
     s.add_argument("--device-code", action="store_true", help="use a code instead of a browser popup")
     s.set_defaults(fn=cmd_login)
 
     for name, fn, help_ in (("serve", cmd_serve, "run the dashboard (and the scheduler) on localhost"),
-                            ("install", cmd_install, "run the dashboard at login via launchd")):
+                            ("install", cmd_install, "start the dashboard at login and keep it running")):
         s = sub.add_parser(name, help=help_)
         s.add_argument("--port", type=int, default=8765)
         s.add_argument("--every", type=int, default=10, help="minutes between runs (default 10)")
         if name == "serve":
             s.add_argument("--no-ticker", action="store_true", help="dashboard only, no automatic runs")
+            s.add_argument("--log", help=argparse.SUPPRESS)
+            s.add_argument("--parent-pid", type=int, help=argparse.SUPPRESS)
         s.set_defaults(fn=fn)
 
-    s = sub.add_parser("uninstall", help="remove the launchd job")
+    s = sub.add_parser("uninstall", help="stop starting the dashboard at login")
     s.set_defaults(fn=cmd_uninstall)
+
+    s = sub.add_parser("supervise")  # internal: what the Windows logon task runs
+    s.add_argument("--log", required=True)
+    s.add_argument("--port", type=int, default=8765)
+    s.add_argument("--every", type=int, default=10)
+    s.set_defaults(fn=cmd_supervise)
+
+    for name, fn, help_ in (("restart", cmd_restart, "restart the running dashboard once it's idle"),
+                            ("update", cmd_update, "get the latest version from GitHub and restart when idle")):
+        s = sub.add_parser(name, help=help_)
+        s.add_argument("--port", type=int, default=8765)
+        s.set_defaults(fn=fn)
 
     s = sub.add_parser("tick", help="one run now: check replies, queue LinkedIn tasks, send due emails")
     s.add_argument("--dry-run", action="store_true", help="log emails instead of sending")

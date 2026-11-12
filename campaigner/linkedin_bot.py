@@ -52,30 +52,27 @@ class _ProfileLock:
         self._t = threading.Lock()
 
     def acquire(self, blocking: bool = True) -> bool:
-        import fcntl
         import time
+
+        from .osutil import open_lock, try_lock
 
         if not self._t.acquire(blocking=blocking):
             return False
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        f = open(self.path, "w")
-        while True:
-            try:
-                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                self._f = f
-                return True
-            except BlockingIOError:
-                if not blocking:
-                    f.close()
-                    self._t.release()
-                    return False
-                time.sleep(1)
+        f = open_lock(self.path)
+        while not try_lock(f):
+            if not blocking:
+                f.close()
+                self._t.release()
+                return False
+            time.sleep(1)
+        self._f = f
+        return True
 
     def release(self) -> None:
-        import fcntl
+        from .osutil import unlock
 
         if self._f:
-            fcntl.flock(self._f, fcntl.LOCK_UN)
+            unlock(self._f)
             self._f.close()
             self._f = None
         self._t.release()

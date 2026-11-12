@@ -13,7 +13,7 @@
       <div class="card-head"><h2>Open &amp; click tracking</h2></div>
       {% if not tracker %}
         <p><span class="pill muted">not set up</span> Emails go out without pixels or tracked links. Reply and bounce tracking still work.</p>
-        <p class="meta">To turn it on, deploy the Cloudflare Worker in <code>tracker/</code> and set <code>OC_TRACK_URL</code>, <code>OC_TRACK_KEY</code> and <code>OC_TRACK_SECRET</code> in <code>.env</code>. Then restart. Run <code>./oc tracker-setup</code> for the exact steps.</p>
+        <p class="meta">To turn it on, deploy the Cloudflare Worker in <code>tracker/</code> and set <code>OC_TRACK_URL</code>, <code>OC_TRACK_KEY</code> and <code>OC_TRACK_SECRET</code> in <code>.env</code>. Then restart. Run <code>{{ OC }} tracker-setup</code> for the exact steps.</p>
       {% elif tracker_error %}
         <p><span class="pill critical">problem</span> {{ tracker.base }}: {{ tracker_error }}</p>
         <p class="meta">Emails still send; open/click links are already signed and will record once the worker answers.</p>
@@ -91,16 +91,39 @@
     <section class="card">
       <div class="card-head"><h2>Scheduler</h2></div>
       <p>The dashboard runs everything every {{ tick_minutes }} min while it's open. To start it at login and keep it running:</p>
-      <pre class="log">./oc install</pre>
-      <p class="meta">Emails respect each campaign's send window and caps. The Mac has to be awake.</p>
+      <pre class="log">{{ OC }} install</pre>
+      <p class="meta">Emails respect each campaign's send window and caps. The {{ MACHINE }} has to be awake.</p>
       <form method="post" action="/settings/keep-awake" class="stack-y" style="gap:8px">
         <label><input type="checkbox" name="keep_awake" value="1" {{ 'checked' if keep_awake }} onchange="this.form.submit()">
-          Keep this Mac awake while a campaign is active</label>
-        <p class="meta">{% if awake_on %}<span class="dot on"></span> Holding the Mac awake now (a campaign is active).{% elif keep_awake %}Not holding it now: no campaign is active.{% else %}Off: the Mac sleeps on its usual schedule and campaigns pause until it wakes.{% endif %}
-          This stops idle sleep, including on battery. <b>Closing the lid still sleeps the Mac</b> unless it's on power with an external display. For lid-open, screen-off running on power, also turn on <i>System Settings → Battery → Options → Prevent automatic sleeping on power adapter when the display is off</i>. After any sleep, due steps run as soon as it wakes.</p>
+          Keep this {{ MACHINE }} awake while a campaign is active</label>
+        <p class="meta">{% if awake_on %}<span class="dot on"></span> Holding the {{ MACHINE }} awake now (a campaign is active).{% elif keep_awake %}Not holding it now: no campaign is active.{% else %}Off: the {{ MACHINE }} sleeps on its usual schedule and campaigns pause until it wakes.{% endif %}
+          This stops idle sleep, including on battery.
+          {% if WINDOWS %}<b>Closing the lid still sleeps the laptop</b> unless you set <i>Control Panel → Power Options → Choose what closing the lid does → When I close the lid (Plugged in): Do nothing</i>.
+          {% else %}<b>Closing the lid still sleeps the Mac</b> unless it's on power with an external display. For lid-open, screen-off running on power, also turn on <i>System Settings → Battery → Options → Prevent automatic sleeping on power adapter when the display is off</i>.{% endif %}
+          After any sleep, due steps run as soon as it wakes.</p>
       </form>
     </section>
   </div>
+
+  <section class="card" id="updates">
+    <div class="card-head"><h2>App updates</h2>
+      {% if not update.ok %}<span class="pill muted">unknown</span>{% elif update.behind %}<span class="pill info">{{ update.behind }} available</span>{% else %}<span class="pill good">up to date</span>{% endif %}
+    </div>
+    {% if update.ok %}
+      <p>Version {{ update.version }} on <code>{{ update.branch }}</code>. Checks GitHub every 6 hours.</p>
+      {% if update.changes %}<ul class="meta">{% for c in update.changes %}<li>{{ c }}</li>{% endfor %}</ul>{% endif %}
+      {% if update.dirty %}<p class="meta">This copy has local code edits. Updating works if they don't overlap the new changes; otherwise it stops and changes nothing.</p>{% endif %}
+    {% else %}
+      <p class="meta">{{ update.error }}</p>
+    {% endif %}
+    {% if restarting %}<p><span class="dot on"></span> Restarting once the current run and the LinkedIn bot are idle. Refresh in a minute.</p>{% endif %}
+    <form method="post" action="/settings/update" class="actions">
+      <button class="btn" name="action" value="check">Check now</button>
+      {% if update.ok and update.behind %}<button class="btn primary" name="action" value="apply">Update now</button>{% endif %}
+    </form>
+    <p class="meta">{% if supervised %}After updating, the dashboard restarts by itself when it's idle (never mid-send).{% else %}Started by hand: after updating, stop it and run <code>{{ OC }} serve</code> again. With <code>{{ OC }} install</code> it restarts by itself.{% endif %}
+      From a terminal: <code>{{ OC }} update</code>.</p>
+  </section>
 
   <section class="card">
     <div class="card-head"><h2>Run log</h2><div class="actions"><button class="btn" data-run>Run now</button></div></div>
