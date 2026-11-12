@@ -857,7 +857,7 @@ async def settings_linkedin_bot(request: Request):
     num = lambda k, d, hi: min(max(int(f.get(k) or d), 0), hi)  # noqa: E731
     db.set_setting(conn, "li_mode", "bot" if f.get("li_mode") == "bot" else "assisted")
     db.set_setting(conn, "li_bot_caps", {a: num(f"cap_{a}", 0, 200) for a in ("view", "connect", "message", "like", "comment")})
-    db.set_setting(conn, "li_bot_week_invites", num("week_invites", 80, 100))
+    db.set_setting(conn, "li_bot_week_invites", num("week_invites", 90, 100))
     gmin = num("gap_min", 45, 3600)
     db.set_setting(conn, "li_bot_gap", [gmin, max(gmin, num("gap_max", 120, 3600))])
     start, end = str(f.get("hours_start") or "09:00"), str(f.get("hours_end") or "18:00")
