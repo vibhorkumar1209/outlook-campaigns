@@ -13,7 +13,7 @@ from msal_extensions import PersistedTokenCache, build_encrypted_persistence
 
 GRAPH = "https://graph.microsoft.com/v1.0"
 SCOPES = ["Mail.Send", "Mail.ReadWrite", "User.Read"]
-# Encrypted at rest: macOS Keychain under the hood. Holds every signed-in mailbox.
+# Encrypted at rest: Keychain on macOS, DPAPI (your Windows login) on Windows. Holds every signed-in mailbox.
 CACHE_PATH = os.path.expanduser("~/.outlook-campaigns/token_cache.bin")
 MSG_FIELDS = "id,conversationId,from,subject,bodyPreview,receivedDateTime,isDraft,internetMessageHeaders"
 RETRY_STATUS = {429, 502, 503, 504}

@@ -17,7 +17,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from jinja2 import TemplateError, TemplateSyntaxError
 
-from .. import ai, attachments, db, domain_health, engine, importer, linkedin_bot, stats
+from .. import ai, attachments, db, domain_health, engine, importer, linkedin_bot, osutil, stats, updater
 from ..db import iso, one, parse, rows, scalar, utcnow
 from ..render import ENV, email_html, lead_context, linkedin_text, render_text
 from ..runner import Runner, remove_sender, wants_awake
@@ -85,6 +85,7 @@ templates.env.globals.update(
     # Versioned static URLs so browsers pick up CSS/JS changes immediately.
     asset=lambda name: f"/static/{name}?v={int((HERE / 'static' / name).stat().st_mtime)}",
     CHANNELS=engine.CHANNELS, CONDITIONS=engine.CONDITIONS, FIELDS=importer.FIELDS,
+    MACHINE=osutil.MACHINE, WINDOWS=osutil.WINDOWS, OC=".\\oc" if osutil.WINDOWS else "./oc",
 )
 
 OPEN_TASKS_SQL = """SELECT COUNT(*) FROM tasks t JOIN enrollments e ON e.id = t.enrollment_id
@@ -124,6 +125,7 @@ def page(request: Request, name: str, conn, **ctx):
         "li_bot": linkedin_bot.status(conn),
         "last_tick": db.get_setting(conn, "last_tick"),
         "open_tasks": scalar(conn, OPEN_TASKS_SQL),
+        "updates_behind": (runner.update_info or {}).get("behind", 0),
         "path": request.url.path,
         "msg": request.query_params.get("msg"),
         "err": request.query_params.get("err"),
@@ -795,7 +797,39 @@ def settings(request: Request):
                 tracker=tracker, tracker_error=tracker.health() if tracker else None,
                 track_cursor=db.get_setting(conn, "track_cursor", 0),
                 tick_minutes=os.environ.get("OC_TICK_MINUTES", "10"),
-                keep_awake=db.get_setting(conn, "keep_awake", True), awake_on=runner.awake.on)
+                keep_awake=db.get_setting(conn, "keep_awake", True), awake_on=runner.awake.on,
+                update=runner.update_info or updater.status(fetch=False), supervised=osutil.supervised(),
+                restarting=runner.restarting)
+
+
+@app.post("/settings/update")
+def settings_update(action: str = Form("check")):
+    if action == "check":
+        runner.update_info = updater.status(fetch=True)
+        st = runner.update_info
+        if not st["ok"]:
+            return back("/settings", err=st["error"])
+        return back("/settings", msg=f"{st['behind']} update(s) available." if st["behind"] else "Up to date.")
+    try:
+        msg = updater.apply()
+    except RuntimeError as e:
+        return back("/settings", err=f"Update failed: {e}")
+    runner.update_info = updater.status(fetch=False)
+    if osutil.supervised():
+        runner.request_restart()
+        msg += " Restarting once the current run and the LinkedIn bot are idle; refresh in a minute."
+    else:
+        msg += f" Restart the dashboard (stop it, then run {'.\\oc' if osutil.WINDOWS else './oc'} serve) to use it."
+    return back("/settings", msg=msg)
+
+
+@app.post("/api/restart")
+def restart():
+    if not osutil.supervised():
+        return {"ok": False, "error": "This dashboard was started by hand with `oc serve`, so nothing would start it "
+                                      "again. Stop it (Ctrl+C) and run it again."}
+    runner.request_restart()
+    return {"ok": True}
 
 
 @app.post("/settings/keep-awake")

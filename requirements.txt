@@ -9,3 +9,4 @@ python-multipart>=0.0.9
 dnspython>=2.6
 anthropic>=1.15
 playwright>=1.50
+tzdata>=2024.1; sys_platform == "win32"  # Windows has no system time zone database

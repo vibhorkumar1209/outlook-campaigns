@@ -169,8 +169,10 @@ class ImportTest(Base):
         db.set_setting(self.conn, "keep_awake", True)
         self.conn.execute("UPDATE campaigns SET status = 'paused'")
         self.assertFalse(runner.wants_awake(self.conn))
+        from campaigner import osutil
         k = runner.KeepAwake()
-        with mock.patch.object(runner.subprocess, "Popen") as popen, mock.patch.object(runner.shutil, "which", return_value="/usr/bin/caffeinate"):
+        with mock.patch.object(osutil, "WINDOWS", False), mock.patch.object(osutil.subprocess, "Popen") as popen, \
+                mock.patch.object(osutil.shutil, "which", return_value="/usr/bin/caffeinate"):
             popen.return_value.poll.return_value = None
             k.update(True)
             k.update(True)                                                  # already holding: no second process
@@ -178,6 +180,63 @@ class ImportTest(Base):
             self.assertEqual(popen.call_args[0][0][:2], ["caffeinate", "-i"])
             k.update(False)
             popen.return_value.terminate.assert_called_once()
+
+    def test_keep_awake_windows_holds_a_thread(self):
+        from campaigner import osutil
+        calls = []
+        with mock.patch.object(osutil, "WINDOWS", True), \
+                mock.patch.object(osutil, "_hold_awake", lambda stop: (calls.append("on"), stop.wait(), calls.append("off"))):
+            k = osutil.KeepAwake()
+            k.update(True)
+            k.update(True)                                                  # already holding: no second thread
+            self.assertTrue(k.on)
+            k.update(False)
+            self.assertFalse(k.on)
+        self.assertEqual(calls, ["on", "off"])
+
+
+class PlatformTest(unittest.TestCase):
+    def test_lock_is_exclusive_across_handles(self):
+        from campaigner import osutil
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "x.lock"
+            a, b = osutil.open_lock(path), osutil.open_lock(path)
+            try:
+                self.assertTrue(osutil.try_lock(a))
+                self.assertFalse(osutil.try_lock(b))                        # held elsewhere
+                osutil.unlock(a)
+                self.assertTrue(osutil.try_lock(b))
+                osutil.unlock(b)
+            finally:
+                a.close(), b.close()
+
+    def test_tick_lock_released_after_use(self):
+        from campaigner import runner
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(runner, "LOCK_PATH", Path(d) / ".tick.lock"):
+            with runner.tick_lock() as ok:
+                self.assertTrue(ok)
+            with runner.tick_lock() as ok:
+                self.assertTrue(ok)
+
+    def test_update_status_reports_missing_git(self):
+        from campaigner import updater
+        with mock.patch.object(updater.subprocess, "run", side_effect=FileNotFoundError):
+            st = updater.status()
+        self.assertFalse(st["ok"])
+        self.assertIn("Git", st["error"])
+
+    def test_update_status_counts_new_commits(self):
+        from campaigner import updater
+        out = {"fetch": "", "rev-parse": "main", "log": "abc · Nov 11, 2026", "status": ""}
+
+        def run(cmd, **kw):
+            sub = cmd[3]
+            text = "fix a\nfeat b" if sub == "log" and "HEAD..@{u}" in cmd else out.get(sub, "")
+            return mock.Mock(returncode=0, stdout=text, stderr="")
+        with mock.patch.object(updater.subprocess, "run", side_effect=run):
+            st = updater.status()
+        self.assertEqual((st["ok"], st["behind"], st["changes"], st["dirty"]), (True, 2, ["fix a", "feat b"], False))
+
 
 class FlowTest(Base):
     def test_full_cross_channel_sequence(self):

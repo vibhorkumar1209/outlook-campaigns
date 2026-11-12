@@ -24,6 +24,7 @@
     <div class="side-foot">
       <div><span class="dot {{ 'on' if n_connected }}"></span>{% if n_connected %}{{ n_connected }} mailbox{{ "es" if n_connected != 1 }} connected{% else %}No mailbox connected{% endif %}</div>
       <div>last run {{ last_tick | ago }}</div>
+      {% if updates_behind %}<div><a href="/settings#updates"><span class="dot on"></span>Update available</a></div>{% endif %}
     </div>
   </aside>
   <main>
