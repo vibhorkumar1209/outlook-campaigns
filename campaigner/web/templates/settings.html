@@ -56,6 +56,7 @@
           <label class="f">Bot hours start<input type="time" name="hours_start" value="{{ bot.li_bot_hours[0] }}"></label>
           <label class="f">Bot hours end<input type="time" name="hours_end" value="{{ bot.li_bot_hours[1] }}"></label>
         </div>
+        <p class="meta">Paced like a person: it works through people in a random order (never the same person twice in a row), skims each profile before acting, types at reading pace, sometimes browses the feed between actions, and takes a 4–10 minute break every 3–5 actions. At most {{ bot.li_bot_per_run }} actions per run.</p>
         <div class="days" style="margin:12px 0">
           {% for d in ["mon", "tue", "wed", "thu", "fri", "sat", "sun"] %}
             <label><input type="checkbox" name="days" value="{{ d }}" {{ 'checked' if d in bot.li_bot_days }}> {{ d }}</label>

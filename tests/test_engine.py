@@ -1,5 +1,6 @@
 """Orchestration logic against a fake Graph. Run: .venv/bin/python -m unittest discover tests"""
 import json
+import random
 import tempfile
 import unittest
 from unittest import mock
@@ -993,6 +994,14 @@ class DraftTest(unittest.TestCase):
             draft_comment("post", {}, client=self.FakeClient(stop="refusal"))
 
 
+class Steady(random.Random):
+    """Predictable pacing for bot tests: keeps task order, never wanders, takes no breaks."""
+    def shuffle(self, x): pass
+    def random(self): return 0.99
+    def uniform(self, a, b): return a
+    def randint(self, a, b): return 10 ** 6
+
+
 class FakeDriver:
     def __init__(self, posts=(), connect="sent", message="sent", blocked=False, connections=()):
         self.calls, self.posts, self.connect_result, self.message_result, self.blocked = [], list(posts), connect, message, blocked
@@ -1042,7 +1051,8 @@ class BotTest(Base):
     def bot(self, driver=None, at=MON, draft=None):
         d = driver or FakeDriver()
         self.drivers.append(d)
-        linkedin_bot.run(self.conn, lambda: d, now=at, log=self.logs.append, sleep=lambda s: None, draft=draft)
+        linkedin_bot.run(self.conn, lambda: d, now=at, log=self.logs.append, sleep=lambda s: None, draft=draft,
+                        rng=Steady())
         return d
 
     def test_assisted_mode_never_opens_browser(self):
@@ -1110,6 +1120,45 @@ class BotTest(Base):
         self.assertEqual((t["bot_attempts"], t["bot_note"]), (2, "not a 1st-degree connection yet"))
         self.assertEqual(self.drivers[2].calls, [])  # third run had nothing left to try
 
+    def test_human_order_hops_between_people_and_puts_messages_first(self):
+        t = lambda lead, i: {"lead_id": lead, "id": i}
+        todo = [(t(1, 1), "view"), (t(1, 2), "like"), (t(2, 3), "connect"), (t(3, 4), "message"), (t(2, 5), "view")]
+        for seed in range(30):
+            out = linkedin_bot.human_order(list(todo), random.Random(seed))
+            self.assertEqual(out[0][1], "message")
+            self.assertEqual(sorted(x[0]["id"] for x in out), [1, 2, 3, 4, 5])
+            leads = [x[0]["lead_id"] for x in out]
+            self.assertFalse(any(a == b for a, b in zip(leads, leads[1:])), leads)
+        orders = {tuple(x[0]["id"] for x in linkedin_bot.human_order(list(todo), random.Random(s))) for s in range(30)}
+        self.assertGreater(len(orders), 1)  # actually shuffled
+
+    def test_pacing_wanders_and_takes_breaks(self):
+        class Wanders(FakeDriver):
+            def wander(self): self.calls.append("wander")
+        class Rng(random.Random):
+            def random(self): return 0.0          # always wander
+            def randint(self, a, b): return a     # break after 3 actions
+            def uniform(self, a, b): return b
+        sleeps, logs = [], []
+        d = Wanders()
+        cfg = {"li_bot_gap": [100, 200]}
+        nb = 3
+        for done in range(1, 5):
+            nb = linkedin_bot._between(d, cfg, done, nb, Rng(), sleeps.append, logs.append)
+        self.assertEqual(d.calls.count("wander"), 4)
+        self.assertTrue(any("break" in l for l in logs))
+        self.assertIn(linkedin_bot.BREAK_SECONDS[1], sleeps)
+        self.assertEqual(nb, 6)
+        gap = 200 * 1.3
+        self.assertAlmostEqual(sum(x for x in sleeps if x != linkedin_bot.BREAK_SECONDS[1]), gap * 4)
+
+    def test_wander_failure_never_costs_a_task(self):
+        class Broken(FakeDriver):
+            def wander(self): raise TimeoutError("feed slow")
+        class Rng(Steady):
+            def random(self): return 0.0
+        linkedin_bot._between(Broken(), {"li_bot_gap": [1, 2]}, 1, 99, Rng(), lambda s: None, print)
+
     def test_task_you_handled_mid_run_is_not_redone(self):
         self.conn.execute("UPDATE leads SET linkedin_url = 'https://www.linkedin.com/in/bob' WHERE email = 'bob@x.com'")
         self.tick(MON)
@@ -1118,7 +1167,7 @@ class BotTest(Base):
         def sleep(_):  # you click Done on Bob's card while the bot pauses between leads
             if self.task("bob@x.com"):
                 engine.complete_task(self.conn, bob["id"], "done", now=MON)
-        linkedin_bot.run(self.conn, lambda: d, now=MON, log=self.logs.append, sleep=sleep)
+        linkedin_bot.run(self.conn, lambda: d, now=MON, log=self.logs.append, sleep=sleep, rng=Steady())
         self.assertEqual([c[1] for c in d.calls if c[0] == "connect"], ["https://www.linkedin.com/in/janedoe"])
 
     def test_task_completed_during_action_does_not_crash(self):
@@ -1130,7 +1179,7 @@ class BotTest(Base):
             engine.complete_task(self.conn, jane["id"], "connected", now=MON)  # you, mid-action
             return orig(url, note)
         d.connect = connect
-        linkedin_bot.run(self.conn, lambda: d, now=MON, log=self.logs.append, sleep=lambda s: None)
+        linkedin_bot.run(self.conn, lambda: d, now=MON, log=self.logs.append, sleep=lambda s: None, rng=Steady())
         self.assertTrue(any("already handled" in l for l in self.logs))
         self.assertIn("close", d.calls)
 
