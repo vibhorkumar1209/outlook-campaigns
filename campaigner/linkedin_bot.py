@@ -27,8 +27,10 @@ BASE = "https://www.linkedin.com"
 SNAP_DIR = db.DB_PATH.parent / "bot-errors"   # screenshots of failed actions (git-ignored data/)
 DEFAULTS = {
     "li_mode": "assisted",                                  # assisted | bot
-    "li_bot_caps": {"view": 40, "connect": 15, "message": 20, "like": 25, "comment": 8},  # per day; 0 = off
-    "li_bot_week_invites": 80,                              # LinkedIn's own limit is ~100/week
+    # Per day, 0 = off. Under LinkedIn's fair-use limits with margin: invites ~100/week (20/day), profile views
+    # well under the ~80-100/day where free accounts get warnings, messages to connections well under ~100/day.
+    "li_bot_caps": {"view": 60, "connect": 20, "message": 40, "like": 30, "comment": 10},
+    "li_bot_week_invites": 90,                              # rolling 7 days; LinkedIn's own limit is ~100/week
     "li_bot_gap": [45, 120],                                # seconds between actions
     "li_bot_hours": ["09:00", "18:00"],
     "li_bot_days": "mon,tue,wed,thu,fri",

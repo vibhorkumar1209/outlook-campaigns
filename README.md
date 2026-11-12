@@ -153,7 +153,7 @@ Waits count from the previous step being done or skipped. The first step counts 
 
 - **The Mac or PC must be awake.** *Settings → Keep awake* stops idle sleep while a campaign is active; closing a laptop lid still sleeps it (see the note there). Missed runs catch up when it wakes.
 - **M365:** about 10k recipients a day and 30 messages a minute per mailbox. Keep the daily caps far below that, and ramp new mailboxes slowly. Keep bounce rate under 2%; the Senders page flags 2% and up as a warning and 5% and up as critical. This is for personal outreach, not bulk mail.
-- **LinkedIn:** about 100 invites a week. Free accounts get a few personalized notes a month, capped at 200 characters. Keep LinkedIn tasks per day ≤ 20.
+- **LinkedIn:** about 100 invites a week. Free accounts get a few personalized notes a month, capped at 200 characters. The bot's defaults stay under LinkedIn's fair-use limits: per day 20 invites (90 per rolling week), 60 profile views, 40 messages, 30 likes, 10 comments. Change them in **Settings → LinkedIn automation**.
 - **Detection is heuristic.** A missed out-of-office counts as a reply, which fails safe: no more follow-ups. A missed LinkedIn notification just means you mark it by hand.
 - **Compliance is on you:** GDPR/PECR for the EU and UK, CAN-SPAM for the US. Keep an easy opt-out; the starter's last email has one.
 
