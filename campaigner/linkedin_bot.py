@@ -32,8 +32,14 @@ DEFAULTS = {
     "li_bot_gap": [45, 120],                                # seconds between actions
     "li_bot_hours": ["09:00", "18:00"],
     "li_bot_days": "mon,tue,wed,thu,fri",
-    "li_bot_per_run": 12,
+    "li_bot_per_run": 8,
 }
+# Human pacing. Between actions: the configured gap, stretched a little at random; now and then a few seconds of
+# read-only browsing (feed, notifications); every few actions a longer break. A run stops after MAX_RUN.
+WANDER_CHANCE = 0.35
+BREAK_EVERY = (3, 5)            # actions between breaks
+BREAK_SECONDS = (240, 600)
+MAX_RUN = timedelta(minutes=45)
 ACTION_OF = {"li_view": "view", "li_connect": "connect", "li_message": "message", "li_engage": "like"}
 MAX_ATTEMPTS = 2
 REPLY_CHECK_EVERY = timedelta(minutes=10)  # LinkedIn inbox scan for replies to the bot's messages
@@ -189,12 +195,54 @@ def expire_unapproved(conn, now: datetime, log) -> None:
 
 # ---------- the run ----------
 
-def run(conn, driver_factory, *, now: datetime | None = None, log=print, sleep=None, draft=None) -> None:
+def human_order(todo: list, rng) -> list:
+    """Shuffled, so the bot hops between people instead of working down the list. Time-sensitive work first
+    (approved comments, messages such as thanks-for-connecting), and never the same person twice in a row
+    while someone else is waiting."""
+    urgent = [x for x in todo if x[1] in ("comment", "message")]
+    rest = [x for x in todo if x[1] not in ("comment", "message")]
+    rng.shuffle(urgent)
+    rng.shuffle(rest)
+    out = urgent + rest
+    for i in range(1, len(out)):
+        prev = out[i - 1][0]["lead_id"]
+        if out[i][0]["lead_id"] == prev:
+            j = next((k for k in range(i + 1, len(out)) if out[k][0]["lead_id"] != prev), None)
+            if j is not None:
+                out[i], out[j] = out[j], out[i]
+    return out
+
+
+def _between(driver, cfg, done: int, next_break: int, rng, sleep, log) -> int:
+    """The pause before the next action. Returns when the next long break is due."""
+    if done >= next_break:
+        secs = rng.uniform(*BREAK_SECONDS)
+        log(f"LinkedIn bot: taking a {secs / 60:.0f}-minute break")
+        sleep(secs)
+        next_break = done + rng.randint(*BREAK_EVERY)
+    gap = rng.uniform(*cfg["li_bot_gap"]) * rng.uniform(0.9, 1.3)
+    wander = getattr(driver, "wander", None)
+    if wander and rng.random() < WANDER_CHANCE:
+        sleep(gap / 3)
+        try:
+            wander()
+        except BlockedError:
+            raise
+        except Exception:  # idle browsing is optional; never let it cost a task
+            pass
+        sleep(gap * 2 / 3)
+    else:
+        sleep(gap)
+    return next_break
+
+
+def run(conn, driver_factory, *, now: datetime | None = None, log=print, sleep=None, draft=None, rng=None) -> None:
     """One pass over due LinkedIn tasks. draft(post_text, lead) -> comment text, or None to skip drafting."""
     import time
 
     now = now or utcnow()
     sleep = sleep or time.sleep
+    rng = rng or random.Random()
     cfg = settings(conn)
     if cfg["li_mode"] != "bot":
         return
@@ -225,8 +273,11 @@ def run(conn, driver_factory, *, now: datetime | None = None, log=print, sleep=N
     if not PROFILE_LOCK.acquire(blocking=False):
         log("LinkedIn bot: browser profile busy (sign-in window open?), skipping this run")
         return
+    todo = human_order(todo, rng)
     driver = driver_factory()
     done = 0
+    next_break = rng.randint(*BREAK_EVERY)
+    started = time.monotonic()
     try:
         driver.open()
         if candidates:
@@ -251,10 +302,13 @@ def run(conn, driver_factory, *, now: datetime | None = None, log=print, sleep=N
         for t, action in todo:
             if done >= cfg["li_bot_per_run"]:
                 break
+            if time.monotonic() - started > MAX_RUN.total_seconds():
+                log("LinkedIn bot: run time limit reached, the rest waits for the next run")
+                break
             if used.get(action, 0) >= caps.get(action, 0):
                 continue
             if done:
-                sleep(random.uniform(*cfg["li_bot_gap"]))
+                next_break = _between(driver, cfg, done, next_break, rng, sleep, log)
             # You may have handled it in the queue while the bot was busy: never redo it on LinkedIn.
             fresh = one(conn, "SELECT status, comment_status FROM tasks WHERE id = ?", t["id"])
             if not fresh or fresh["status"] != "open" or fresh["comment_status"] != t["comment_status"]:
@@ -498,13 +552,55 @@ class ChromeDriver:
             if self._pw:
                 self._pw.stop()
 
-    def _pause(self, lo=1.5, hi=3.5) -> None:
+    def _pause(self, lo=2.0, hi=4.5) -> None:
         self.page.wait_for_timeout(int(random.uniform(lo, hi) * 1000))
 
     def _goto(self, url: str) -> None:
         self.page.goto(url, wait_until="domcontentloaded")
-        self._pause(2.5, 4.5)  # LinkedIn renders client-side after load
+        self._pause(3, 6)  # LinkedIn renders client-side after load
         self._check_blocked()
+
+    def _scroll(self, times: int, lo=250, hi=750) -> None:
+        vp = self.page.viewport_size or {"width": 1280, "height": 800}
+        self.page.mouse.move(vp["width"] * random.uniform(0.35, 0.65), vp["height"] * random.uniform(0.4, 0.7),
+                             steps=random.randint(5, 15))
+        for _ in range(times):
+            self.page.mouse.wheel(0, random.randint(lo, hi))
+            self._pause(1.0, 3.0)
+
+    def _skim(self, light: bool = False) -> None:
+        """Scroll down a profile as a person reading it would, then back to the top card where the buttons are."""
+        self._scroll(random.randint(1, 2) if light else random.randint(2, 4))
+        if random.random() < 0.4:
+            self.page.mouse.wheel(0, -random.randint(200, 500))  # glance back up at something
+            self._pause(0.8, 2.0)
+        self.page.evaluate("window.scrollTo({top: 0, behavior: 'smooth'})")
+        self._pause(1.0, 2.0)
+
+    def _click(self, el) -> None:
+        """Move the mouse over to the control in small steps, hesitate briefly, then click."""
+        try:
+            el.scroll_into_view_if_needed(timeout=3000)
+            box = el.bounding_box()
+            if box:
+                self.page.mouse.move(box["x"] + box["width"] * random.uniform(0.3, 0.7),
+                                     box["y"] + box["height"] * random.uniform(0.3, 0.7), steps=random.randint(8, 25))
+                self._pause(0.3, 0.9)
+        except Exception:
+            pass  # the click below still works without the approach
+        el.click()
+
+    def _type(self, text: str) -> None:
+        """Type into the focused field at a person's pace: uneven keystrokes, short stops after punctuation."""
+        for word in re.split(r"(?<= )", text):
+            self.page.keyboard.type(word, delay=random.randint(45, 120))
+            if word.rstrip()[-1:] in ".,?!:;" and random.random() < 0.6:
+                self._pause(0.4, 1.2)
+
+    def wander(self) -> None:
+        """Between actions: read-only browsing of the feed, notifications or network page. Clicks nothing."""
+        self._goto(self.base + random.choice(["/feed/", "/feed/", "/notifications/", "/mynetwork/"]))
+        self._scroll(random.randint(2, 5), 300, 900)
 
     def _check_blocked(self) -> None:
         u = self.page.url
@@ -565,8 +661,9 @@ class ChromeDriver:
     # Profile pages also list other people ("People also viewed", "People you may know") with their own
     # Message/Connect controls. Every control below is tied to the profile being worked on.
 
-    def view(self, url: str) -> Profile:
+    def view(self, url: str, light: bool = False) -> Profile:
         self._goto(url)
+        self._skim(light)
         head = self._main().inner_text(timeout=10000)[:2500]
         self.profile_name = head.strip().split("\n", 1)[0].strip()
         # "· 1st" in the top card (inline elements can run together: "· 1stMessage"), or the screen-reader text.
@@ -592,7 +689,7 @@ class ChromeDriver:
             return c
         more = self._reachable(self._all_visible(self._main().get_by_role("button", name=re.compile(r"^More( actions)?$", re.I))))
         if more:
-            more.click()
+            self._click(more)
             self._pause(0.8, 1.6)
             return self._invite_control(url)
         return None
@@ -609,24 +706,24 @@ class ChromeDriver:
         btn = self._connect_button(url)
         if not btn:
             raise ActionError("no Connect control for this profile (follow-only, or LinkedIn changed the page)")
-        btn.click()
+        self._click(btn)
         self._pause(1.5, 2.5)
         if self._visible(self.page.locator("input[type=email]")):
             raise ActionError("LinkedIn wants their email address to connect")
         if note.strip():
             add = self._button_named(r"^Add a (free )?note$")
             if add:
-                add.click()
+                self._click(add)
                 self._pause(0.8, 1.6)
                 box = self._visible(self.page.locator("textarea"))
                 if box:
-                    box.click()
-                    box.type(note[:300], delay=random.randint(25, 60))
-                    self._pause(0.6, 1.2)
+                    self._click(box)
+                    self._type(note[:300])
+                    self._pause(1.5, 3.5)  # reread before sending
                     send = self._button_named(r"^Send( invitation| now)?$")
                     if not send or not send.is_enabled():
                         raise ActionError("invite dialog changed (no Send button)")
-                    send.click()
+                    self._click(send)
                     self._pause()
                     return "sent"
                 # Note refused (free-account limit upsell): close it and send the invite without one.
@@ -635,12 +732,12 @@ class ChromeDriver:
                 btn = self._connect_button(url)
                 if not btn:
                     raise ActionError("couldn't reopen the invite after the note was refused")
-                btn.click()
+                self._click(btn)
                 self._pause(1.5, 2.5)
         send = self._button_named(r"^Send without a note$|^Send( now)?$")
         if not send:
             raise ActionError("invite dialog changed (no Send button)")
-        send.click()
+        self._click(send)
         self._pause()
         return "sent" if not note.strip() else "sent_without_note"
 
@@ -699,8 +796,8 @@ class ChromeDriver:
         if not btn:
             raise ActionError("no Message control on the profile")
         self._close_chats()
-        btn.click()
-        self._pause(2.5, 4)
+        self._click(btn)
+        self._pause(3, 5)
         editors = self.page.locator("[contenteditable='true'][aria-label^='Write a message']")
         vis = [editors.nth(i) for i in range(editors.count()) if editors.nth(i).is_visible()]
         if len(vis) != 1:
@@ -719,13 +816,13 @@ class ChromeDriver:
         if not first or not any(first in n for n in names + recipients):
             raise ActionError(f"couldn't confirm the message window is addressed to {self.profile_name}")
         box = vis[0]
-        box.click()
+        self._click(box)
         self._type_multiline(text)
-        self._pause(0.8, 1.6)
+        self._pause(1.5, 3.5)  # reread before sending
         send = self._button_named(r"^Send$")
         if not send or not send.is_enabled():
             raise ActionError("Send button not available")
-        send.click()
+        self._click(send)
         self._pause(2, 3)
         if (box.inner_text() or "").strip():
             raise ActionError("message may not have sent (text still in the box)")
@@ -770,12 +867,12 @@ class ChromeDriver:
 
     def thread_reply(self, url: str, our_text: str) -> str | None:
         """Open this profile's conversation and return the first thing they wrote AFTER our message, if any."""
-        p = self.view(url)
+        p = self.view(url, light=True)
         btn = self._message_control()
         if not btn or p.degree != "1st":
             return None
         self._close_chats()
-        btn.click()
+        self._click(btn)
         self._pause(3, 4.5)
         msgs = []
         for m in self.page.evaluate(self._THREAD_JS):  # "Name: text"; LinkedIn renders each message twice
@@ -796,7 +893,7 @@ class ChromeDriver:
             if i:
                 self.page.keyboard.press("Shift+Enter")
             if line:
-                self.page.keyboard.type(line, delay=random.randint(20, 50))
+                self._type(line)
 
     # Activity page: class names are randomized, so posts are found through their accessibility labels.
     # Each post has "Open control menu for post by <name>" and a "Reaction button state: ..." button.
@@ -857,7 +954,8 @@ class ChromeDriver:
         if found.liked:
             return
         react = box.locator("button[aria-label^='Reaction button state']").first
-        react.click()
+        self._scroll(1, 100, 300)
+        self._click(react)
         self._pause(1, 2)
         if "no reaction" in (react.get_attribute("aria-label") or "").lower():
             raise ActionError("like didn't register")
@@ -865,13 +963,13 @@ class ChromeDriver:
     def comment(self, post: Post, text: str) -> None:
         box, _ = self._find_post(post)
         toggle = box.get_by_role("button", name="Comment", exact=True).first
-        toggle.click()
+        self._click(toggle)
         self._pause(1, 2)
         editor = box.locator("[contenteditable='true'][aria-label^='Text editor for creating comment']").first
         editor.wait_for()
         before = {box.locator("button").nth(i).evaluate("e => e.outerHTML.length + ':' + (e.getAttribute('componentkey') || '')")
                   for i in range(box.locator("button").count())}
-        editor.click()
+        self._click(editor)
         self._type_multiline(text)
         self._pause(1, 2)
         # The post button only appears once there's text. Use it only if exactly one new one showed up.
@@ -885,7 +983,7 @@ class ChromeDriver:
                 new.append(b)
         if len(new) != 1:
             raise ActionError("couldn't identify the button to post the comment (left typed, not posted)")
-        new[0].click()
+        self._click(new[0])
         self._pause(2, 3)
 
     def check(self, url: str) -> dict:
