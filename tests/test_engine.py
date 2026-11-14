@@ -1488,7 +1488,6 @@ class CrmTest(Base):
         def connect(*a, **k):
             opened.append(real(dbfile))
             return opened[-1]
-        self.addCleanup(lambda: [c.close() for c in opened])  # Windows can't delete an open database file
         with mock.patch.object(webapp.db, "connect", connect):
             c = TestClient(webapp.app, base_url=f"http://127.0.0.1:{webapp.PORT}")
             r = c.get(f"/status/export.xlsx?campaign={self.cid}")
@@ -1506,3 +1505,7 @@ class CrmTest(Base):
                          f"/leads/{self.lead('jane@x.com')['id']}/history", f"/campaigns/{self.cid}?tab=status",
                          f"/campaigns/{self.cid}?tab=settings"):
                 self.assertEqual(c.get(path).status_code, 200, path)
+        # The app's request threads opened these; drop them so Windows can delete the temp database.
+        import gc
+        opened.clear()
+        gc.collect()
