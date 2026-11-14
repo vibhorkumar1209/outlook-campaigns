@@ -12,7 +12,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo, available_timezones
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from jinja2 import TemplateError, TemplateSyntaxError
@@ -51,6 +51,11 @@ DEFAULT_SEQUENCE = [
 runner = Runner()
 app = FastAPI(docs_url=None, redoc_url=None)
 app.mount("/static", StaticFiles(directory=HERE / "static"), name="static")
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+def favicon():
+    return FileResponse(HERE / "static" / "favicon.ico", media_type="image/x-icon")
 templates = Jinja2Templates(directory=HERE / "templates")
 UPLOADS: dict[str, dict] = {}
 
