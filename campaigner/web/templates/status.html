@@ -4,17 +4,22 @@
 <header class="head">
   <div>
     <h1>Campaign Status <span class="meta">· {{ status_rows | length }} leads</span></h1>
-    <p class="sub">Your outreach tracker, kept up to date by the app: invite state, the date of every LinkedIn message and email, "Undelivered" for bounces, "(OOO)" for out-of-office replies. Lead Status and VM1–VM3 are yours to fill in; they save as you type.</p>
+    <p class="sub">Your outreach tracker. Emails and LinkedIn (invites, messages, likes, comments, replies) fill in by themselves: dates, "Undelivered" for bounces, "(OOO)" for out-of-office. Calls are logged by the lead's owner with <b>Log</b>; VM1–VM3, Calls, Last Call and Next Step come from those. <b>History</b> shows every communication with the person. Owner and Lead Status save as you change them.</p>
   </div>
   <div class="actions">
-    <form method="get" action="/status">
+    <form method="get" action="/status" class="actions">
       <select name="campaign" onchange="this.form.submit()" aria-label="Campaign">
         <option value="all" {{ 'selected' if not selected }}>All campaigns</option>
         {% for c in campaigns %}<option value="{{ c.id }}" {{ 'selected' if selected == c.id }}>{{ c.name }} ({{ c.status }})</option>{% endfor %}
       </select>
+      <select name="owner" onchange="this.form.submit()" aria-label="Owner">
+        <option value="">All owners</option><option value="none" {{ 'selected' if owner == 'none' }}>Unassigned</option>
+        {% for m in team %}<option value="{{ m.id }}" {{ 'selected' if owner == m.id | string }}>{{ m.name }}</option>{% endfor %}
+      </select>
     </form>
-    <a class="btn" href="/status/export.xlsx?campaign={{ selected or 'all' }}">Download Excel</a>
+    <a class="btn" href="/status/export.xlsx?campaign={{ selected or 'all' }}" title="Two sheets: Campaign Status and every communication">Download Excel</a>
     <a class="btn ghost" href="/status/export.csv?campaign={{ selected or 'all' }}">CSV</a>
+    <a class="btn ghost" href="/status/communications.csv?campaign={{ selected or 'all' }}">Communications CSV</a>
   </div>
 </header>
 <section class="card">

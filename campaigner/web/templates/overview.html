@@ -22,6 +22,27 @@
   {{ tile("Reply rate", (o.reply_rate ~ "%") if o.reply_rate is not none else "–", "of contacted leads") }}
 </section>
 
+{% if follow_ups %}
+<section class="card">
+  <div class="card-head"><h2>Follow-ups · next 7 days</h2><span class="meta">next steps set when calls, meetings and notes were logged</span></div>
+  <div class="tbl-wrap"><table class="t">
+    <thead><tr><th>Due</th><th>Lead</th><th>Next step</th><th>Owner</th><th>Last logged</th><th></th></tr></thead>
+    <tbody>
+    {% for f in follow_ups %}
+      <tr>
+        <td class="{{ 'bad' if f.overdue else ('warn' if f.today else 'meta') }}">{{ "Overdue · " if f.overdue }}{{ "Today" if f.today else f.next_step_at }}</td>
+        <td><a href="/leads/{{ f.lead_id }}">{{ f.first_name }} {{ f.last_name }}</a><div class="meta">{{ f.company }}</div></td>
+        <td>{{ f.next_step or "Follow up" }}</td>
+        <td class="meta">{{ f.owner or "Unassigned" }}</td>
+        <td class="meta">{{ f.kind | capitalize }}{% if f.outcome %} · {{ f.outcome }}{% endif %} · {{ f.at | ago }}</td>
+        <td><button class="btn sm" data-log data-lead="{{ f.lead_id }}" data-name="{{ f.first_name }} {{ f.last_name }}" data-company="{{ f.company }}">Log</button></td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+</section>
+{% endif %}
+
 <section class="card">
   <div class="card-head">
     <h2>Activity · last 14 days</h2>

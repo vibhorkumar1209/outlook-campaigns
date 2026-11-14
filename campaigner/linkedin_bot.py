@@ -423,7 +423,7 @@ def check_replies(conn, driver, candidates: list[dict], now: datetime, log) -> N
             continue
         reply = driver.thread_reply(lead["linkedin_url"], lead["sent_text"])
         if reply:
-            if engine.mark_replied(conn, lead["lead_id"], "linkedin", now, detail=reply[:200]):
+            if engine.mark_replied(conn, lead["lead_id"], "linkedin", now, detail=reply[:200], content=reply):
                 log(f"reply (LinkedIn) from {lead['first_name']} {lead['last_name']}: moved to Leads")
 
 

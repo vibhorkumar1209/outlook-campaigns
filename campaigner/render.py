@@ -120,3 +120,16 @@ def email_html(body: str, signature: str, ctx: dict, *, link: Callable[[str], st
     sig = render_text(signature, ctx)
     inner = text_to_html(render_text(body, ctx), link) + (text_to_html(sig, link) if sig else "")
     return WRAP.format(inner + (PIXEL.format(html.escape(pixel)) if pixel else ""))
+
+
+def plain_text(html: str) -> str:
+    """Readable text of an email body for the communications log (no tags, pixels or styles)."""
+    import html as _h
+    import re as _re
+
+    t = _re.sub(r"(?is)<(style|script|head)\b.*?</\1>", "", html or "")
+    t = _re.sub(r"(?i)<br\s*/?>|</(p|div|li|tr|h\d)>", "\n", t)
+    t = _re.sub(r"(?s)<[^>]+>", "", t)
+    t = _h.unescape(t).replace("\xa0", " ")
+    t = "\n".join(line.strip() for line in t.splitlines())
+    return _re.sub(r"\n{3,}", "\n\n", t).strip()

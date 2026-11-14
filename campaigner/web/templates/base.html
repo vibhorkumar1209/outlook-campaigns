@@ -18,6 +18,7 @@
         <a href="{{ href }}" class="{{ 'on' if on }}" {% if href == '/tasks' %}id="nav-tasks"{% endif %}>
           <span>{{ label }}</span>
           {% if href == "/tasks" and open_tasks %}<span class="badge">{{ open_tasks }}</span>{% endif %}
+          {% if href == "/" and follow_ups_due %}<span class="badge warn" title="Follow-ups due today or overdue">{{ follow_ups_due }}</span>{% endif %}
         </a>
       {% endfor %}
     </nav>
@@ -42,6 +43,7 @@
   </main>
 </div>
 <div id="tip" class="tip" hidden></div>
+{% include "_call_dialog.html" %}
 <script src="{{ asset('app.js') }}"></script>
 {% block scripts %}{% endblock %}
 </body>

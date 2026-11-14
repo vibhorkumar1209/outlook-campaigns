@@ -1,19 +1,31 @@
 {# Campaign Status table: status_cols, status_rows. Used by the Campaign Status page and the campaign tab. #}
     <div class="tbl-wrap status-wrap"><table class="t status-t">
-      <thead><tr>{% for k in status_cols %}<th>{{ k }}</th>{% endfor %}</tr></thead>
+      <thead><tr><th class="sticky-act"></th>{% for k in status_cols %}<th>{{ k }}</th>{% endfor %}</tr></thead>
       <tbody>
       {% for r in status_rows %}
         <tr>
+        <td class="sticky-act"><div class="row-act">
+          <button class="btn sm" data-log data-lead="{{ r.lead_id }}" data-name="{{ r.cells['Name'] }}" data-company="{{ r.cells['Company'] }}"
+                  data-phone="{{ r.phone }}" data-campaign="{{ r.campaign_id }}" data-owner="{{ r.owner_id or '' }}" title="Log a call, meeting or note">Log</button>
+          <button class="btn sm ghost" data-history="{{ r.lead_id }}" aria-expanded="false" title="Every email, LinkedIn message and call">History</button>
+        </div></td>
         {% for k in status_cols %}{% set v = r.cells[k] %}
           {% if k == "Name" %}<td><a href="/leads/{{ r.lead_id }}">{{ v }}</a></td>
           {% elif k == "LinkedIn" %}<td>{% if v %}<a href="{{ v }}" target="_blank" rel="noopener">profile</a>{% endif %}</td>
+          {% elif k == "Phone" %}<td class="meta">{% if v %}<a href="tel:{{ v | replace(' ', '') }}">{{ v }}</a>{% endif %}</td>
+          {% elif k == "Owner" %}<td><select class="cell-in" data-owner-of="{{ r.lead_id }}" aria-label="Owner of {{ r.cells['Name'] }}">
+              <option value="">Unassigned</option>{% for m in team %}<option value="{{ m.id }}" {{ 'selected' if r.owner_id == m.id }}>{{ m.name }}</option>{% endfor %}
+              {% if r.owner_id and r.owner_id not in team | map(attribute='id') | list %}<option selected value="{{ r.owner_id }}">{{ v }} (inactive)</option>{% endif %}
+            </select></td>
           {% elif k == "Lead Status" %}<td><input class="cell-in" data-tracker="{{ r.eid }}" data-field="lead_status" value="{{ r.manual_status }}" placeholder="{{ v if not r.manual_status }}" aria-label="Lead status for {{ r.cells['Name'] }}"></td>
-          {% elif k.startswith("VM") %}<td><input class="cell-in vm" data-tracker="{{ r.eid }}" data-field="vm" data-i="{{ k[2:] | int - 1 }}" value="{{ v }}" placeholder="date" aria-label="{{ k }} for {{ r.cells['Name'] }}"></td>
           {% elif k in ("LI Status",) %}<td class="{{ 'good' if v in ('Request Accepted', 'Already Connected') }}">{{ v }}</td>
+          {% elif k == "Next Step" %}<td class="{{ 'warn' if r.next_due }}">{{ v }}</td>
+          {% elif k == "Last Call" and v %}<td class="{{ 'good' if v.split(' · ', 1)[-1] in RESPONDED }}">{{ v }}</td>
           {% elif v == "Undelivered" %}<td class="bad">{{ v }}</td>
-          {% else %}<td class="{{ 'meta' if k in ('#', 'Phone', 'Country') }}">{{ v }}</td>{% endif %}
+          {% else %}<td class="{{ 'meta' if k in ('#', 'Country', 'Touches') }}">{{ v }}</td>{% endif %}
         {% endfor %}
         </tr>
+        <tr class="history-row" id="history-{{ r.lead_id }}-{{ loop.index }}" hidden><td colspan="{{ status_cols | length + 1 }}"><div class="history-box">Loading…</div></td></tr>
       {% endfor %}
       </tbody>
     </table></div>

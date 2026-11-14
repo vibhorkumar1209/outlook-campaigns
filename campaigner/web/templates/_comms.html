@@ -1,0 +1,29 @@
+{# Communications history: comms (from crm.communications), newest first. compact: inside a Campaign Status row. #}
+{% if comms %}
+<ul class="comms{{ ' compact' if compact }}">
+  {% for c in comms %}
+    <li class="cm {{ c.channel }} {{ c.direction }}">
+      <span class="cm-ic" aria-hidden="true">{{ {"email": "✉", "linkedin": "in", "call": "☎", "meeting": "◷", "note": "✎"}[c.channel] }}</span>
+      <div class="cm-body">
+        <div class="cm-head">
+          <b>{{ c.label }}</b>
+          <span class="meta">{{ "→ sent" if c.direction == "out" and c.channel in ("email", "linkedin") else ("← received" if c.direction == "in" else "") }}</span>
+          {% if c.outcome %}<span class="pill {{ 'good' if c.outcome in RESPONDED else 'muted' }}">{{ c.outcome }}</span>{% endif %}
+          {% if c.extra and c.channel == "email" %}<span class="pill info">{{ c.extra }}</span>{% endif %}
+          {% if c.campaign %}<span class="meta">· {{ c.campaign }}</span>{% endif %}
+          {% if c.by %}<span class="meta">· by {{ c.by }}</span>{% endif %}
+          {% if c.activity_id and not compact %}<button class="btn sm ghost" data-del-activity="{{ c.activity_id }}" title="Delete this entry">Delete</button>{% endif %}
+        </div>
+        {% if c.subject %}<div class="cm-subj">{{ c.subject }}</div>{% endif %}
+        {% if c.content %}
+          {% if c.content | length > 280 %}
+            <details><summary class="cm-text">{{ c.content[:280] }}…</summary><div class="cm-text">{{ c.content }}</div></details>
+          {% else %}<div class="cm-text">{{ c.content }}</div>{% endif %}
+        {% endif %}
+        {% if c.extra and c.channel == "linkedin" %}<div class="meta"><a href="{{ c.extra }}" target="_blank" rel="noopener">post ↗</a></div>{% endif %}
+      </div>
+      <span class="meta cm-at" title="{{ c.at | local('%Y-%m-%d %H:%M') }}">{{ c.at | local }}</span>
+    </li>
+  {% endfor %}
+</ul>
+{% else %}<div class="empty">No communications yet.</div>{% endif %}

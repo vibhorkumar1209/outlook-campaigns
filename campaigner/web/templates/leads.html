@@ -13,21 +13,26 @@
     {% endif %}
   </div>
   <div class="actions">
-    <form method="get"><input name="q" value="{{ q }}" placeholder="Search name, email, company" style="width:260px"></form>
+    <form method="get" class="actions"><input name="q" value="{{ q }}" placeholder="Search name, email, company" style="width:260px">
+      <select name="owner" onchange="this.form.submit()" aria-label="Owner">
+        <option value="">All owners</option><option value="none" {{ 'selected' if owner == 'none' }}>Unassigned</option>
+        {% for m in team %}<option value="{{ m.id }}" {{ 'selected' if owner == m.id | string }}>{{ m.name }}</option>{% endfor %}
+      </select></form>
     {% if stage != "lead" %}<a class="btn primary" href="/import">Import</a>{% endif %}
   </div>
 </header>
 {% if leads %}
 <section class="card"><div class="tbl-wrap"><table class="t">
   {% if stage == "lead" %}
-  <thead><tr><th>Name</th><th>Company</th><th>Replied</th><th>Via</th><th>Campaign</th><th>Reply</th><th>Email</th></tr></thead>
+  <thead><tr><th>Name</th><th>Company</th><th>Owner</th><th>Replied</th><th>Via</th><th>Campaign</th><th>Reply</th><th>Email</th></tr></thead>
   <tbody>
   {% for l in leads %}
     <tr>
       <td><a href="/leads/{{ l.id }}">{{ lead_name(l) }}</a><div class="meta">{{ l.title }}</div></td>
       <td>{{ l.company }}</td>
+      <td class="meta">{{ l.owner or "–" }}</td>
       <td class="meta">{{ (l.reply_at or l.became_lead_at) | ago if (l.reply_at or l.became_lead_at) else "–" }}</td>
-      <td>{% if l.reply_channel %}<span class="chip {{ 'email' if l.reply_channel == 'email' else 'linkedin' }}">{{ "Email" if l.reply_channel == "email" else "LinkedIn" }}</span>{% else %}<span class="meta">moved by you</span>{% endif %}</td>
+      <td>{% if l.reply_channel in ("email", "linkedin") %}<span class="chip {{ l.reply_channel }}">{{ "Email" if l.reply_channel == "email" else "LinkedIn" }}</span>{% elif l.reply_channel %}<span class="chip">{{ l.reply_channel | capitalize }}</span>{% else %}<span class="meta">moved by you</span>{% endif %}</td>
       <td>{{ l.reply_campaign or "–" }}</td>
       <td class="meta">{{ (l.reply_detail or "")[:70] }}</td>
       <td class="meta">{{ l.email or "–" }}</td>
@@ -35,12 +40,13 @@
   {% endfor %}
   </tbody>
   {% else %}
-  <thead><tr><th>Name</th><th>Company</th><th>Email</th><th>LinkedIn</th><th class="num">Campaigns</th><th>Latest status</th><th>Last touch</th></tr></thead>
+  <thead><tr><th>Name</th><th>Company</th><th>Owner</th><th>Email</th><th>LinkedIn</th><th class="num">Campaigns</th><th>Latest status</th><th>Last touch</th></tr></thead>
   <tbody>
   {% for l in leads %}
     <tr>
       <td><a href="/leads/{{ l.id }}">{{ lead_name(l) }}</a><div class="meta">{{ l.title }}</div></td>
       <td>{{ l.company }}</td>
+      <td class="meta">{{ l.owner or "–" }}</td>
       <td class="meta">{{ l.email or "–" }}</td>
       <td>{% if l.linkedin_url %}<a href="{{ l.linkedin_url }}" target="_blank" rel="noopener">profile</a> {{ pill(l.li_state) if l.li_state != "none" }}{% else %}<span class="meta">–</span>{% endif %}</td>
       <td class="num">{{ l.n_campaigns }}</td>

@@ -176,7 +176,14 @@
           {% if not senders %}<option value="">No mailbox connected yet</option>{% endif %}
         </select>
       </label>
-      <label class="f">Timezone (blank = this Mac)
+      <label class="f">Default owner (BDR)
+        <select name="owner_id">
+          <option value="">None</option>
+          {% for m in team %}<option value="{{ m.id }}" {{ 'selected' if c.owner_id == m.id }}>{{ m.name }} ({{ m.role }})</option>{% endfor %}
+        </select>
+        <span class="meta">Unassigned leads in this campaign, and new ones you import, go to this person.</span>
+      </label>
+      <label class="f">Timezone (blank = this {{ MACHINE }})
         <input name="timezone" value="{{ c.timezone or '' }}" list="zones" placeholder="e.g. Asia/Kolkata">
         <datalist id="zones">{% for z in zones %}<option value="{{ z }}">{% endfor %}</datalist>
       </label>

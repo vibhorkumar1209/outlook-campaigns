@@ -194,8 +194,11 @@ def campaign_status(conn, campaign_id: int | None, tz) -> tuple[list[str], list[
     """Columns and rows like a hand-kept tracker: one row per lead, a date per LinkedIn message and email.
     campaign_id None: every campaign, with a Campaign column."""
     day = lambda s: parse(s).astimezone(tz).strftime("%d-%b-%y") if s else ""  # noqa: E731
-    ens = rows(conn, f"""SELECT e.id eid, e.status, e.reply_channel, e.was_connected, e.voicemails, c.name campaign, l.*
+    from . import crm
+
+    ens = rows(conn, f"""SELECT e.id eid, e.campaign_id, e.status, e.reply_channel, e.was_connected, c.name campaign, tm.name owner, l.*
                          FROM enrollments e JOIN leads l ON l.id = e.lead_id JOIN campaigns c ON c.id = e.campaign_id
+                         LEFT JOIN team tm ON tm.id = l.owner_id
                          {"WHERE e.campaign_id = ?" if campaign_id else ""} ORDER BY c.id, e.id""",
                *([campaign_id] if campaign_id else []))
     ids = [e["eid"] for e in ens] or [0]
@@ -216,31 +219,42 @@ def campaign_status(conn, campaign_id: int | None, tz) -> tuple[list[str], list[
         elif out and ev["type"] == "auto_reply" and "OOO" not in out[-1]["text"]:
             out[-1]["text"] += " (OOO)"
     likes, comments, engage_state = _engagement(conn, ids, marks, day)
+    summ = crm.summaries(conn, campaign_id=campaign_id)
     n_li = max([2] + [len(v) for v in msgs.values()])
     n_em = max([2] + [len(v) for v in mails.values()])
     cols = ["#", *([] if campaign_id else ["Campaign"]), "Name", "First Name", "Last Name", "Designation", "Department", "Company", "Email", "Phone",
-            "Country", "LinkedIn", "Lead Status", "LI Status",
+            "Country", "LinkedIn", "Owner", "Lead Status", "LI Status",
             *[f"LI {_nth(i + 1)} Msg" for i in range(n_li)], "LI Likes", "LI Comments",
             *[f"EM{i + 1}" for i in range(n_em)],
-            *[f"VM{i + 1}" for i in range(N_VOICEMAILS)]]
+            *[f"VM{i + 1}" for i in range(N_VOICEMAILS)], "Calls", "Last Call", "Next Step", "Last Touch", "Touches"]
     out = []
     for n, e in enumerate(ens, start=1):
         extra = json.loads(e["data"] or "{}")
-        status = e["lead_status"] or (f"Replied ({'LinkedIn' if e['reply_channel'] == 'linkedin' else 'email'})"
-                                      if e["status"] == "replied" else "Unsubscribed" if e["dnc"] else "")
+        via = {"linkedin": "LinkedIn", "call": "call", "meeting": "meeting"}.get(e["reply_channel"], "email")
+        status = e["lead_status"] or (f"Replied ({via})" if e["status"] == "replied" else "Unsubscribed" if e["dnc"] else "")
+        sm = summ.get(e["id"], {})
+        lc, nx, last = sm.get("last_call"), sm.get("next"), sm.get("last")
         li = "Already Connected" if e["li_state"] == "connected" and e["was_connected"] == 1 else LI_STATUS[e["li_state"]]
         m, em = msgs.get(e["eid"], []), [x["text"] for x in mails.get(e["eid"], [])]
         li_cells = (m + [""] * n_li)[:n_li]
         if not m and e["li_state"] != "connected":
             li_cells[0] = "-"  # can't message them yet
-        vms = (json.loads(e["voicemails"] or "[]") + [""] * N_VOICEMAILS)[:N_VOICEMAILS]
+        vms = ([day(x) for x in sm.get("voicemails", [])] + [""] * N_VOICEMAILS)[:N_VOICEMAILS]
+        touches = " · ".join(f"{n} {k}" for k, n in (("email", sm.get("email_out", 0)), ("LI", sm.get("li_out", 0)),
+                                                     ("call", sm.get("calls", 0)),
+                                                     ("in", sm.get("email_in", 0) + sm.get("li_in", 0))) if n)
         values = [n, *([] if campaign_id else [e["campaign"]]), f"{e['first_name']} {e['last_name']}".strip(), e["first_name"], e["last_name"], e["title"],
                   extra.get("department", ""), e["company"], e["email"] or "", extra.get("phone", ""),
-                  extra.get("country", ""), e["linkedin_url"] or "", status, li,
+                  extra.get("country", ""), e["linkedin_url"] or "", e["owner"] or "", status, li,
                   *li_cells, _dates(likes.get(e["eid"], [])) or engage_state.get(e["eid"], {}).get("likes", ""),
                   _dates(comments.get(e["eid"], [])) or engage_state.get(e["eid"], {}).get("comments", ""),
-                  *(em + [""] * n_em)[:n_em], *vms]
-        out.append({"eid": e["eid"], "lead_id": e["id"], "manual_status": e["lead_status"],
+                  *(em + [""] * n_em)[:n_em], *vms, sm.get("calls", 0) or "",
+                  f"{day(lc['at'])} · {lc['outcome'] or 'logged'}" if lc else "",
+                  (f"{nx['text']}" + (f" · {nx['date']}" if nx["date"] else "")) if nx else "",
+                  f"{day(last['at'])} · {last['label']}" if last else "", touches]
+        out.append({"eid": e["eid"], "lead_id": e["id"], "manual_status": e["lead_status"], "owner_id": e["owner_id"],
+                    "phone": extra.get("phone", ""), "campaign_id": e.get("campaign_id"),
+                    "next_due": bool(nx and nx["date"] and nx["date"] <= datetime.now(tz).date().isoformat()),
                     "cells": dict(zip(cols, values))})
     return cols, out
 
