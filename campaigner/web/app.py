@@ -17,7 +17,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from jinja2 import TemplateError, TemplateSyntaxError
 
-from .. import ai, attachments, db, domain_health, engine, importer, linkedin_bot, osutil, stats, updater
+from .. import ai, attachments, crm, db, domain_health, engine, importer, linkedin_bot, osutil, stats, updater
 from ..db import iso, one, parse, rows, scalar, utcnow
 from ..render import ENV, email_html, lead_context, linkedin_text, render_text
 from ..runner import Runner, remove_sender, wants_awake
@@ -126,6 +126,10 @@ def page(request: Request, name: str, conn, **ctx):
         "last_tick": db.get_setting(conn, "last_tick"),
         "open_tasks": scalar(conn, OPEN_TASKS_SQL),
         "updates_behind": (runner.update_info or {}).get("behind", 0),
+        "team": crm.team(conn, active_only=True),
+        "me": crm.me(conn),
+        "OUTCOMES": crm.OUTCOMES, "RESPONDED": sorted(crm.RESPONDED),
+        "follow_ups_due": sum(1 for f in crm.follow_ups(conn, local_tz(), days=0)),
         "path": request.url.path,
         "msg": request.query_params.get("msg"),
         "err": request.query_params.get("err"),
@@ -158,7 +162,8 @@ def overview(request: Request):
     for c in camps:
         c["email"] = stats.email_stats(conn, campaign_id=c["id"])
     return page(request, "overview.html", conn, o=stats.overview(conn, tz), act=act, peak=peak, campaigns=camps,
-                replies=stats.recent_replies(conn), em=stats.email_stats(conn, since=utcnow() - timedelta(days=30)))
+                replies=stats.recent_replies(conn), em=stats.email_stats(conn, since=utcnow() - timedelta(days=30)),
+                follow_ups=crm.follow_ups(conn, tz))
 
 
 # ---------- LinkedIn queue ----------
@@ -312,7 +317,8 @@ def campaign_settings(cid: int, name: str = Form(...), timezone: str = Form(""),
                       window_days: list[str] = Form([]), window_start: str = Form("09:30"), window_end: str = Form("17:00"),
                       email_daily_cap: int = Form(40), li_daily_cap: int = Form(20), gap_min: int = Form(45),
                       gap_max: int = Form(120), signature: str = Form(""), sender: str = Form(""),
-                      track_opens: str = Form(""), track_clicks: str = Form(""), li_engage: str = Form("")):
+                      track_opens: str = Form(""), track_clicks: str = Form(""), li_engage: str = Form(""),
+                      owner_id: str = Form("")):
     conn = db.connect()
     get_campaign(conn, cid)
     url = f"/campaigns/{cid}"
@@ -334,7 +340,10 @@ def campaign_settings(cid: int, name: str = Form(...), timezone: str = Form(""),
                  (name.strip() or "Untitled", timezone or None, start, ",".join(window_days), window_start, window_end,
                   max(0, email_daily_cap), max(0, li_daily_cap), gap_min, gap_max, signature, sender or None,
                   1 if track_opens else 0, 1 if track_clicks else 0, 1 if li_engage else 0, cid))
-    return back(url, tab="settings", msg="Saved")
+    owner = int(owner_id) if owner_id.isdigit() and one(conn, "SELECT 1 FROM team WHERE id = ?", int(owner_id)) else None
+    conn.execute("UPDATE campaigns SET owner_id = ? WHERE id = ?", (owner, cid))
+    n = crm.assign_campaign_owner(conn, cid)
+    return back(url, tab="settings", msg="Saved" + (f". {n} unassigned lead(s) given to the campaign owner." if n else ""))
 
 
 @app.post("/api/campaigns/{cid}/rename")
@@ -535,7 +544,7 @@ async def tracker_fields(eid: int, request: Request):
 
 
 @app.get("/status")
-def status_page(request: Request, campaign: str = ""):
+def status_page(request: Request, campaign: str = "", owner: str = ""):
     conn = db.connect()
     campaigns = rows(conn, "SELECT id, name, status FROM campaigns ORDER BY status = 'active' DESC, id DESC")
     if campaign == "all":
@@ -545,12 +554,46 @@ def status_page(request: Request, campaign: str = ""):
     else:  # default: the newest active campaign
         selected = campaigns[0]["id"] if campaigns else None
     cols, items = stats.campaign_status(conn, selected, local_tz())
-    return page(request, "status.html", conn, campaigns=campaigns, selected=selected, status_cols=cols, status_rows=items)
+    if owner:
+        items = [r for r in items if (r["owner_id"] is None if owner == "none" else str(r["owner_id"]) == owner)]
+    return page(request, "status.html", conn, campaigns=campaigns, selected=selected, status_cols=cols, status_rows=items,
+                owner=owner)
 
 
 @app.get("/status/export.{fmt}")
 def status_export(fmt: str, campaign: str = "all"):
     return campaign_status_export(int(campaign) if campaign.isdigit() else None, fmt)
+
+
+COMM_COLS = ["Date", "Time", "Lead", "Company", "Owner", "Campaign", "Channel", "Direction", "Type", "Subject",
+             "Content", "Outcome", "By", "Seen"]
+
+
+def communication_rows(conn, cid: int | None) -> list[list]:
+    tz = local_tz()
+    leads = {r["id"]: r for r in rows(conn, """SELECT l.id, l.first_name, l.last_name, l.company, tm.name owner
+                                              FROM leads l LEFT JOIN team tm ON tm.id = l.owner_id""")}
+    out = []
+    for c in crm.communications(conn, campaign_id=cid):
+        l, at = leads.get(c["lead_id"], {}), parse(c["at"]).astimezone(tz)
+        out.append([at.strftime("%d-%b-%y"), at.strftime("%H:%M"), f"{l.get('first_name', '')} {l.get('last_name', '')}".strip(),
+                    l.get("company", ""), l.get("owner") or "", c["campaign"], c["channel"].capitalize(),
+                    "Outbound" if c["direction"] == "out" else "Inbound", c["label"], c["subject"],
+                    c["content"][:32000], c["outcome"], c["by"], c["extra"]])
+    return out
+
+
+@app.get("/status/communications.csv")
+def communications_export(campaign: str = "all"):
+    conn = db.connect()
+    cid = int(campaign) if campaign.isdigit() else None
+    name = re.sub(r"[^\w\- ]+", "", get_campaign(conn, cid)["name"]).strip() if cid else "All campaigns"
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(COMM_COLS)
+    w.writerows(communication_rows(conn, cid))
+    return Response("\ufeff" + buf.getvalue(), media_type="text/csv",
+                    headers={"Content-Disposition": f'attachment; filename="{name} - Communications.csv"'})
 
 
 @app.get("/campaigns/{cid}/status.{fmt}")
@@ -582,6 +625,20 @@ def campaign_status_export(cid: int | None, fmt: str):
     ws.freeze_panes = "C2"
     for col in ws.columns:
         ws.column_dimensions[col[0].column_letter].width = min(40, max(6, *(len(str(x.value or "")) + 2 for x in col)))
+    # Second sheet: every email, LinkedIn touch, call, meeting and note with these leads.
+    from openpyxl.styles import Alignment
+
+    cs = wb.create_sheet("Communications")
+    cs.append(COMM_COLS)
+    for cell in cs[1]:
+        cell.font, cell.fill = Font(bold=True, color="FFFFFF"), PatternFill("solid", fgColor="1F4E79")
+    for r in communication_rows(conn, cid):
+        cs.append(r)
+    cs.freeze_panes = "D2"
+    for letter, width in zip("ABCDEFGHIJKLMN", (10, 7, 22, 22, 14, 26, 10, 10, 20, 34, 70, 22, 22, 16)):
+        cs.column_dimensions[letter].width = width
+    for cell in cs["K"][1:]:
+        cell.alignment = Alignment(wrap_text=True, vertical="top")
     buf = io.BytesIO()
     wb.save(buf)
     return Response(buf.getvalue(), media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -590,32 +647,36 @@ def campaign_status_export(cid: int | None, fmt: str):
 
 # ---------- leads ----------
 
-def contacts_page(request: Request, stage: str, q: str):
+def contacts_page(request: Request, stage: str, q: str, owner: str = ""):
     conn = db.connect()
     like = f"%{q.strip()}%"
+    owner_sql = "" if not owner else " AND l.owner_id IS NULL" if owner == "none" else " AND l.owner_id = ?"
+    owner_arg = [int(owner)] if owner.isdigit() else []
     items = rows(conn, """
-        SELECT l.*, (SELECT COUNT(*) FROM enrollments e WHERE e.lead_id = l.id) n_campaigns,
+        SELECT l.*, tm.name owner, (SELECT COUNT(*) FROM enrollments e WHERE e.lead_id = l.id) n_campaigns,
           (SELECT status FROM enrollments e WHERE e.lead_id = l.id ORDER BY e.id DESC LIMIT 1) last_status,
           (SELECT MAX(at) FROM events ev WHERE ev.lead_id = l.id AND ev.type IN ('sent', 'task_done', 'reply')) last_touch,
           r.channel reply_channel, r.at reply_at, r.detail reply_detail, rc.name reply_campaign
         FROM leads l
         LEFT JOIN events r ON r.id = (SELECT MAX(id) FROM events WHERE lead_id = l.id AND type = 'reply')
         LEFT JOIN campaigns rc ON rc.id = r.campaign_id
+        LEFT JOIN team tm ON tm.id = l.owner_id
         WHERE l.stage = ? AND (? = '' OR l.first_name || ' ' || l.last_name LIKE ? OR l.email LIKE ? OR l.company LIKE ?)
-        ORDER BY COALESCE(l.became_lead_at, '') DESC, l.id DESC LIMIT 500""", stage, q.strip(), like, like, like)
+        """ + owner_sql + """
+        ORDER BY COALESCE(l.became_lead_at, '') DESC, l.id DESC LIMIT 500""", stage, q.strip(), like, like, like, *owner_arg)
     counts = {r["stage"]: r["n"] for r in rows(conn, "SELECT stage, COUNT(*) n FROM leads GROUP BY stage")}
-    return page(request, "leads.html", conn, leads=items, q=q, stage=stage, counts=counts)
+    return page(request, "leads.html", conn, leads=items, q=q, stage=stage, counts=counts, owner=owner)
 
 
 @app.get("/leads")
-def leads(request: Request, q: str = ""):
+def leads(request: Request, q: str = "", owner: str = ""):
     """People who responded: dropped from every sequence when they replied."""
-    return contacts_page(request, "lead", q)
+    return contacts_page(request, "lead", q, owner)
 
 
 @app.get("/prospects")
-def prospects(request: Request, q: str = ""):
-    return contacts_page(request, "prospect", q)
+def prospects(request: Request, q: str = "", owner: str = ""):
+    return contacts_page(request, "prospect", q, owner)
 
 
 @app.get("/leads/{lid}")
@@ -630,8 +691,46 @@ def lead(request: Request, lid: int):
     events = rows(conn, """SELECT ev.*, c.name campaign FROM events ev LEFT JOIN campaigns c ON c.id = ev.campaign_id
                            WHERE ev.lead_id = ? ORDER BY ev.at DESC, ev.id DESC""", lid)
     extras = json.loads(l["data"] or "{}")
+    summary = crm.summaries(conn, lead_id=lid).get(lid, {})
     return page(request, "lead.html", conn, l=l, enrollments=ens, events=events, extras=extras,
+                comms=crm.communications(conn, lead_id=lid), summary=summary,
                 active="/leads" if l["stage"] == "lead" else "/prospects")
+
+
+@app.get("/leads/{lid}/history")
+def lead_history(request: Request, lid: int):
+    """The communications list alone, for the Campaign Status row expander."""
+    conn = db.connect()
+    return templates.TemplateResponse(request, "_comms.html", {"comms": crm.communications(conn, lead_id=lid), "compact": True})
+
+
+@app.post("/api/leads/{lid}/activities")
+async def log_activity(lid: int, request: Request):
+    p = await request.json()
+    conn = db.connect()
+    if not one(conn, "SELECT id FROM leads WHERE id = ?", lid):
+        raise HTTPException(404)
+    try:
+        at = crm.parse_local(p.get("at") or "", local_tz())
+        if at and at > utcnow() + timedelta(minutes=5):
+            raise ValueError("That time is in the future; use Next step for planned calls")
+        dur = str(p.get("duration_min") or "").strip()
+        aid = crm.log_activity(
+            conn, lid, kind=p.get("kind") or "call", at=at, outcome=p.get("outcome") or "",
+            duration_min=int(dur) if dur.isdigit() else None, notes=p.get("notes") or "",
+            next_step=p.get("next_step") or "", next_step_at=p.get("next_step_at") or None,
+            by_id=int(p["by_id"]) if str(p.get("by_id") or "").isdigit() else None,
+            campaign_id=int(p["campaign_id"]) if str(p.get("campaign_id") or "").isdigit() else None,
+            stop_sequences=bool(p.get("stop_sequences")))
+    except ValueError as ex:
+        raise HTTPException(422, str(ex))
+    return {"ok": True, "id": aid}
+
+
+@app.post("/api/activities/{aid}/delete")
+def delete_activity(aid: int):
+    crm.delete_activity(db.connect(), aid)
+    return {"ok": True}
 
 
 @app.post("/api/leads/{lid}")
@@ -664,6 +763,11 @@ async def lead_action(lid: int, request: Request):
     elif act == "stop_all":
         for e in rows(conn, "SELECT id FROM enrollments WHERE lead_id = ?", lid):
             engine.stop_enrollment(conn, e["id"], now=now)
+    elif act == "owner":
+        try:
+            crm.set_owner(conn, lid, int(p["owner_id"]) if str(p.get("owner_id") or "").isdigit() else None)
+        except ValueError as ex:
+            raise HTTPException(422, str(ex))
     elif act == "update":
         email = (p.get("email") or "").strip().lower() or None
         li = importer.normalize_linkedin(p.get("linkedin_url") or "") if p.get("linkedin_url") else None
@@ -799,7 +903,35 @@ def settings(request: Request):
                 tick_minutes=os.environ.get("OC_TICK_MINUTES", "10"),
                 keep_awake=db.get_setting(conn, "keep_awake", True), awake_on=runner.awake.on,
                 update=runner.update_info or updater.status(fetch=False), supervised=osutil.supervised(),
-                restarting=runner.restarting)
+                restarting=runner.restarting, team_all=crm.team(conn), roles=crm.ROLES,
+                owned={r["owner_id"]: r["n"] for r in rows(conn, "SELECT owner_id, COUNT(*) n FROM leads GROUP BY owner_id")})
+
+
+@app.post("/settings/team")
+def settings_team_add(name: str = Form(""), email: str = Form(""), role: str = Form("BDR")):
+    conn = db.connect()
+    try:
+        mid = crm.add_member(conn, name, email, role)
+    except ValueError as ex:
+        return back("/settings", err=str(ex))
+    if not crm.me(conn):
+        db.set_setting(conn, "crm_me", mid)
+    return back("/settings", msg=f"Added {name.strip()} to the team")
+
+
+@app.post("/settings/team/{mid}")
+def settings_team_update(mid: int, action: str = Form(...)):
+    conn = db.connect()
+    m = one(conn, "SELECT * FROM team WHERE id = ?", mid)
+    if not m:
+        raise HTTPException(404)
+    if action == "me":
+        db.set_setting(conn, "crm_me", mid)
+        return back("/settings", msg=f"This computer is used by {m['name']}")
+    if action in ("deactivate", "activate"):
+        conn.execute("UPDATE team SET active = ? WHERE id = ?", (1 if action == "activate" else 0, mid))
+        return back("/settings", msg=f"{m['name']} {'is active again' if action == 'activate' else 'is inactive: kept on past calls, not offered for new ones'}")
+    raise HTTPException(400)
 
 
 @app.post("/settings/update")

@@ -19,6 +19,7 @@ FIELDS = {
     "company": "Company",
     "title": "Title",
     "linkedin_url": "LinkedIn URL",
+    "owner": "Owner (assigned to)",
     # Optional history, so leads you've already worked outside the app start at the right step.
     "lead_status": "History: lead status",
     "li_status": "History: LinkedIn status",
@@ -35,6 +36,7 @@ GUESS = {
     "name": ["name", "full_name", "fullname", "contact_name", "contact", "person"],
     "company": ["company", "company_name", "organization", "organisation", "account", "account_name", "employer"],
     "title": ["title", "job_title", "position", "role", "designation", "headline"],
+    "owner": ["owner", "lead_owner", "assigned_to", "assignee", "bdr", "sdr", "rep", "sales_rep"],
     "lead_status": ["lead_status"],
     "li_status": ["li_status", "linkedin_status", "connection_status"],
     "li_msg_1": ["li_1st_msg", "li_msg_1", "li_message_1", "linkedin_message_1", "li_msg1"],
@@ -133,6 +135,7 @@ def import_rows(conn, rows: list[dict], mapping: dict[str, str], campaign_id: in
     summary = {"created": 0, "updated": 0, "enrolled": 0, "already_enrolled": 0, "not_enrolled": 0,
                "skipped_rows": 0, "skipped": []}
     mapped = {v for v in mapping.values() if v}
+    owners: dict[str, int] = {}
     conn.execute("BEGIN")
     for n, r in enumerate(rows, start=2):
         val = {f: r.get(col, "").strip() if col else "" for f, col in mapping.items()}
@@ -186,6 +189,10 @@ def import_rows(conn, rows: list[dict], mapping: dict[str, str], campaign_id: in
             lead_id = cur.lastrowid
             summary["created"] += 1
 
+        if (val.get("owner") or "").strip():
+            oid = _owner_id(conn, val["owner"].strip(), owners)
+            conn.execute("UPDATE leads SET owner_id = ? WHERE id = ?", (oid, lead_id))
+
         if campaign_id:
             why = lead and _keep_out(conn, lead_id, campaign_id)
             if why:
@@ -207,5 +214,22 @@ def import_rows(conn, rows: list[dict], mapping: dict[str, str], campaign_id: in
                         summary["skipped"].append(f"row {n}: {note}")
             else:
                 summary["already_enrolled"] += 1
+    if campaign_id:
+        from . import crm
+
+        crm.assign_campaign_owner(conn, campaign_id)  # anyone still unassigned gets the campaign's owner
     conn.execute("COMMIT")
+    if owners:
+        summary["owners"] = sorted(owners)
     return summary
+
+
+def _owner_id(conn, name: str, cache: dict) -> int:
+    """Team member by name or email (case-insensitive); added to the team if new."""
+    key = name.lower()
+    if key not in cache:
+        m = one(conn, "SELECT id FROM team WHERE lower(name) = ? OR (email != '' AND lower(email) = ?)", key, key)
+        cache[key] = m["id"] if m else conn.execute(
+            "INSERT INTO team (name, email, role, created_at) VALUES (?, ?, 'BDR', ?)",
+            (name[:80], name if "@" in name else "", iso(utcnow()))).lastrowid
+    return cache[key]

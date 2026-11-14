@@ -697,7 +697,7 @@ class HistoryImportTest(Base):
                          ("Request Accepted", "09-Oct-26", "Undelivered"))
         self.assertEqual((cells["ed@x.com"]["LI 1st Msg"], cells["ed@x.com"]["EM1"]), ("-", "12-Oct-26 (OOO)"))
         self.assertEqual(cells["fa@x.com"]["Lead Status"], "Demo Scheduled")
-        self.assertEqual(cols[-3:], ["VM1", "VM2", "VM3"])
+        self.assertEqual(cols[-8:], ["VM1", "VM2", "VM3", "Calls", "Last Call", "Next Step", "Last Touch", "Touches"])
         all_cols, all_rows = stats.campaign_status(self.conn, None, timezone.utc)   # every campaign
         self.assertEqual(all_cols[:3], ["#", "Campaign", "Name"])
         self.assertEqual({r["cells"]["Campaign"] for r in all_rows}, {"c", "hist"})
@@ -1387,3 +1387,117 @@ class ClassifyTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CrmTest(Base):
+    def lead(self, email):
+        return one(self.conn, "SELECT * FROM leads WHERE email = ?", email)
+
+    def test_communications_merge_email_linkedin_and_calls(self):
+        from campaigner import crm
+        self.tick(MON)
+        t = self.task("jane@x.com")
+        engine.complete_task(self.conn, t["id"], "done", "Hi Jane!", now=MON)
+        self.tick(MON + timedelta(days=1))                                   # emails go out
+        jane = self.lead("jane@x.com")
+        sent = one(self.conn, "SELECT body FROM sends WHERE lead_id = ?", jane["id"])
+        self.assertEqual(sent["body"], "Hello Jane")                         # plain-text copy kept for the log
+        self.g.inbox.append(mail("jane@x.com", "Re: Hi Acme", cid=self.conv("jane@x.com"), at=MON + timedelta(days=2),
+                                 preview="Sounds good, call me Thursday"))
+        self.tick(MON + timedelta(days=2, hours=1))
+        crm.log_activity(self.conn, jane["id"], kind="call", at=MON + timedelta(days=3), outcome="Left voicemail",
+                         notes="rang twice")
+        comms = crm.communications(self.conn, lead_id=jane["id"])
+        got = [(c["channel"], c["direction"], c["label"]) for c in comms]
+        self.assertEqual(got[0], ("call", "out", "Call"))
+        self.assertIn(("email", "in", "Email reply"), got)
+        self.assertIn(("linkedin", "out", "LinkedIn invite"), got)
+        self.assertIn(("email", "out", "Email · step 2"), got)
+        reply = next(c for c in comms if c["label"] == "Email reply")
+        self.assertEqual(reply["content"], "Sounds good, call me Thursday")
+        invite = next(c for c in comms if c["label"] == "LinkedIn invite")
+        self.assertEqual((invite["content"], invite["by"]), ("Hi Jane!", "you"))
+        s = crm.summaries(self.conn, lead_id=jane["id"])[jane["id"]]
+        self.assertEqual((s["email_out"], s["email_in"], s["li_out"], s["calls"]), (1, 1, 1, 1))
+        self.assertEqual(len(s["voicemails"]), 1)
+
+    def test_call_that_connects_stops_sequences_and_sets_next_step(self):
+        from campaigner import crm
+        bdr = crm.add_member(self.conn, "Priya", "priya@co.com", "BDR")
+        bob = self.lead("bob@x.com")
+        crm.log_activity(self.conn, bob["id"], kind="call", outcome="Meeting booked", notes="Demo on Tue",
+                         next_step="Send deck", next_step_at="2026-10-21", by_id=bdr, stop_sequences=True, at=MON)
+        e = self.enr("bob@x.com")
+        self.assertEqual((e["status"], e["reply_channel"]), ("replied", "call"))
+        lead = self.lead("bob@x.com")
+        self.assertEqual((lead["stage"], lead["lead_status"]), ("lead", "Meeting Booked"))
+        s = crm.summaries(self.conn, lead_id=bob["id"])[bob["id"]]
+        self.assertEqual(s["next"], {"text": "Send deck", "date": "2026-10-21"})
+        crm.log_activity(self.conn, bob["id"], kind="note", notes="Deck sent", at=MON + timedelta(hours=1))
+        self.assertIsNone(crm.summaries(self.conn, lead_id=bob["id"])[bob["id"]]["next"])  # latest log replaces it
+        with self.assertRaises(ValueError):
+            crm.log_activity(self.conn, bob["id"], kind="call", outcome="Telepathy")
+
+    def test_follow_ups_due(self):
+        from campaigner import crm
+        jane = self.lead("jane@x.com")
+        today = datetime.now(timezone.utc).date()
+        crm.log_activity(self.conn, jane["id"], kind="call", outcome="No answer", next_step="Try again",
+                         next_step_at=(today - timedelta(days=1)).isoformat())
+        due = crm.follow_ups(self.conn, timezone.utc)
+        self.assertEqual([(d["lead_id"], d["overdue"]) for d in due], [(jane["id"], True)])
+        crm.log_activity(self.conn, jane["id"], kind="call", outcome="No answer",
+                         next_step_at=(today + timedelta(days=30)).isoformat())
+        self.assertEqual(crm.follow_ups(self.conn, timezone.utc), [])          # rescheduled beyond the window
+
+    def test_owners_campaign_default_and_import_column(self):
+        from campaigner import crm
+        a = crm.add_member(self.conn, "Alex")
+        self.conn.execute("UPDATE campaigns SET owner_id = ? WHERE id = ?", (a, self.cid))
+        self.assertEqual(crm.assign_campaign_owner(self.conn, self.cid), 2)
+        self.assertEqual(self.lead("jane@x.com")["owner_id"], a)
+        importer.import_rows(self.conn, [{"Email": "cy@x.com", "Name": "Cy Z", "Owner": "Sam Lee"},
+                                         {"Email": "di@x.com", "Name": "Di Q", "Owner": "sam lee"}],
+                             importer.guess_mapping(["Email", "Name", "Owner"]), self.cid)
+        sam = one(self.conn, "SELECT id FROM team WHERE name = 'Sam Lee'")["id"]
+        self.assertEqual({self.lead("cy@x.com")["owner_id"], self.lead("di@x.com")["owner_id"]}, {sam})
+        self.assertEqual(scalar(self.conn, "SELECT COUNT(*) FROM team"), 2)     # matched case-insensitively
+        cols, items = stats.campaign_status(self.conn, self.cid, timezone.utc)
+        owners = {r["cells"]["Name"]: r["cells"]["Owner"] for r in items}
+        self.assertEqual((owners["Jane Doe"], owners["Cy Z"]), ("Alex", "Sam Lee"))
+
+    def test_old_voicemail_cells_become_calls(self):
+        e = self.enr("jane@x.com")
+        self.conn.execute("UPDATE enrollments SET voicemails = ? WHERE id = ?", (json.dumps(["03-Nov-26", "left msg"]), e["id"]))
+        db.set_setting(self.conn, "voicemails_to_calls", False)
+        db._voicemails_to_calls(self.conn)
+        got = rows(self.conn, "SELECT outcome, notes, at FROM activities ORDER BY id")
+        self.assertEqual([g["outcome"] for g in got], ["Left voicemail"] * 2)
+        self.assertTrue(got[0]["at"].startswith("2026-11-03"))
+        self.assertEqual(got[1]["notes"], "logged as: left msg")
+
+    def test_status_export_has_communications_sheet(self):
+        from fastapi.testclient import TestClient
+        from campaigner.web import app as webapp
+        from openpyxl import load_workbook
+        import io
+        from campaigner import crm
+        crm.log_activity(self.conn, self.lead("jane@x.com")["id"], kind="call", outcome="No answer")
+        real, dbfile = db.connect, Path(self.tmp.name) / "t.db"
+        with mock.patch.object(webapp.db, "connect", lambda *a, **k: real(dbfile)):
+            c = TestClient(webapp.app, base_url=f"http://127.0.0.1:{webapp.PORT}")
+            r = c.get(f"/status/export.xlsx?campaign={self.cid}")
+            self.assertEqual(r.status_code, 200)
+            wb = load_workbook(io.BytesIO(r.content))
+            self.assertEqual(wb.sheetnames, ["Campaign Status", "Communications"])
+            ws = wb["Communications"]
+            self.assertEqual([x.value for x in ws[1]][:3], ["Date", "Time", "Lead"])
+            self.assertEqual(ws.cell(2, 7).value, "Call")
+            r = c.post(f"/api/leads/{self.lead('bob@x.com')['id']}/activities",
+                       json={"kind": "call", "outcome": "No answer", "at": ""},
+                       headers={"Origin": f"http://127.0.0.1:{webapp.PORT}"})
+            self.assertEqual(r.status_code, 200, r.text)
+            for path in ("/status", f"/leads/{self.lead('jane@x.com')['id']}", "/", "/settings", "/leads", "/prospects",
+                         f"/leads/{self.lead('jane@x.com')['id']}/history", f"/campaigns/{self.cid}?tab=status",
+                         f"/campaigns/{self.cid}?tab=settings"):
+                self.assertEqual(c.get(path).status_code, 200, path)

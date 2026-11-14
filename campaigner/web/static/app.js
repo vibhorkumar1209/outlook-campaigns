@@ -204,17 +204,122 @@ $$("[data-rename]").forEach((b) => b.addEventListener("click", () => {
   input.addEventListener("blur", () => finish(true));
 }));
 
-// Campaign Status: Lead Status and VM1..VM3 save as you type.
+// Campaign Status: Lead Status saves as you type.
 $$("[data-tracker]").forEach((inp) => {
   let timer;
   inp.addEventListener("input", () => {
     clearTimeout(timer);
     timer = setTimeout(async () => {
       const eid = inp.dataset.tracker;
-      const body = inp.dataset.field === "lead_status" ? { lead_status: inp.value }
-        : { voicemails: $$(`[data-tracker="${eid}"][data-field="vm"]`).map((x) => x.value) };
+      const body = { lead_status: inp.value };
       try { await api(`/api/enrollments/${eid}/tracker`, body); inp.classList.remove("err"); }
       catch (err) { inp.classList.add("err"); toast(err.message, true); }
     }, 500);
   });
+});
+
+// ---------- CRM ----------
+
+// Owner: Campaign Status cells and the lead page's "Assigned to".
+$$("[data-owner-of]").forEach((sel) => sel.addEventListener("change", async () => {
+  try {
+    await api(`/api/leads/${sel.dataset.ownerOf}`, { action: "owner", owner_id: sel.value });
+    // The same person can appear in several campaigns' rows: keep them in step.
+    $$(`[data-owner-of="${sel.dataset.ownerOf}"]`).forEach((o) => { o.value = sel.value; });
+    $$(`[data-log][data-lead="${sel.dataset.ownerOf}"]`).forEach((b) => { b.dataset.owner = sel.value; });
+    toast("Owner saved");
+  } catch (err) { toast(err.message, true); }
+}));
+
+// Campaign Status: History expands every communication with the person under their row.
+$$("[data-history]").forEach((b) => b.addEventListener("click", async () => {
+  const row = b.closest("tr").nextElementSibling;
+  const open = row.hidden;
+  row.hidden = !open;
+  b.setAttribute("aria-expanded", String(open));
+  b.textContent = open ? "Hide" : "History";
+  if (open) {
+    try {
+      const r = await fetch(`/leads/${b.dataset.history}/history`);
+      $(".history-box", row).innerHTML = await r.text();
+    } catch (err) { $(".history-box", row).textContent = "Couldn't load: " + err.message; }
+  }
+}));
+
+// Log a call / meeting / note.
+const dlg = $("#log-dlg");
+if (dlg) {
+  const form = $("#log-form");
+  const pad = (n) => String(n).padStart(2, "0");
+  const nowLocal = () => {
+    const d = new Date();
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  };
+  const responded = new Set(JSON.parse(dlg.dataset.responded || "[]"));
+  const syncOutcome = () => {
+    form.stop_sequences.checked = form.kind.value !== "note" && responded.has(form.outcome.value);
+  };
+  const syncKind = () => {
+    const kind = form.kind.value;
+    $("#log-title").textContent = { call: "Log a call", meeting: "Log a meeting", note: "Add a note" }[kind];
+    $$("[data-for]", form).forEach((el) => { el.hidden = !el.dataset.for.split(" ").includes(kind); });
+    $$("option[data-kind]", form.outcome).forEach((o) => {
+      o.hidden = o.disabled = !o.dataset.kind.split(" ").includes(kind);
+    });
+    const cur = form.outcome.selectedOptions[0];
+    if (!cur || cur.hidden) form.outcome.value = "";  // always a deliberate choice, never a default outcome
+    syncOutcome();
+  };
+  $$("input[name=kind]", form).forEach((r) => r.addEventListener("change", syncKind));
+  form.outcome.addEventListener("change", syncOutcome);
+
+  document.addEventListener("click", (e) => {
+    const b = e.target.closest("[data-log]");
+    if (!b) return;
+    form.reset();
+    form.lead.value = b.dataset.lead;
+    form.campaign_id.value = b.dataset.campaign || "";
+    form.at.value = nowLocal();
+    form.by_id.value = dlg.dataset.me || b.dataset.owner || "";
+    $("#log-who").textContent = [b.dataset.name, b.dataset.company].filter(Boolean).join(" · ");
+    const phone = b.dataset.phone || "";
+    const ph = $("#log-phone");
+    ph.textContent = "";
+    if (phone) {
+      const a = document.createElement("a");
+      a.href = "tel:" + phone.replace(/\s+/g, "");
+      a.textContent = "☎ " + phone;
+      ph.appendChild(a);
+    }
+    syncKind();
+    dlg.showModal();
+  });
+
+  form.addEventListener("submit", async (e) => {
+    if (e.submitter && e.submitter.value === "cancel") return;
+    e.preventDefault();
+    const kind = form.kind.value;
+    if (kind !== "note" && !form.outcome.value) { toast("Pick an outcome", true); form.outcome.focus(); return; }
+    const body = {
+      kind, at: form.at.value, outcome: kind === "note" ? "" : form.outcome.value,
+      duration_min: kind === "note" ? "" : form.duration_min.value, notes: form.notes.value,
+      next_step: form.next_step.value, next_step_at: form.next_step_at.value, by_id: form.by_id.value,
+      campaign_id: form.campaign_id.value, stop_sequences: kind !== "note" && form.stop_sequences.checked,
+    };
+    $("#log-save").disabled = true;
+    try {
+      await api(`/api/leads/${form.lead.value}/activities`, body);
+      dlg.close();
+      toast("Logged");
+      setTimeout(() => location.reload(), 400);
+    } catch (err) { toast(err.message, true); }
+    finally { $("#log-save").disabled = false; }
+  });
+}
+
+document.addEventListener("click", async (e) => {
+  const b = e.target.closest("[data-del-activity]");
+  if (!b || !confirm("Delete this entry? This can't be undone.")) return;
+  try { await api(`/api/activities/${b.dataset.delActivity}/delete`); location.reload(); }
+  catch (err) { toast(err.message, true); }
 });

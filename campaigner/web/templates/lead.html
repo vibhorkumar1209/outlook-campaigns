@@ -14,6 +14,8 @@
     <p class="sub">{{ l.title }}{% if l.title and l.company %} · {% endif %}{{ l.company }}</p>
   </div>
   <div class="actions">
+    <button class="btn primary" data-log data-lead="{{ l.id }}" data-name="{{ lead_name(l) }}" data-company="{{ l.company }}"
+            data-phone="{{ extras.get('phone', '') }}" data-owner="{{ l.owner_id or '' }}">Log call / note</button>
     {% if l.linkedin_url %}<a class="btn" href="{{ l.linkedin_url }}" target="_blank" rel="noopener">LinkedIn ↗</a>{% endif %}
     {% if l.li_state != "connected" and l.linkedin_url %}<button class="btn" data-lead-act="connected" data-lead="{{ l.id }}">Mark connected</button>{% endif %}
     <button class="btn" data-lead-act="replied" data-channel="linkedin" data-lead="{{ l.id }}" data-ask="Mark as replied on LinkedIn? This stops all their sequences.">Replied on LinkedIn</button>
@@ -31,8 +33,14 @@
 
 {% if l.email_bounced %}<div class="flash err">Email to <b>{{ l.email }}</b> bounced, so email steps are skipped for this person while LinkedIn steps carry on. Fix the address under Details and later emails go out normally.</div>{% endif %}
 <div class="grid2">
+  <div class="stack-y">
   <section class="card">
-    <div class="card-head"><h2>Timeline</h2></div>
+    <div class="card-head"><h2>Communications</h2><span class="meta">emails and LinkedIn log themselves; calls, meetings and notes are logged by the owner</span></div>
+    {% include "_comms.html" %}
+  </section>
+
+  <details class="card">
+    <summary><b>Activity log</b> <span class="meta">· everything the app did, step by step ({{ events | length }})</span></summary>
     {% if events %}
     <ul class="tl">
       {% for ev in events %}
@@ -52,9 +60,32 @@
       {% endfor %}
     </ul>
     {% else %}<div class="empty">Nothing yet.</div>{% endif %}
-  </section>
+
+  </details>
+  </div>
 
   <div class="stack-y">
+    <section class="card">
+      <div class="card-head"><h2>Owner &amp; follow-up</h2></div>
+      <div class="stack-y" style="gap:10px">
+        <label class="f">Assigned to
+          <select data-owner-of="{{ l.id }}">
+            <option value="">Unassigned</option>
+            {% for m in team %}<option value="{{ m.id }}" {{ 'selected' if l.owner_id == m.id }}>{{ m.name }} ({{ m.role }})</option>{% endfor %}
+          </select>
+        </label>
+        {% if extras.get('phone') %}<div>Phone: <a href="tel:{{ extras.phone | replace(' ', '') }}">{{ extras.phone }}</a></div>{% endif %}
+        {% if summary.next %}<div class="{{ 'flash' if summary.next.date }}">Next step: <b>{{ summary.next.text }}</b>{% if summary.next.date %} · due {{ summary.next.date }}{% endif %}</div>{% endif %}
+        <dl class="kv">
+          <dt>Emails</dt><dd>{{ summary.email_out or 0 }} sent · {{ summary.email_in or 0 }} received</dd>
+          <dt>LinkedIn</dt><dd>{{ summary.li_out or 0 }} sent · {{ summary.li_in or 0 }} received</dd>
+          <dt>Calls</dt><dd>{{ summary.calls or 0 }}{% if summary.last_call %} · last: {{ summary.last_call.outcome or "logged" }}, {{ summary.last_call.at | ago }}{% endif %}</dd>
+          <dt>Meetings</dt><dd>{{ summary.meetings or 0 }}</dd>
+          <dt>Last touch</dt><dd>{% if summary.last %}{{ summary.last.label }}, {{ summary.last.at | ago }}{% else %}–{% endif %}</dd>
+        </dl>
+      </div>
+    </section>
+
     <section class="card">
       <div class="card-head"><h2>Campaigns</h2></div>
       {% if enrollments %}

@@ -22,7 +22,7 @@ from jinja2 import TemplateError
 from . import attachments, db
 from .db import event, iso, one, parse, rows, scalar, utcnow
 from .graph import AuthError, GraphError, NetworkError
-from .render import email_html, lead_context, linkedin_text, render_text
+from .render import email_html, lead_context, linkedin_text, plain_text, render_text
 from .tracking import BOT_UA, MACHINE_WINDOW_S
 
 CHANNELS = {"email": "Email", "li_view": "View profile", "li_connect": "Connect", "li_message": "LinkedIn message"}
@@ -161,7 +161,7 @@ def close_tasks(conn, enrollment_id: int, now: datetime) -> None:
 
 
 def mark_replied(conn, lead_id: int, channel: str, at: datetime, *, enrollment: dict | None = None,
-                 detail: str | None = None) -> bool:
+                 detail: str | None = None, content: str | None = None) -> bool:
     """Stop the lead in every campaign (the one that got the reply is 'replied', others 'stopped') and move them
     to Leads. Still counts for someone whose sequences already ended (e.g. bounced). False if nothing changed."""
     ens = rows(conn, "SELECT * FROM enrollments WHERE lead_id = ? AND status IN ('pending', 'active', 'done')", lead_id)
@@ -180,7 +180,7 @@ def mark_replied(conn, lead_id: int, channel: str, at: datetime, *, enrollment: 
                          (f"replied via {channel} in another campaign", e["id"]))
         close_tasks(conn, e["id"], at)
     event(conn, lead_id, "reply", enrollment=enrollment, channel=channel,
-          step_pos=enrollment["step_pos"] if enrollment else None, detail=detail, at=at)
+          step_pos=enrollment["step_pos"] if enrollment else None, detail=detail, at=at, content=content)
     # They responded: out of every sequence (above) and into Leads.
     conn.execute("UPDATE leads SET stage = 'lead', became_lead_at = COALESCE(became_lead_at, ?) WHERE id = ?",
                  (iso(at), lead_id))
@@ -553,11 +553,12 @@ def check_lead_email(conn, graph, es: list[dict], log) -> bool:
             at = iso(parse(m["receivedDateTime"]))
             if not scalar(conn, "SELECT 1 FROM events WHERE lead_id = ? AND type = 'auto_reply' AND at = ?", lead_id, at):
                 event(conn, lead_id, "auto_reply", enrollment=e, channel="email", step_pos=e["step_pos"],
-                      detail=m.get("subject"), at=parse(at))
+                      detail=m.get("subject"), at=parse(at), content=m.get("bodyPreview"))
                 log(f"automatic reply from {e['email']} ({m.get('subject')}): sequence continues")
     if reply:
         m, e = reply
-        mark_replied(conn, e["lead_id"], "email", parse(m["receivedDateTime"]), enrollment=e, detail=m.get("subject"))
+        mark_replied(conn, e["lead_id"], "email", parse(m["receivedDateTime"]), enrollment=e, detail=m.get("subject"),
+                     content=m.get("bodyPreview"))
         log(f"reply (email) from {e['email']}")
         return True
     if bounce:
@@ -574,7 +575,7 @@ def check_lead_email(conn, graph, es: list[dict], log) -> bool:
         conn.execute("UPDATE leads SET email_bounced = 1 WHERE id = ?", (e["lead_id"],))
         conn.execute("UPDATE enrollments SET note = 'email bounced' WHERE id = ?", (e["id"],))
         event(conn, e["lead_id"], "bounce", enrollment=e, channel="email", step_pos=e["step_pos"],
-              detail=m.get("subject"), at=at)
+              detail=m.get("subject"), at=at, content=m.get("bodyPreview"))
         log(f"bounce for {e['email']}: email steps skipped until the address is fixed; LinkedIn steps continue")
         return True
     return False
@@ -632,7 +633,8 @@ def check_linkedin(conn, boxes: Mailboxes, now: datetime, log) -> None:
                 continue
             if kind == "connected" and set_connected(conn, lead["id"], at):
                 log(f"LinkedIn: {full} accepted")
-            elif kind == "message" and mark_replied(conn, lead["id"], "linkedin", at, detail=m.get("subject")):
+            elif kind == "message" and mark_replied(conn, lead["id"], "linkedin", at, detail=m.get("subject"),
+                                                    content=m.get("bodyPreview")):
                 log(f"reply (LinkedIn) from {full}")
     db.set_setting(conn, "li_cursor", max(m["receivedDateTime"] for m in msgs))
 
@@ -949,10 +951,10 @@ def send_emails(conn, c, steps, queue, boxes: Mailboxes, tracker, now, send, sle
         conn.execute("""UPDATE enrollments SET step_pos = ?, status = 'active', conversation_id = ?, failures = 0,
                           note = NULL, sender = ?, first_email_at = COALESCE(first_email_at, ?), last_step_at = ?
                         WHERE id = ?""", (k, cid, acct, iso(now), iso(now), e["id"]))
-        conn.execute("""INSERT INTO sends (id, enrollment_id, campaign_id, lead_id, step_pos, sender, subject, tracked, sent_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        conn.execute("""INSERT INTO sends (id, enrollment_id, campaign_id, lead_id, step_pos, sender, subject, tracked, sent_at,
+                          body) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                      (sid, e["id"], c["id"], e["lead_id"], k, acct, subject, (1 if pixel else 0) | (2 if link else 0),
-                      iso(now)))
+                      iso(now), plain_text(html)[:20000]))
         event(conn, e["lead_id"], "sent", enrollment=e, channel="email", step_pos=k, detail=subject, at=now)
         remaining[acct] -= 1
         sent += 1

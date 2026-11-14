@@ -144,6 +144,34 @@ CREATE TABLE IF NOT EXISTS bot_actions (
     at TEXT NOT NULL
 );
 
+-- CRM: the people working leads (BDRs, AEs...). No sign-in: whoever logs a call picks their name.
+CREATE TABLE IF NOT EXISTS team (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    email TEXT NOT NULL DEFAULT '',
+    role TEXT NOT NULL DEFAULT 'BDR',
+    active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL
+);
+
+-- CRM: calls, meetings and notes, logged by the lead's owner. Emails and LinkedIn are logged automatically
+-- elsewhere (sends, events, tasks, engagements) and merged with these by crm.communications().
+CREATE TABLE IF NOT EXISTS activities (
+    id INTEGER PRIMARY KEY,
+    lead_id INTEGER NOT NULL REFERENCES leads(id) ON DELETE CASCADE,
+    campaign_id INTEGER REFERENCES campaigns(id) ON DELETE SET NULL,
+    kind TEXT NOT NULL DEFAULT 'call',              -- call|meeting|note
+    outcome TEXT NOT NULL DEFAULT '',
+    duration_min INTEGER,
+    notes TEXT NOT NULL DEFAULT '',
+    next_step TEXT NOT NULL DEFAULT '',
+    next_step_at TEXT,                              -- local date, YYYY-MM-DD
+    by_id INTEGER REFERENCES team(id) ON DELETE SET NULL,
+    at TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS ix_activities_lead ON activities (lead_id, at);
 CREATE INDEX IF NOT EXISTS ix_sends_campaign ON sends (campaign_id, step_pos);
 CREATE INDEX IF NOT EXISTS ix_sends_sender ON sends (sender, sent_at);
 CREATE INDEX IF NOT EXISTS ix_events_lead ON events (lead_id, at);
@@ -175,7 +203,11 @@ MIGRATIONS = [
     ("leads", "reply_ignored_before", "TEXT"),
     ("enrollments", "was_connected", "INTEGER"),
     ("leads", "lead_status", "TEXT NOT NULL DEFAULT ''"),          # your own label, e.g. "Demo Scheduled"
-    ("enrollments", "voicemails", "TEXT NOT NULL DEFAULT '[]'"),   # Campaign Status VM1..VM3, logged by you                   # start branch: 1 already connected, 0 needed an invite                     # 'Not a reply': messages up to here don't count
+    ("enrollments", "voicemails", "TEXT NOT NULL DEFAULT '[]'"),   # old VM1..VM3 cells; now calls in `activities`
+    ("leads", "owner_id", "INTEGER"),                              # team.id the lead is assigned to
+    ("campaigns", "owner_id", "INTEGER"),                          # default owner for the campaign's leads
+    ("sends", "body", "TEXT"),                                     # plain-text copy of what was sent
+    ("events", "content", "TEXT"),                                 # message text for replies (preview)
 ]
 
 
@@ -212,7 +244,30 @@ def connect(path: Path = DB_PATH) -> sqlite3.Connection:
                           SELECT MIN(replied_at) FROM enrollments e WHERE e.lead_id = leads.id AND e.status = 'replied')
                         WHERE id IN (SELECT lead_id FROM enrollments WHERE status = 'replied')""")
         set_setting(conn, "stage_backfilled", True)
+    if not get_setting(conn, "voicemails_to_calls"):
+        _voicemails_to_calls(conn)
+        set_setting(conn, "voicemails_to_calls", True)
     return conn
+
+
+def _voicemails_to_calls(conn) -> None:
+    """VM1..VM3 used to be free-text cells; each becomes a logged call with outcome "Left voicemail"."""
+    for e in rows(conn, "SELECT id, lead_id, campaign_id, voicemails, enrolled_at FROM enrollments WHERE voicemails != '[]'"):
+        for v in json.loads(e["voicemails"] or "[]"):
+            v = str(v or "").strip()
+            if not v:
+                continue
+            at = None
+            for fmt in ("%d-%b-%y", "%d-%b-%Y", "%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y", "%d %b %Y"):
+                try:
+                    at = datetime.strptime(v, fmt).replace(hour=12, tzinfo=timezone.utc)
+                    break
+                except ValueError:
+                    pass
+            conn.execute("""INSERT INTO activities (lead_id, campaign_id, kind, outcome, notes, at, created_at)
+                            VALUES (?, ?, 'call', 'Left voicemail', ?, ?, ?)""",
+                         (e["lead_id"], e["campaign_id"], "" if at else f"logged as: {v}",
+                          iso(at) if at else e["enrolled_at"], iso(utcnow())))
 
 
 def rows(conn, sql: str, *args) -> list[dict]:
@@ -230,12 +285,13 @@ def scalar(conn, sql: str, *args):
 
 
 def event(conn, lead_id: int, type: str, *, enrollment: dict | None = None, channel: str | None = None,
-          step_pos: int | None = None, detail: str | None = None, at: datetime | None = None) -> None:
+          step_pos: int | None = None, detail: str | None = None, at: datetime | None = None,
+          content: str | None = None) -> None:
     conn.execute(
-        "INSERT INTO events (lead_id, enrollment_id, campaign_id, step_pos, type, channel, detail, at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO events (lead_id, enrollment_id, campaign_id, step_pos, type, channel, detail, at, content) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (lead_id, enrollment and enrollment["id"], enrollment and enrollment["campaign_id"],
-         step_pos, type, channel, detail, iso(at or utcnow())),
+         step_pos, type, channel, detail, iso(at or utcnow()), content),
     )
 
 
