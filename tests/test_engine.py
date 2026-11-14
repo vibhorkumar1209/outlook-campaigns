@@ -1483,8 +1483,13 @@ class CrmTest(Base):
         import io
         from campaigner import crm
         crm.log_activity(self.conn, self.lead("jane@x.com")["id"], kind="call", outcome="No answer")
-        real, dbfile = db.connect, Path(self.tmp.name) / "t.db"
-        with mock.patch.object(webapp.db, "connect", lambda *a, **k: real(dbfile)):
+        real, dbfile, opened = db.connect, Path(self.tmp.name) / "t.db", []
+
+        def connect(*a, **k):
+            opened.append(real(dbfile))
+            return opened[-1]
+        self.addCleanup(lambda: [c.close() for c in opened])  # Windows can't delete an open database file
+        with mock.patch.object(webapp.db, "connect", connect):
             c = TestClient(webapp.app, base_url=f"http://127.0.0.1:{webapp.PORT}")
             r = c.get(f"/status/export.xlsx?campaign={self.cid}")
             self.assertEqual(r.status_code, 200)
