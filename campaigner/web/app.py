@@ -1077,7 +1077,8 @@ def settings(request: Request):
     return page(request, "settings.html", conn, logs=list(runner.logs)[-120:], busy=runner.busy,
                 eng=engine.engage_settings(conn), voice=db.get_setting(conn, "comment_voice", ""),
                 bot=linkedin_bot.settings(conn), bot_status=linkedin_bot.status(conn),
-                bot_used=linkedin_bot.used_today(conn, utcnow()), li_login_state=runner.li_login_state,
+                bot_used=linkedin_bot.used_today(conn, utcnow()), bot_plan=linkedin_bot.day_plan(conn, linkedin_bot.settings(conn), utcnow()),
+                bot_ceil=linkedin_bot.CEILINGS, bot_hour_cap=linkedin_bot.HOUR_CAP, li_login_state=runner.li_login_state,
                 ai_ready=bool(os.environ.get("ANTHROPIC_API_KEY")),
                 tracker=tracker, tracker_error=tracker.health() if tracker else None,
                 track_cursor=db.get_setting(conn, "track_cursor", 0),
@@ -1196,7 +1197,8 @@ async def settings_linkedin_bot(request: Request):
     conn = db.connect()
     num = lambda k, d, hi: min(max(int(f.get(k) or d), 0), hi)  # noqa: E731
     db.set_setting(conn, "li_mode", "bot" if f.get("li_mode") == "bot" else "assisted")
-    db.set_setting(conn, "li_bot_caps", {a: num(f"cap_{a}", 0, 200) for a in ("view", "connect", "message", "like", "comment")})
+    db.set_setting(conn, "li_bot_caps", {a: num(f"cap_{a}", 0, hi) for a, hi in linkedin_bot.CEILINGS.items()})
+    db.set_setting(conn, "li_bot_vary", bool(f.get("vary")))
     db.set_setting(conn, "li_bot_week_invites", num("week_invites", 90, 100))
     gmin = num("gap_min", 45, 3600)
     db.set_setting(conn, "li_bot_gap", [gmin, max(gmin, num("gap_max", 120, 3600))])
