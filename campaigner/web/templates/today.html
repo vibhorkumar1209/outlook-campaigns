@@ -1,0 +1,80 @@
+{% extends "base.html" %}
+{% block title %}Today{% endblock %}
+{% macro reminder_rows(items) %}
+  {% for r in items %}
+    <tr>
+      <td class="{{ 'bad' if r.overdue_days else ('warn' if r.today else 'meta') }}">{% if r.overdue_days %}{{ r.overdue_days }} day{{ "s" if r.overdue_days != 1 }} overdue{% elif r.today %}Today{% else %}{{ r.due }}{% endif %}</td>
+      <td><a href="/leads/{{ r.lead_id }}">{{ r.name }}</a><div class="meta">{{ r.company }}</div></td>
+      <td><span class="pill {{ LEAD_TONE[r.status] }}">{{ r.status }}</span></td>
+      <td class="meta">{{ r.last_contacted_at | local("%d %b %Y") if r.last_contacted_at else "never" }}</td>
+      <td>{{ r.reason }}</td>
+      <td class="meta">{{ r.owner or "Unassigned" }}</td>
+      <td><div class="row-act">
+        <button class="btn sm primary" data-compose data-lead="{{ r.lead_id }}" data-name="{{ r.name }}" data-company="{{ r.company }}"
+                data-email="{{ r.email or '' }}" data-wa="{{ r.wa }}" data-linkedin="{{ r.linkedin_url or '' }}" data-first="{{ r.first_name }}">Send email / message</button>
+        <button class="btn sm" data-log data-lead="{{ r.lead_id }}" data-name="{{ r.name }}" data-company="{{ r.company }}" data-phone="{{ r.phone }}"
+                data-owner="{{ r.owner_id or '' }}" data-status="{{ r.status }}">Log</button>
+        <button class="btn sm ghost" data-snooze="{{ r.lead_id }}" title="Remind me again after {{ cadence.get(r.status, 1) }} day{{ 's' if cadence.get(r.status, 1) != 1 }}">Snooze</button>
+      </div></td>
+    </tr>
+  {% endfor %}
+{% endmacro %}
+{% block main %}
+<header class="head">
+  <div>
+    <h1>Today <span class="meta">· {{ a.total }} waiting on you</span></h1>
+    <p class="sub">Everything that needs a person: follow-ups that are due, emails to approve, and LinkedIn and WhatsApp tasks. The same list is emailed at {{ "%02d" | format(cfg.digest_hour) }}:00 each day{{ "" if cfg.digest_enabled else " (currently off)" }}.</p>
+  </div>
+  <form method="get" class="actions">
+    <select name="owner" onchange="this.form.submit()" aria-label="Owner">
+      <option value="">Everyone's leads</option>
+      {% for m in team %}<option value="{{ m.id }}" {{ 'selected' if owner == m.id | string }}>{{ m.name }}</option>{% endfor %}
+    </select>
+    <a class="btn ghost" href="/reminders/email" target="_blank" rel="noopener">Preview the email</a>
+  </form>
+</header>
+
+{% for alert in a.alerts %}<div class="banner">{{ alert }}</div>{% endfor %}
+
+<section class="tiles four">
+  <a class="tile link" href="#followups"><div class="k">Follow-ups due</div><div class="v">{{ a.reminders | length }}</div><div class="s">warm, cold and next steps</div></a>
+  <a class="tile link" href="/drafts"><div class="k">Email drafts</div><div class="v">{{ a.drafts | length }}</div><div class="s">waiting for your approval</div></a>
+  <a class="tile link" href="/tasks"><div class="k">LinkedIn tasks</div><div class="v">{{ a.linkedin + a.comments }}</div><div class="s">{{ a.comments }} comment{{ "s" if a.comments != 1 }} to approve</div></a>
+  <a class="tile link" href="/tasks"><div class="k">WhatsApp messages</div><div class="v">{{ a.whatsapp }}</div><div class="s">ready to send</div></a>
+</section>
+
+<section class="card" id="followups">
+  <div class="card-head"><h2>Follow-ups due</h2>
+    <span class="meta">Warm: every {{ cadence.Warm }} days after the last contact · Cold: every {{ cadence.Cold }} days · or the next step you set. <a href="/settings#reminders">Change</a></span></div>
+  {% if a.reminders %}
+  <div class="tbl-wrap"><table class="t">
+    <thead><tr><th>Due</th><th>Lead</th><th>Status</th><th>Last contacted</th><th>Why</th><th>Owner</th><th></th></tr></thead>
+    <tbody>{{ reminder_rows(a.reminders) }}</tbody>
+  </table></div>
+  {% else %}<div class="empty">No follow-ups due. Leads marked Warm or Cold show up here when their next contact is due.</div>{% endif %}
+</section>
+
+{% if a.drafts %}
+<section class="card">
+  <div class="card-head"><h2>Email drafts waiting for you</h2><a href="/drafts">review and send →</a></div>
+  <div class="tbl-wrap"><table class="t">
+    <thead><tr><th>Lead</th><th>Subject</th><th>Campaign</th><th>Written</th></tr></thead>
+    <tbody>{% for d in a.drafts[:8] %}<tr>
+      <td><a href="/leads/{{ d.lead_id }}">{{ d.first_name }} {{ d.last_name }}</a><div class="meta">{{ d.company }}</div></td>
+      <td>{{ d.subject }}</td><td class="meta">{{ d.campaign or "one-off" }}{% if d.step_pos is not none %} · step {{ d.step_pos + 1 }}{% endif %}</td>
+      <td class="meta">{{ d.created_at | ago }}</td></tr>{% endfor %}</tbody>
+  </table></div>
+  {% if a.drafts | length > 8 %}<p class="meta">…and {{ a.drafts | length - 8 }} more.</p>{% endif %}
+</section>
+{% endif %}
+
+{% if upcoming %}
+<section class="card">
+  <div class="card-head"><h2>Coming up · next 7 days</h2></div>
+  <div class="tbl-wrap"><table class="t">
+    <thead><tr><th>Due</th><th>Lead</th><th>Status</th><th>Last contacted</th><th>Why</th><th>Owner</th><th></th></tr></thead>
+    <tbody>{{ reminder_rows(upcoming) }}</tbody>
+  </table></div>
+</section>
+{% endif %}
+{% endblock %}

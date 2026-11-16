@@ -7,35 +7,47 @@
   "task_skipped": "Task skipped", "step_skipped": "Step skipped", "connected": "Connected on LinkedIn",
   "reply": "Replied", "bounce": "Bounced", "stopped": "Stopped", "error": "Error",
   "open": "Opened email", "click": "Clicked link", "unsubscribe": "Unsubscribed", "resumed": "Sequence resumed",
-  "auto_reply": "Automatic reply (sequence continues)", "reply_ignored": "Not a reply (ignored)"} %}
+  "auto_reply": "Automatic reply (sequence continues)", "reply_ignored": "Not a reply (ignored)",
+  "draft_created": "Email drafted (waiting for approval)", "status": "Status changed",
+  "email_in": "Email received", "email_out": "Email written in Outlook"} %}
 <header class="head">
   <div>
-    <h1>{{ lead_name(l) }} {% if l.li_state != "none" %}{{ pill(l.li_state) }}{% endif %}{% if l.dnc %} <span class="pill critical">do not contact</span>{% endif %} {% if l.stage == "lead" %}<span class="pill good">lead</span>{% else %}<span class="pill muted">prospect</span>{% endif %}</h1>
+    <h1>{{ lead_name(l) }} <span class="pill {{ LEAD_TONE[l.status] }}">{{ l.status }}</span> {% if l.li_state != "none" %}{{ pill(l.li_state) }}{% endif %}{% if l.dnc %} <span class="pill critical">do not contact</span>{% endif %} {% if l.stage == "lead" %}<span class="pill good">lead</span>{% else %}<span class="pill muted">prospect</span>{% endif %}</h1>
     <p class="sub">{{ l.title }}{% if l.title and l.company %} · {% endif %}{{ l.company }}</p>
   </div>
   <div class="actions">
-    <button class="btn primary" data-log data-lead="{{ l.id }}" data-name="{{ lead_name(l) }}" data-company="{{ l.company }}"
-            data-phone="{{ extras.get('phone', '') }}" data-owner="{{ l.owner_id or '' }}">Log call / note</button>
+    {% if not l.dnc %}<button class="btn primary" data-compose data-lead="{{ l.id }}" data-name="{{ lead_name(l) }}" data-company="{{ l.company }}"
+            data-email="{{ l.email or '' }}" data-wa="{{ wa }}" data-linkedin="{{ l.linkedin_url or '' }}" data-first="{{ l.first_name }}"
+            data-thread="{{ '1' if has_thread }}">Send email / message</button>{% endif %}
+    <button class="btn" data-log data-lead="{{ l.id }}" data-name="{{ lead_name(l) }}" data-company="{{ l.company }}"
+            data-phone="{{ phone }}" data-owner="{{ l.owner_id or '' }}" data-status="{{ l.status }}">Log call / note</button>
     {% if l.linkedin_url %}<a class="btn" href="{{ l.linkedin_url }}" target="_blank" rel="noopener">LinkedIn ↗</a>{% endif %}
-    {% if l.li_state != "connected" and l.linkedin_url %}<button class="btn" data-lead-act="connected" data-lead="{{ l.id }}">Mark connected</button>{% endif %}
-    <button class="btn" data-lead-act="replied" data-channel="linkedin" data-lead="{{ l.id }}" data-ask="Mark as replied on LinkedIn? This stops all their sequences.">Replied on LinkedIn</button>
-    <button class="btn" data-lead-act="replied" data-channel="email" data-lead="{{ l.id }}" data-ask="Mark as replied by email? This stops all their sequences.">Replied by email</button>
-    {% if l.stage == "lead" %}
-      {% if events | selectattr("type", "equalto", "reply") | list %}<button class="btn" data-lead-act="not_reply" data-lead="{{ l.id }}" data-ask="Not a real reply? This puts {{ l.first_name or 'them' }} back into the sequences it stopped, from the step they were on. Pending steps that are already due go out on the next run.">Not a reply</button>{% endif %}
-      <button class="btn" data-lead-act="stage" data-stage="prospect" data-lead="{{ l.id }}" data-ask="Move back to prospects? Their sequences stay stopped; use Resume on a campaign to restart one.">Move to prospects</button>
-    {% else %}
-      <button class="btn" data-lead-act="stage" data-stage="lead" data-lead="{{ l.id }}" data-ask="Move to leads? This stops all their sequences.">Move to leads</button>
-    {% endif %}
-    {% if not l.dnc %}<button class="btn danger" data-lead-act="dnc" data-lead="{{ l.id }}" data-ask="Mark do-not-contact? Stops every campaign now and for future imports.">Do not contact</button>{% endif %}
-    <button class="btn danger" data-lead-act="stop_all" data-lead="{{ l.id }}" data-ask="Stop every campaign for this lead?">Stop all</button>
+    <details class="menu">
+      <summary class="btn">More ▾</summary>
+      <div class="menu-list">
+        {% if l.li_state != "connected" and l.linkedin_url %}<button data-lead-act="connected" data-lead="{{ l.id }}">Mark connected on LinkedIn</button>{% endif %}
+        <button data-lead-act="replied" data-channel="email" data-lead="{{ l.id }}" data-ask="Mark as replied by email? This stops all their sequences.">They replied by email</button>
+        <button data-lead-act="replied" data-channel="linkedin" data-lead="{{ l.id }}" data-ask="Mark as replied on LinkedIn? This stops all their sequences.">They replied on LinkedIn</button>
+        <button data-lead-act="replied" data-channel="whatsapp" data-lead="{{ l.id }}" data-ask="Mark as replied on WhatsApp? This stops all their sequences.">They replied on WhatsApp</button>
+        {% if l.stage == "lead" %}
+          {% if events | selectattr("type", "equalto", "reply") | list %}<button data-lead-act="not_reply" data-lead="{{ l.id }}" data-ask="Not a real reply? This puts {{ l.first_name or 'them' }} back into the sequences it stopped, from the step they were on. Pending steps that are already due go out on the next run.">Not a reply</button>{% endif %}
+          <button data-lead-act="stage" data-stage="prospect" data-lead="{{ l.id }}" data-ask="Move back to prospects? Their sequences stay stopped; use Resume on a campaign to restart one.">Move to prospects</button>
+        {% else %}
+          <button data-lead-act="stage" data-stage="lead" data-lead="{{ l.id }}" data-ask="Move to leads? This stops all their sequences.">Move to leads</button>
+        {% endif %}
+        <button class="danger" data-lead-act="stop_all" data-lead="{{ l.id }}" data-ask="Stop every campaign for this lead?">Stop all sequences</button>
+        {% if not l.dnc %}<button class="danger" data-lead-act="dnc" data-lead="{{ l.id }}" data-ask="Mark do-not-contact? Stops every campaign now and for future imports, and sets the status to Closed/Lost.">Do not contact</button>{% endif %}
+      </div>
+    </details>
   </div>
 </header>
 
+{% if lead_drafts %}<div class="flash">{{ lead_drafts | length }} email draft{{ "s" if lead_drafts | length != 1 }} to {{ l.first_name or "this lead" }} {{ "is" if lead_drafts | length == 1 else "are" }} waiting: <a href="/drafts">review and send →</a></div>{% endif %}
 {% if l.email_bounced %}<div class="flash err">Email to <b>{{ l.email }}</b> bounced, so email steps are skipped for this person while LinkedIn steps carry on. Fix the address under Details and later emails go out normally.</div>{% endif %}
 <div class="grid2">
   <div class="stack-y">
   <section class="card">
-    <div class="card-head"><h2>Communications</h2><span class="meta">emails and LinkedIn log themselves; calls, meetings and notes are logged by the owner</span></div>
+    <div class="card-head"><h2>Communications</h2><span class="meta">emails, LinkedIn and WhatsApp steps log themselves; calls and anything done outside the app are logged by the owner</span></div>
     {% include "_comms.html" %}
   </section>
 
@@ -68,17 +80,25 @@
     <section class="card">
       <div class="card-head"><h2>Owner &amp; follow-up</h2></div>
       <div class="stack-y" style="gap:10px">
+        <label class="f">Lead status
+          <select data-status-of="{{ l.id }}" data-reload="1">{% for st in STATUSES %}<option {{ 'selected' if st == l.status }}>{{ st }}</option>{% endfor %}</select>
+        </label>
         <label class="f">Assigned to
           <select data-owner-of="{{ l.id }}">
             <option value="">Unassigned</option>
             {% for m in team %}<option value="{{ m.id }}" {{ 'selected' if l.owner_id == m.id }}>{{ m.name }} ({{ m.role }})</option>{% endfor %}
           </select>
         </label>
-        {% if extras.get('phone') %}<div>Phone: <a href="tel:{{ extras.phone | replace(' ', '') }}">{{ extras.phone }}</a></div>{% endif %}
-        {% if summary.next %}<div class="{{ 'flash' if summary.next.date }}">Next step: <b>{{ summary.next.text }}</b>{% if summary.next.date %} · due {{ summary.next.date }}{% endif %}</div>{% endif %}
+        {% if phone %}<div>Phone: <a href="tel:{{ phone | replace(' ', '') }}">{{ phone }}</a>{% if wa %} · <a href="https://wa.me/{{ wa }}" target="_blank" rel="noopener">WhatsApp ↗</a>{% endif %}</div>{% endif %}
+        <dl class="kv">
+          <dt>Last contacted</dt><dd>{{ l.last_contacted_at | local("%d %b %Y") if l.last_contacted_at else "never" }}</dd>
+          <dt>Next follow-up</dt><dd class="{{ 'warn' if l.next_followup_at and l.next_followup_at <= today }}">{% if l.next_followup_at %}{{ l.next_followup_at }}{% if summary.next and summary.next.date == l.next_followup_at %} · {{ summary.next.text }}{% elif l.status in ("Warm", "Cold") %} · {{ l.status | lower }} follow-up{% endif %}
+            {% if l.next_followup_at <= today %}<button class="btn sm ghost" data-snooze="{{ l.id }}">Snooze</button>{% endif %}{% else %}–{% endif %}</dd>
+        </dl>
         <dl class="kv">
           <dt>Emails</dt><dd>{{ summary.email_out or 0 }} sent · {{ summary.email_in or 0 }} received</dd>
           <dt>LinkedIn</dt><dd>{{ summary.li_out or 0 }} sent · {{ summary.li_in or 0 }} received</dd>
+          <dt>WhatsApp</dt><dd>{{ summary.wa_out or 0 }} sent · {{ summary.wa_in or 0 }} received</dd>
           <dt>Calls</dt><dd>{{ summary.calls or 0 }}{% if summary.last_call %} · last: {{ summary.last_call.outcome or "logged" }}, {{ summary.last_call.at | ago }}{% endif %}</dd>
           <dt>Meetings</dt><dd>{{ summary.meetings or 0 }}</dd>
           <dt>Last touch</dt><dd>{% if summary.last %}{{ summary.last.label }}, {{ summary.last.at | ago }}{% else %}–{% endif %}</dd>
@@ -107,6 +127,7 @@
       <div class="stack-y" style="gap:10px">
         <label class="f">Email<input id="lead-email" value="{{ l.email or '' }}"></label>
         <label class="f">LinkedIn URL<input id="lead-li" value="{{ l.linkedin_url or '' }}" placeholder="https://www.linkedin.com/in/..."></label>
+        <label class="f">Phone (with country code, for calls and WhatsApp)<input id="lead-phone" value="{{ phone }}" placeholder="+1 440 465 1879"></label>
         <div><button class="btn" data-lead-act="update" data-lead="{{ l.id }}">Save</button></div>
       </div>
       {% if extras %}

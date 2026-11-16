@@ -176,6 +176,13 @@
           {% if not senders %}<option value="">No mailbox connected yet</option>{% endif %}
         </select>
       </label>
+      <label class="f">Emails
+        <select name="email_mode">
+          <option value="draft" {{ 'selected' if c.email_mode != 'auto' }}>Save as drafts: I approve each one</option>
+          <option value="auto" {{ 'selected' if c.email_mode == 'auto' }}>Send automatically, no review</option>
+        </select>
+        <span class="meta">Drafts wait in <a href="/drafts">Email drafts</a> and in Outlook's Drafts folder until you approve them.</span>
+      </label>
       <label class="f">Default owner (BDR)
         <select name="owner_id">
           <option value="">None</option>

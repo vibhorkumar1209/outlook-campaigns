@@ -12,14 +12,16 @@ from pathlib import Path
 from zoneinfo import ZoneInfo, available_timezones
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from jinja2 import TemplateError, TemplateSyntaxError
 
 from .. import ai, attachments, crm, db, domain_health, engine, importer, linkedin_bot, osutil, stats, updater
 from ..db import iso, one, parse, rows, scalar, utcnow
-from ..render import ENV, email_html, lead_context, linkedin_text, render_text
+from ..graph import AuthError, Graph, GraphError
+from ..render import (ENV, WRAP, email_html, lead_context, lead_phone, linkedin_text, render_text, text_to_html,
+                      wa_digits, whatsapp_text)
 from ..runner import Runner, remove_sender, wants_awake
 from ..tracking import Tracker
 
@@ -51,7 +53,19 @@ DEFAULT_SEQUENCE = [
 runner = Runner()
 app = FastAPI(docs_url=None, redoc_url=None)
 app.mount("/static", StaticFiles(directory=HERE / "static"), name="static")
+
+
 templates = Jinja2Templates(directory=HERE / "templates")
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+def favicon():
+    return FileResponse(HERE / "static" / "favicon.ico", media_type="image/x-icon")
+
+
+def mail_client(account: str):
+    """The Outlook client for one mailbox (its own function so tests can swap it)."""
+    return Graph(account)
 UPLOADS: dict[str, dict] = {}
 
 
@@ -86,6 +100,7 @@ templates.env.globals.update(
     asset=lambda name: f"/static/{name}?v={int((HERE / 'static' / name).stat().st_mtime)}",
     CHANNELS=engine.CHANNELS, CONDITIONS=engine.CONDITIONS, FIELDS=importer.FIELDS,
     MACHINE=osutil.MACHINE, WINDOWS=osutil.WINDOWS, OC=".\\oc" if osutil.WINDOWS else "./oc",
+    STATUSES=crm.STATUSES, LEAD_TONE=crm.STATUS_TONE, KINDS=crm.KINDS, SUGGESTED_STATUS=crm.SUGGESTED_STATUS,
 )
 
 OPEN_TASKS_SQL = """SELECT COUNT(*) FROM tasks t JOIN enrollments e ON e.id = t.enrollment_id
@@ -129,7 +144,8 @@ def page(request: Request, name: str, conn, **ctx):
         "team": crm.team(conn, active_only=True),
         "me": crm.me(conn),
         "OUTCOMES": crm.OUTCOMES, "RESPONDED": sorted(crm.RESPONDED),
-        "follow_ups_due": sum(1 for f in crm.follow_ups(conn, local_tz(), days=0)),
+        "today_count": crm.actions(conn, local_tz())["total"],
+        "drafts_pending": scalar(conn, "SELECT COUNT(*) FROM email_drafts WHERE status = 'pending'"),
         "path": request.url.path,
         "msg": request.query_params.get("msg"),
         "err": request.query_params.get("err"),
@@ -157,22 +173,160 @@ def overview(request: Request):
     conn = db.connect()
     tz = local_tz()
     act = stats.activity(conn, tz)
-    peak = max([d["email"] + d["linkedin"] for d in act] + [1])
+    peak = max([d["email"] + d["linkedin"] + d["whatsapp"] for d in act] + [1])
     camps = stats.campaign_rows(conn)
     for c in camps:
         c["email"] = stats.email_stats(conn, campaign_id=c["id"])
     return page(request, "overview.html", conn, o=stats.overview(conn, tz), act=act, peak=peak, campaigns=camps,
-                replies=stats.recent_replies(conn), em=stats.email_stats(conn, since=utcnow() - timedelta(days=30)),
-                follow_ups=crm.follow_ups(conn, tz))
+                replies=stats.recent_replies(conn), em=stats.email_stats(conn, since=utcnow() - timedelta(days=30)))
 
 
-# ---------- LinkedIn queue ----------
+# ---------- Today: everything waiting on a person ----------
+
+@app.get("/today")
+def today(request: Request, owner: str = ""):
+    conn = db.connect()
+    tz = local_tz()
+    crm.refresh_followups(conn, tz=tz)
+    oid = int(owner) if owner.isdigit() else None
+    a = crm.actions(conn, tz, oid)
+    upcoming = [r for r in crm.reminders(conn, tz, oid, ahead=7) if not r["today"] and not r["overdue_days"]]
+    return page(request, "today.html", conn, a=a, upcoming=upcoming, owner=owner, cadence=crm.cadence(conn),
+                cfg=crm.settings(conn))
+
+
+@app.get("/reminders/email")
+def reminder_email_preview():
+    """Today's reminder email, as it would be sent."""
+    return HTMLResponse(crm.digest(db.connect(), local_tz())[1])
+
+
+# ---------- email drafts: written by the sequences, sent when you approve ----------
+
+DRAFTS_SQL = """SELECT d.*, l.first_name, l.last_name, l.company, l.title, c.name campaign, c.window_start, c.window_end,
+                       c.status campaign_status, (SELECT COUNT(*) FROM steps s WHERE s.campaign_id = d.campaign_id) n_steps
+                FROM email_drafts d JOIN leads l ON l.id = d.lead_id LEFT JOIN campaigns c ON c.id = d.campaign_id"""
+
+
+def _kick() -> None:
+    """A quick pass now, so something you just approved doesn't wait for the next minute's run."""
+    import threading
+
+    threading.Thread(target=runner.run_once, kwargs={"checks": False}, daemon=True).start()
+
+
+@app.get("/drafts")
+def drafts_page(request: Request, campaign: int | None = None):
+    conn = db.connect()
+    where, args = (" AND d.campaign_id = ?", [campaign]) if campaign else ("", [])
+    items = rows(conn, DRAFTS_SQL + f" WHERE d.status IN ('pending', 'approved'){where} ORDER BY d.status = 'approved', "
+                                    "d.created_at, d.id", *args)
+    recent = rows(conn, DRAFTS_SQL + " WHERE d.status NOT IN ('pending', 'approved') ORDER BY d.done_at DESC LIMIT 15")
+    camps = rows(conn, """SELECT c.id, c.name, c.email_mode, COUNT(d.id) n FROM campaigns c
+                          LEFT JOIN email_drafts d ON d.campaign_id = c.id AND d.status = 'pending'
+                          WHERE c.status != 'draft' GROUP BY c.id ORDER BY c.status = 'active' DESC, c.id DESC""")
+    return page(request, "drafts.html", conn, drafts=items, recent=recent, campaigns=camps, campaign=campaign,
+                n_pending=sum(1 for d in items if d["status"] == "pending"))
+
+
+@app.get("/drafts/{did}/preview")
+def draft_preview(did: int):
+    d = one(db.connect(), "SELECT subject, html FROM email_drafts WHERE id = ?", did)
+    if not d:
+        raise HTTPException(404)
+    body = re.sub(r"<img[^>]*(width=\"1\"|/o/)[^>]*>", "", d["html"], flags=re.I)  # looking mustn't count as an open
+    return HTMLResponse('<!doctype html><meta charset="utf-8"><base target="_blank"><body style="margin:12px;'
+                        'font-family:Aptos,Calibri,Arial,sans-serif">' + body,
+                        headers={"Content-Security-Policy": "sandbox allow-popups; default-src 'none'; style-src 'unsafe-inline'"})
+
+
+@app.post("/api/drafts/approve")
+async def drafts_approve(request: Request):
+    p = await request.json()
+    conn = db.connect()
+    if p.get("all"):
+        where, args = (" AND campaign_id = ?", [int(p["campaign_id"])]) if str(p.get("campaign_id") or "").isdigit() else ("", [])
+        ids = [r["id"] for r in rows(conn, f"SELECT id FROM email_drafts WHERE status = 'pending'{where}", *args)]
+    else:
+        ids = [int(i) for i in p.get("ids") or [] if str(i).isdigit()]
+    n = engine.approve_drafts(conn, ids)
+    if n:
+        _kick()
+    return {"ok": True, "approved": n, "pending": scalar(conn, "SELECT COUNT(*) FROM email_drafts WHERE status = 'pending'")}
+
+
+@app.post("/api/drafts/{did}")
+async def draft_action(did: int, request: Request):
+    act = (await request.json()).get("action")
+    conn = db.connect()
+    d = one(conn, "SELECT * FROM email_drafts WHERE id = ?", did)
+    if not d or d["status"] not in ("pending", "approved"):
+        raise HTTPException(409, "This draft was already sent or dropped")
+    if act == "skip":      # don't send this one; the sequence carries on. The Outlook copy is removed on the next full run.
+        engine.skip_draft(conn, d, "skipped by you", utcnow())
+    elif act == "hold":    # take back an approval that hasn't gone out yet
+        conn.execute("UPDATE email_drafts SET status = 'pending', approved_at = NULL WHERE id = ? AND status = 'approved'", (did,))
+    else:
+        raise HTTPException(400, "bad action")
+    return {"ok": True, "pending": scalar(conn, "SELECT COUNT(*) FROM email_drafts WHERE status = 'pending'")}
+
+
+@app.post("/api/leads/{lid}/compose")
+async def compose(lid: int, request: Request):
+    """A one-off email to a lead: saved in Outlook's Drafts (in their existing thread when there is one), and
+    sent only if you say so."""
+    p = await request.json()
+    conn = db.connect()
+    l = one(conn, "SELECT * FROM leads WHERE id = ?", lid)
+    if not l:
+        raise HTTPException(404)
+    if l["dnc"]:
+        raise HTTPException(409, "This lead is marked do-not-contact")
+    if not l["email"]:
+        raise HTTPException(422, "No email address for this lead. Add one under Details.")
+    subject, text = (p.get("subject") or "").strip(), (p.get("body") or "").strip()
+    if not text:
+        raise HTTPException(422, "Write the message")
+    acct, conv, signature = engine.thread_for(conn, lid)
+    if not acct:
+        raise HTTPException(409, "Connect a mailbox first (Senders)")
+    threaded = bool(conv) and not subject
+    if not threaded and not subject:
+        raise HTTPException(422, "Add a subject (there's no earlier email thread with them to reply in)")
+    ctx = lead_context(l)
+    try:
+        html = WRAP.format(text_to_html(render_text(text, ctx)) + (text_to_html(render_text(signature, ctx)) if signature else ""))
+        subject = render_text(subject, ctx)
+    except TemplateError as ex:
+        raise HTTPException(422, f"Template: {ex}")
+
+    def save():
+        g = mail_client(acct)
+        return (g.draft_in_thread(conv, l["email"], ctx["name"], html, "Re:") if threaded
+                else g.draft_new(l["email"], ctx["name"], subject, html))
+    try:
+        from starlette.concurrency import run_in_threadpool
+        dr = await run_in_threadpool(save)
+    except (AuthError, GraphError) as ex:
+        raise HTTPException(409, f"Couldn't save the draft in Outlook: {ex}")
+    send = bool(p.get("send"))
+    conn.execute("""INSERT INTO email_drafts (lead_id, sender, to_email, subject, html, outlook_id, web_link, conversation_id,
+                      threaded, status, created_at, approved_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                 (lid, acct, l["email"], subject or "(reply in thread)", html, dr.get("id"), dr.get("webLink"),
+                  dr.get("conversationId"), int(threaded), "approved" if send else "pending", iso(utcnow()),
+                  iso(utcnow()) if send else None))
+    if send:
+        _kick()
+    return {"ok": True, "web_link": dr.get("webLink"), "sent": send}
+
+
+# ---------- task queue: LinkedIn and WhatsApp ----------
 
 @app.get("/tasks")
 def tasks(request: Request, campaign: int | None = None):
     conn = db.connect()
     sql = """SELECT t.*, c.id campaign_id, c.name campaign, l.id lead_id, l.first_name, l.last_name, l.company,
-                    l.title, l.linkedin_url, l.li_state,
+                    l.title, l.linkedin_url, l.li_state, l.data,
                     (SELECT COUNT(*) FROM steps s WHERE s.campaign_id = c.id) n_steps
              FROM tasks t JOIN enrollments e ON e.id = t.enrollment_id
              JOIN campaigns c ON c.id = e.campaign_id JOIN leads l ON l.id = e.lead_id
@@ -185,6 +339,8 @@ def tasks(request: Request, campaign: int | None = None):
     eng = engine.engage_settings(conn)
     since = (utcnow() - timedelta(days=round(30.4 * eng["engage_lookback_months"]))).astimezone(local_tz())
     for t in items:
+        t["phone"] = lead_phone(t)
+        t["wa"] = wa_digits(t["phone"])
         if t["channel"] == engine.ENGAGE:
             t["posts_url"] = t["linkedin_url"].rstrip("/") + "/recent-activity/all/"
             t["engaged"] = rows(conn, "SELECT * FROM engagements WHERE lead_id = ? ORDER BY at DESC LIMIT 10", t["lead_id"])
@@ -194,7 +350,7 @@ def tasks(request: Request, campaign: int | None = None):
     bot = linkedin_bot.settings(conn)
     for t in items:
         t["bot_will"] = (bot["li_mode"] == "bot" and t["bot_attempts"] < linkedin_bot.MAX_ATTEMPTS
-                         and t["comment_status"] != "needs_approval")
+                         and t["comment_status"] != "needs_approval" and t["channel"] != engine.WHATSAPP)
     return page(request, "tasks.html", conn, tasks=items, campaigns=camps, campaign=campaign, done_today=done_today,
                 since=since, ai_ready=bool(os.environ.get("ANTHROPIC_API_KEY")))
 
@@ -318,7 +474,7 @@ def campaign_settings(cid: int, name: str = Form(...), timezone: str = Form(""),
                       email_daily_cap: int = Form(40), li_daily_cap: int = Form(20), gap_min: int = Form(45),
                       gap_max: int = Form(120), signature: str = Form(""), sender: str = Form(""),
                       track_opens: str = Form(""), track_clicks: str = Form(""), li_engage: str = Form(""),
-                      owner_id: str = Form("")):
+                      owner_id: str = Form(""), email_mode: str = Form("draft")):
     conn = db.connect()
     get_campaign(conn, cid)
     url = f"/campaigns/{cid}"
@@ -341,7 +497,8 @@ def campaign_settings(cid: int, name: str = Form(...), timezone: str = Form(""),
                   max(0, email_daily_cap), max(0, li_daily_cap), gap_min, gap_max, signature, sender or None,
                   1 if track_opens else 0, 1 if track_clicks else 0, 1 if li_engage else 0, cid))
     owner = int(owner_id) if owner_id.isdigit() and one(conn, "SELECT 1 FROM team WHERE id = ?", int(owner_id)) else None
-    conn.execute("UPDATE campaigns SET owner_id = ? WHERE id = ?", (owner, cid))
+    conn.execute("UPDATE campaigns SET owner_id = ?, email_mode = ? WHERE id = ?",
+                 (owner, "auto" if email_mode == "auto" else "draft", cid))
     n = crm.assign_campaign_owner(conn, cid)
     return back(url, tab="settings", msg="Saved" + (f". {n} unassigned lead(s) given to the campaign owner." if n else ""))
 
@@ -417,7 +574,7 @@ def _validate_steps(raw: list[dict]) -> tuple[list[dict], list[str]]:
             if not subject and (not seen_email or not in_thread):
                 errs.append(f"{n}: subject needed ({'first email starts the thread' if not seen_email else 'new thread'})")
             seen_email = True
-        if ch in ("email", "li_message") and not body.strip():
+        if ch in ("email", "li_message", "whatsapp") and not body.strip():
             errs.append(f"{n}: message is empty")
         if ch == "li_connect" and len(body) > 300:
             errs.append(f"{n}: LinkedIn invite notes max 300 characters")
@@ -503,7 +660,8 @@ async def preview(request: Request):
             if not st.get("subject") and p.get("in_thread_followup"):
                 subject = "Re: " + subject
             return {"subject": subject, "html": email_html(st.get("body") or "", c["signature"], ctx)}
-        text = linkedin_text(render_text(st.get("body") or "", ctx))
+        fmt = whatsapp_text if st.get("channel") == engine.WHATSAPP else linkedin_text
+        text = fmt(render_text(st.get("body") or "", ctx))
         return {"text": text, "chars": len(text)}
     except TemplateError as e:
         return {"error": str(e)}
@@ -647,11 +805,13 @@ def campaign_status_export(cid: int | None, fmt: str):
 
 # ---------- leads ----------
 
-def contacts_page(request: Request, stage: str, q: str, owner: str = ""):
+def contacts_page(request: Request, stage: str, q: str, owner: str = "", status: str = ""):
     conn = db.connect()
     like = f"%{q.strip()}%"
     owner_sql = "" if not owner else " AND l.owner_id IS NULL" if owner == "none" else " AND l.owner_id = ?"
     owner_arg = [int(owner)] if owner.isdigit() else []
+    if status in crm.STATUSES:
+        owner_sql, owner_arg = owner_sql + " AND l.status = ?", owner_arg + [status]
     items = rows(conn, """
         SELECT l.*, tm.name owner, (SELECT COUNT(*) FROM enrollments e WHERE e.lead_id = l.id) n_campaigns,
           (SELECT status FROM enrollments e WHERE e.lead_id = l.id ORDER BY e.id DESC LIMIT 1) last_status,
@@ -665,18 +825,19 @@ def contacts_page(request: Request, stage: str, q: str, owner: str = ""):
         """ + owner_sql + """
         ORDER BY COALESCE(l.became_lead_at, '') DESC, l.id DESC LIMIT 500""", stage, q.strip(), like, like, like, *owner_arg)
     counts = {r["stage"]: r["n"] for r in rows(conn, "SELECT stage, COUNT(*) n FROM leads GROUP BY stage")}
-    return page(request, "leads.html", conn, leads=items, q=q, stage=stage, counts=counts, owner=owner)
+    return page(request, "leads.html", conn, leads=items, q=q, stage=stage, counts=counts, owner=owner, status=status,
+                today=datetime.now(local_tz()).date().isoformat())
 
 
 @app.get("/leads")
-def leads(request: Request, q: str = "", owner: str = ""):
+def leads(request: Request, q: str = "", owner: str = "", status: str = ""):
     """People who responded: dropped from every sequence when they replied."""
-    return contacts_page(request, "lead", q, owner)
+    return contacts_page(request, "lead", q, owner, status)
 
 
 @app.get("/prospects")
-def prospects(request: Request, q: str = "", owner: str = ""):
-    return contacts_page(request, "prospect", q, owner)
+def prospects(request: Request, q: str = "", owner: str = "", status: str = ""):
+    return contacts_page(request, "prospect", q, owner, status)
 
 
 @app.get("/leads/{lid}")
@@ -691,9 +852,16 @@ def lead(request: Request, lid: int):
     events = rows(conn, """SELECT ev.*, c.name campaign FROM events ev LEFT JOIN campaigns c ON c.id = ev.campaign_id
                            WHERE ev.lead_id = ? ORDER BY ev.at DESC, ev.id DESC""", lid)
     extras = json.loads(l["data"] or "{}")
+    crm.refresh_followups(conn, lead_id=lid, tz=local_tz())
+    l = one(conn, "SELECT * FROM leads WHERE id = ?", lid)
     summary = crm.summaries(conn, lead_id=lid).get(lid, {})
+    phone = lead_phone(l)
+    acct, conv, _ = engine.thread_for(conn, lid)
     return page(request, "lead.html", conn, l=l, enrollments=ens, events=events, extras=extras,
-                comms=crm.communications(conn, lead_id=lid), summary=summary,
+                comms=crm.communications(conn, lead_id=lid), summary=summary, phone=phone, wa=wa_digits(phone),
+                has_thread=bool(conv), compose_from=acct, today=datetime.now(local_tz()).date().isoformat(),
+                lead_drafts=rows(conn, "SELECT * FROM email_drafts WHERE lead_id = ? AND status IN ('pending', 'approved') "
+                                       "ORDER BY id", lid),
                 active="/leads" if l["stage"] == "lead" else "/prospects")
 
 
@@ -721,7 +889,7 @@ async def log_activity(lid: int, request: Request):
             next_step=p.get("next_step") or "", next_step_at=p.get("next_step_at") or None,
             by_id=int(p["by_id"]) if str(p.get("by_id") or "").isdigit() else None,
             campaign_id=int(p["campaign_id"]) if str(p.get("campaign_id") or "").isdigit() else None,
-            stop_sequences=bool(p.get("stop_sequences")))
+            stop_sequences=bool(p.get("stop_sequences")), status=p.get("status") or None)
     except ValueError as ex:
         raise HTTPException(422, str(ex))
     return {"ok": True, "id": aid}
@@ -768,6 +936,14 @@ async def lead_action(lid: int, request: Request):
             crm.set_owner(conn, lid, int(p["owner_id"]) if str(p.get("owner_id") or "").isdigit() else None)
         except ValueError as ex:
             raise HTTPException(422, str(ex))
+    elif act == "status":
+        try:
+            crm.set_status(conn, lid, p.get("status") or "", now)
+        except ValueError as ex:
+            raise HTTPException(422, str(ex))
+    elif act == "snooze":
+        days = int(p["days"]) if str(p.get("days") or "").isdigit() else None
+        return {"ok": True, "until": crm.snooze(conn, lid, days, local_tz())}
     elif act == "update":
         email = (p.get("email") or "").strip().lower() or None
         li = importer.normalize_linkedin(p.get("linkedin_url") or "") if p.get("linkedin_url") else None
@@ -779,6 +955,11 @@ async def lead_action(lid: int, request: Request):
             engine.set_lead_contact(conn, lid, email, li, now)
         except Exception:
             raise HTTPException(409, "That email or URL belongs to another lead")
+        if "phone" in p:
+            data = json.loads(scalar(conn, "SELECT data FROM leads WHERE id = ?", lid) or "{}")
+            key = next((k for k in ("whatsapp", "mobile", "mobile_phone", "phone") if str(data.get(k) or "").strip()), "phone")
+            data[key] = str(p.get("phone") or "").strip()[:40]
+            conn.execute("UPDATE leads SET data = ? WHERE id = ?", (json.dumps(data), lid))
     else:
         raise HTTPException(400, "bad action")
     return {"ok": True}
@@ -903,8 +1084,35 @@ def settings(request: Request):
                 tick_minutes=os.environ.get("OC_TICK_MINUTES", "10"),
                 keep_awake=db.get_setting(conn, "keep_awake", True), awake_on=runner.awake.on,
                 update=runner.update_info or updater.status(fetch=False), supervised=osutil.supervised(),
-                restarting=runner.restarting, team_all=crm.team(conn), roles=crm.ROLES,
+                restarting=runner.restarting, team_all=crm.team(conn), roles=crm.ROLES, crm_cfg=crm.settings(conn),
+                digest_sent_on=db.get_setting(conn, "digest_sent_on"),
                 owned={r["owner_id"]: r["n"] for r in rows(conn, "SELECT owner_id, COUNT(*) n FROM leads GROUP BY owner_id")})
+
+
+@app.post("/settings/reminders")
+def settings_reminders(crm_warm_days: int = Form(3), crm_cold_days: int = Form(90), digest_enabled: str = Form(""),
+                       digest_hour: int = Form(8), digest_team: str = Form(""), digest_skip_weekends: str = Form("")):
+    conn = db.connect()
+    db.set_setting(conn, "crm_warm_days", min(60, max(1, crm_warm_days)))
+    db.set_setting(conn, "crm_cold_days", min(730, max(7, crm_cold_days)))
+    db.set_setting(conn, "digest_enabled", bool(digest_enabled))
+    db.set_setting(conn, "digest_hour", min(23, max(0, digest_hour)))
+    db.set_setting(conn, "digest_team", bool(digest_team))
+    db.set_setting(conn, "digest_skip_weekends", bool(digest_skip_weekends))
+    crm.refresh_followups(conn, tz=local_tz())
+    return back("/settings", msg="Saved")
+
+
+@app.post("/settings/reminders/test")
+def settings_reminders_test():
+    """Send today's reminder email to your own mailbox now (not to the team)."""
+    conn = db.connect()
+    try:
+        n = crm.maybe_send_digest(conn, engine.Mailboxes(mail_client, runner.log), utcnow(), runner.log,
+                                  tz=local_tz(), force=True)
+    except (AuthError, GraphError) as ex:
+        return back("/settings", err=f"Couldn't send it: {ex}")
+    return back("/settings", msg="Sent to your mailbox." if n else "No mailbox is connected, so nothing was sent.")
 
 
 @app.post("/settings/team")

@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 from .db import iso, parse, rows, scalar, utcnow
+from .render import lead_phone, wa_digits
 
 TOUCH_TYPES = ("sent", "task_done")
 
@@ -60,12 +61,13 @@ def activity(conn, tz, days: int = 14) -> list[dict]:
     """Daily touches by channel, local days, oldest first."""
     today = utcnow().astimezone(tz).date()
     start = datetime.combine(today - timedelta(days=days - 1), datetime.min.time(), tz)
-    buckets = {today - timedelta(days=i): {"email": 0, "linkedin": 0, "replies": 0} for i in range(days)}
+    buckets = {today - timedelta(days=i): {"email": 0, "linkedin": 0, "whatsapp": 0, "replies": 0} for i in range(days)}
     for r in rows(conn, f"SELECT type, channel, at FROM events WHERE at >= ? AND type IN ('sent', 'task_done', 'reply')",
                   iso(start)):
         d = parse(r["at"]).astimezone(tz).date()
         if d in buckets:
-            key = "replies" if r["type"] == "reply" else ("email" if r["channel"] == "email" else "linkedin")
+            key = "replies" if r["type"] == "reply" else (
+                r["channel"] if r["channel"] in ("email", "whatsapp") else "linkedin")
             buckets[d][key] += 1
     return [{"day": d, **buckets[d]} for d in sorted(buckets)]
 
@@ -196,7 +198,7 @@ def campaign_status(conn, campaign_id: int | None, tz) -> tuple[list[str], list[
     day = lambda s: parse(s).astimezone(tz).strftime("%d-%b-%y") if s else ""  # noqa: E731
     from . import crm
 
-    ens = rows(conn, f"""SELECT e.id eid, e.campaign_id, e.status, e.reply_channel, e.was_connected, c.name campaign, tm.name owner, l.*
+    ens = rows(conn, f"""SELECT e.id eid, e.campaign_id, e.status e_status, e.reply_channel, e.was_connected, c.name campaign, tm.name owner, l.*
                          FROM enrollments e JOIN leads l ON l.id = e.lead_id JOIN campaigns c ON c.id = e.campaign_id
                          LEFT JOIN team tm ON tm.id = l.owner_id
                          {"WHERE e.campaign_id = ?" if campaign_id else ""} ORDER BY c.id, e.id""",
@@ -220,18 +222,20 @@ def campaign_status(conn, campaign_id: int | None, tz) -> tuple[list[str], list[
             out[-1]["text"] += " (OOO)"
     likes, comments, engage_state = _engagement(conn, ids, marks, day)
     summ = crm.summaries(conn, campaign_id=campaign_id)
+    today = datetime.now(tz).date().isoformat()
     n_li = max([2] + [len(v) for v in msgs.values()])
     n_em = max([2] + [len(v) for v in mails.values()])
     cols = ["#", *([] if campaign_id else ["Campaign"]), "Name", "First Name", "Last Name", "Designation", "Department", "Company", "Email", "Phone",
-            "Country", "LinkedIn", "Owner", "Lead Status", "LI Status",
+            "Country", "LinkedIn", "Owner", "Lead Status", "Status Note", "LI Status",
             *[f"LI {_nth(i + 1)} Msg" for i in range(n_li)], "LI Likes", "LI Comments",
             *[f"EM{i + 1}" for i in range(n_em)],
-            *[f"VM{i + 1}" for i in range(N_VOICEMAILS)], "Calls", "Last Call", "Next Step", "Last Touch", "Touches"]
+            "WhatsApp", *[f"VM{i + 1}" for i in range(N_VOICEMAILS)], "Calls", "Last Call", "Last Contacted",
+            "Next Follow-up", "Next Step", "Last Touch", "Touches"]
     out = []
     for n, e in enumerate(ens, start=1):
         extra = json.loads(e["data"] or "{}")
-        via = {"linkedin": "LinkedIn", "call": "call", "meeting": "meeting"}.get(e["reply_channel"], "email")
-        status = e["lead_status"] or (f"Replied ({via})" if e["status"] == "replied" else "Unsubscribed" if e["dnc"] else "")
+        via = {"linkedin": "LinkedIn", "whatsapp": "WhatsApp", "call": "call", "meeting": "meeting"}.get(e["reply_channel"], "email")
+        status = e["lead_status"] or (f"Replied ({via})" if e["e_status"] == "replied" else "Unsubscribed" if e["dnc"] else "")
         sm = summ.get(e["id"], {})
         lc, nx, last = sm.get("last_call"), sm.get("next"), sm.get("last")
         li = "Already Connected" if e["li_state"] == "connected" and e["was_connected"] == 1 else LI_STATUS[e["li_state"]]
@@ -240,21 +244,27 @@ def campaign_status(conn, campaign_id: int | None, tz) -> tuple[list[str], list[
         if not m and e["li_state"] != "connected":
             li_cells[0] = "-"  # can't message them yet
         vms = ([day(x) for x in sm.get("voicemails", [])] + [""] * N_VOICEMAILS)[:N_VOICEMAILS]
-        touches = " · ".join(f"{n} {k}" for k, n in (("email", sm.get("email_out", 0)), ("LI", sm.get("li_out", 0)),
-                                                     ("call", sm.get("calls", 0)),
-                                                     ("in", sm.get("email_in", 0) + sm.get("li_in", 0))) if n)
+        touches = " · ".join(f"{n} {k}" for k, n in (
+            ("email", sm.get("email_out", 0)), ("LI", sm.get("li_out", 0)), ("WA", sm.get("wa_out", 0)),
+            ("call", sm.get("calls", 0)),
+            ("in", sm.get("email_in", 0) + sm.get("li_in", 0) + sm.get("wa_in", 0))) if n)
         values = [n, *([] if campaign_id else [e["campaign"]]), f"{e['first_name']} {e['last_name']}".strip(), e["first_name"], e["last_name"], e["title"],
-                  extra.get("department", ""), e["company"], e["email"] or "", extra.get("phone", ""),
-                  extra.get("country", ""), e["linkedin_url"] or "", e["owner"] or "", status, li,
+                  extra.get("department", ""), e["company"], e["email"] or "", lead_phone(e),
+                  extra.get("country", ""), e["linkedin_url"] or "", e["owner"] or "", e["status"], status, li,
                   *li_cells, _dates(likes.get(e["eid"], [])) or engage_state.get(e["eid"], {}).get("likes", ""),
                   _dates(comments.get(e["eid"], [])) or engage_state.get(e["eid"], {}).get("comments", ""),
-                  *(em + [""] * n_em)[:n_em], *vms, sm.get("calls", 0) or "",
+                  *(em + [""] * n_em)[:n_em], _dates([day(x) for x in sm.get("wa_dates", [])]), *vms,
+                  sm.get("calls", 0) or "",
                   f"{day(lc['at'])} · {lc['outcome'] or 'logged'}" if lc else "",
+                  day(e["last_contacted_at"]),
+                  date.fromisoformat(e["next_followup_at"]).strftime("%d-%b-%y") if e["next_followup_at"] else "",
                   (f"{nx['text']}" + (f" · {nx['date']}" if nx["date"] else "")) if nx else "",
                   f"{day(last['at'])} · {last['label']}" if last else "", touches]
         out.append({"eid": e["eid"], "lead_id": e["id"], "manual_status": e["lead_status"], "owner_id": e["owner_id"],
-                    "phone": extra.get("phone", ""), "campaign_id": e.get("campaign_id"),
-                    "next_due": bool(nx and nx["date"] and nx["date"] <= datetime.now(tz).date().isoformat()),
+                    "phone": lead_phone(e), "campaign_id": e.get("campaign_id"),
+                    "next_due": bool(nx and nx["date"] and nx["date"] <= today),
+                    "followup_due": bool(e["next_followup_at"] and e["next_followup_at"] <= today and not e["dnc"]),
+                    "status": e["status"], "email": e["email"] or "", "wa": wa_digits(lead_phone(e)),
                     "cells": dict(zip(cols, values))})
     return cols, out
 

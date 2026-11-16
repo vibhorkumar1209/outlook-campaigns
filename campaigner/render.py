@@ -114,6 +114,45 @@ def linkedin_text(text: str) -> str:
     return "\n".join(lines)
 
 
+def whatsapp_text(text: str) -> str:
+    """WhatsApp's own light formatting: *bold*, _italic_, "•" bullets, and [text](url) as "text (url)"."""
+    lines = []
+    for line in text.split("\n"):
+        line = BULLET_RE.sub("• ", line, count=1)
+        line = re.sub(r"\[([^\]\n]+)\]\((https?://[^\s)]+)\)", r"\1 (\2)", line)
+        line = BOLD_RE.sub(lambda m: f"\x00{m.group(1)}\x00", line)
+        line = ITALIC_RE.sub(lambda m: f"_{m.group(1) or m.group(2)}_", line)
+        lines.append(line.replace("\x00", "*"))
+    return "\n".join(lines)
+
+
+PHONE_KEYS = ("whatsapp", "whatsapp_number", "mobile", "mobile_phone", "mobile_number", "cell", "cell_phone", "phone",
+              "phone_number", "direct_phone", "direct_dial", "work_phone", "telephone", "contact_number")
+
+
+def lead_phone(lead: dict) -> str:
+    """The lead's phone number from whichever import column held it (WhatsApp/mobile columns win over desk lines)."""
+    data = lead.get("data") or {}
+    if isinstance(data, str):
+        try:
+            data = json.loads(data or "{}")
+        except ValueError:
+            data = {}
+    for k in PHONE_KEYS:
+        v = str(data.get(k) or "").strip()
+        if v:
+            return v
+    return ""
+
+
+def wa_digits(phone: str) -> str:
+    """Digits for a wa.me link (country code first, no "+" or leading 00). Empty if it can't be a full number."""
+    digits = re.sub(r"\D", "", phone or "")
+    if digits.startswith("00"):
+        digits = digits[2:]
+    return digits if 8 <= len(digits) <= 15 else ""
+
+
 def email_html(body: str, signature: str, ctx: dict, *, link: Callable[[str], str] | None = None,
                pixel: str | None = None) -> str:
     """link: rewrites each URL (click tracking). pixel: open-tracking image URL."""

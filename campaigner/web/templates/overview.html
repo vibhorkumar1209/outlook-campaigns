@@ -3,7 +3,7 @@
 {% block title %}Overview{% endblock %}
 {% block main %}
 <header class="head">
-  <div><h1>Overview</h1><p class="sub">Email through Outlook, LinkedIn through your queue. A reply on either channel stops the lead.</p></div>
+  <div><h1>Overview</h1><p class="sub">How the outreach is doing across email, LinkedIn and WhatsApp. A reply on any channel stops that person's sequences. What needs you is on <a href="/today">Today</a>.</p></div>
   <div class="actions">
     <button class="btn" data-run>Run now</button>
     <a class="btn primary" href="/campaigns">New campaign</a>
@@ -22,41 +22,21 @@
   {{ tile("Reply rate", (o.reply_rate ~ "%") if o.reply_rate is not none else "–", "of contacted leads") }}
 </section>
 
-{% if follow_ups %}
-<section class="card">
-  <div class="card-head"><h2>Follow-ups · next 7 days</h2><span class="meta">next steps set when calls, meetings and notes were logged</span></div>
-  <div class="tbl-wrap"><table class="t">
-    <thead><tr><th>Due</th><th>Lead</th><th>Next step</th><th>Owner</th><th>Last logged</th><th></th></tr></thead>
-    <tbody>
-    {% for f in follow_ups %}
-      <tr>
-        <td class="{{ 'bad' if f.overdue else ('warn' if f.today else 'meta') }}">{{ "Overdue · " if f.overdue }}{{ "Today" if f.today else f.next_step_at }}</td>
-        <td><a href="/leads/{{ f.lead_id }}">{{ f.first_name }} {{ f.last_name }}</a><div class="meta">{{ f.company }}</div></td>
-        <td>{{ f.next_step or "Follow up" }}</td>
-        <td class="meta">{{ f.owner or "Unassigned" }}</td>
-        <td class="meta">{{ f.kind | capitalize }}{% if f.outcome %} · {{ f.outcome }}{% endif %} · {{ f.at | ago }}</td>
-        <td><button class="btn sm" data-log data-lead="{{ f.lead_id }}" data-name="{{ f.first_name }} {{ f.last_name }}" data-company="{{ f.company }}">Log</button></td>
-      </tr>
-    {% endfor %}
-    </tbody>
-  </table></div>
-</section>
-{% endif %}
-
 <section class="card">
   <div class="card-head">
     <h2>Activity · last 14 days</h2>
-    <div class="legend"><span><i class="sw email"></i>Emails sent</span><span><i class="sw linkedin"></i>LinkedIn actions</span></div>
+    <div class="legend"><span><i class="sw email"></i>Emails sent</span><span><i class="sw linkedin"></i>LinkedIn actions</span><span><i class="sw whatsapp"></i>WhatsApp messages</span></div>
   </div>
   <div class="bars" role="img" aria-label="Daily emails sent and LinkedIn actions over the last 14 days">
     <div class="gl" style="top:0"><span>{{ peak }}</span></div>
     {% if peak > 1 %}<div class="gl" style="top:calc((100% - 22px) / 2)"><span>{{ (peak / 2) | round(1) | replace(".0", "") }}</span></div>{% endif %}
     <div class="base"></div>
     {% for d in act %}
-      {% set total = d.email + d.linkedin %}
-      <div class="col" data-tip="{{ d.day.strftime('%a %b %d') }} · email {{ d.email }} · LinkedIn {{ d.linkedin }} · replies {{ d.replies }}">
+      {% set total = d.email + d.linkedin + d.whatsapp %}
+      <div class="col" data-tip="{{ d.day.strftime('%a %b %d') }} · email {{ d.email }} · LinkedIn {{ d.linkedin }} · WhatsApp {{ d.whatsapp }} · replies {{ d.replies }}">
         {% if total %}
         <div class="stack" style="height: {{ (100 * total / peak) | round(1) }}%">
+          {% if d.whatsapp %}<div class="seg whatsapp" style="flex: {{ d.whatsapp }}"></div>{% endif %}
           {% if d.linkedin %}<div class="seg linkedin" style="flex: {{ d.linkedin }}"></div>{% endif %}
           {% if d.email %}<div class="seg email" style="flex: {{ d.email }}"></div>{% endif %}
         </div>

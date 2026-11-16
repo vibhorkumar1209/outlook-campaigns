@@ -1,0 +1,25 @@
+{# One dialog for the "Send email / message" quick action; opened by any [data-compose] button (see app.js). #}
+<dialog id="compose-dlg" class="dlg" aria-labelledby="compose-title">
+  <form method="dialog" id="compose-form" class="stack-y" style="gap:10px">
+    <div class="card-head"><h2 id="compose-title">Send email / message</h2><button class="btn sm ghost" value="cancel" formnovalidate aria-label="Close">✕</button></div>
+    <p class="meta" id="compose-who"></p>
+    <input type="hidden" name="lead">
+    <div class="seg" role="radiogroup" aria-label="Channel">
+      <label><input type="radio" name="via" value="email" checked> Email</label>
+      <label><input type="radio" name="via" value="whatsapp"> WhatsApp</label>
+      <label><input type="radio" name="via" value="linkedin"> LinkedIn</label>
+    </div>
+    <label class="f" data-via="email">Subject<input name="subject" placeholder="Leave blank to reply in your existing thread with them"></label>
+    <label class="f">Message<textarea name="body" rows="7" placeholder="Hi {{ '{{ first_name }}' }}, …"></textarea></label>
+    <p class="meta" data-via="email">The email is saved in your Outlook Drafts folder, on top of your last email to them when there is one. <b>Save draft</b> leaves it there for you to finish; <b>Send now</b> sends it straight away. Either way it's added to their history.</p>
+    <p class="meta" data-via="whatsapp" hidden>Opens WhatsApp with this message ready; you press send there. Then <b>Log as sent</b> so it's in their history. <span id="compose-wa-missing" hidden>No phone number with a country code is saved for this lead: add one on their page.</span></p>
+    <p class="meta" data-via="linkedin" hidden>Copies the message and opens their profile; paste and send it there. Then <b>Log as sent</b> so it's in their history.</p>
+    <div class="actions">
+      <button class="btn primary" value="draft" data-via="email">Save draft</button>
+      <button class="btn" value="send" data-via="email">Send now</button>
+      <button class="btn primary" type="button" id="compose-open-wa" data-via="whatsapp" hidden>Open WhatsApp</button>
+      <button class="btn primary" type="button" id="compose-open-li" data-via="linkedin" hidden>Copy &amp; open profile</button>
+      <button class="btn" type="button" id="compose-logged" data-via="whatsapp linkedin" hidden>Log as sent</button>
+    </div>
+  </form>
+</dialog>

@@ -22,11 +22,14 @@ from jinja2 import TemplateError
 from . import attachments, db
 from .db import event, iso, one, parse, rows, scalar, utcnow
 from .graph import AuthError, GraphError, NetworkError
-from .render import email_html, lead_context, linkedin_text, plain_text, render_text
+from .render import email_html, lead_context, lead_phone, linkedin_text, plain_text, render_text, wa_digits, whatsapp_text
 from .tracking import BOT_UA, MACHINE_WINDOW_S
 
-CHANNELS = {"email": "Email", "li_view": "View profile", "li_connect": "Connect", "li_message": "LinkedIn message"}
+CHANNELS = {"email": "Email", "li_view": "View profile", "li_connect": "Connect", "li_message": "LinkedIn message",
+            "whatsapp": "WhatsApp message"}
 LI = ("li_view", "li_connect", "li_message")
+# WhatsApp is an assisted step: the queue opens WhatsApp with the text ready, you press send. No bot, no API.
+WHATSAPP = "whatsapp"
 # Task-only channel: recurring "like + comment on a recent post" alongside the sequence. Not a sequence step.
 ENGAGE = "li_engage"
 TASK_LABELS = {**CHANNELS, ENGAGE: "Like + comment"}
@@ -67,6 +70,7 @@ def step_delay(c: dict, steps: list[dict], k: int) -> timedelta:
 LI_LOOKBACK = timedelta(days=14)      # first scan of LinkedIn notification mails
 MAX_FAILURES = 3
 MAX_EMAILS_PER_TICK = 10
+MAIL_SYNC_LOOKBACK = timedelta(days=14)  # first sync of hand-written emails to/from leads
 
 AUTO_SUBJECTS = ("automatic reply", "auto reply", "autoreply", "auto-reply", "auto response", "autoresponse",
                  "auto-response", "out of office", "out of the office", "ooo", "away from", "on leave",
@@ -181,9 +185,11 @@ def mark_replied(conn, lead_id: int, channel: str, at: datetime, *, enrollment: 
         close_tasks(conn, e["id"], at)
     event(conn, lead_id, "reply", enrollment=enrollment, channel=channel,
           step_pos=enrollment["step_pos"] if enrollment else None, detail=detail, at=at, content=content)
-    # They responded: out of every sequence (above) and into Leads.
+    # They responded: out of every sequence (above) and into Leads. A response is interest until you say otherwise.
     conn.execute("UPDATE leads SET stage = 'lead', became_lead_at = COALESCE(became_lead_at, ?) WHERE id = ?",
                  (iso(at), lead_id))
+    conn.execute("UPDATE leads SET status = 'Warm', status_changed_at = ?, followup_snoozed_until = NULL "
+                 "WHERE id = ? AND status IN ('New', 'Cold')", (iso(at), lead_id))
     return True
 
 
@@ -191,7 +197,7 @@ def unsubscribe(conn, lead_id: int, at: datetime, enrollment: dict | None = None
     """Do-not-contact: stops every sequence for the lead, now and in future imports."""
     if scalar(conn, "SELECT dnc FROM leads WHERE id = ?", lead_id):
         return False
-    conn.execute("UPDATE leads SET dnc = 1 WHERE id = ?", (lead_id,))
+    conn.execute("UPDATE leads SET dnc = 1, status = 'Closed/Lost', status_changed_at = ? WHERE id = ?", (iso(at), lead_id))
     for e in rows(conn, "SELECT * FROM enrollments WHERE lead_id = ? AND status IN ('pending', 'active', 'done')", lead_id):
         conn.execute("UPDATE enrollments SET status = 'stopped', note = 'unsubscribed' WHERE id = ?", (e["id"],))
         close_tasks(conn, e["id"], at)
@@ -441,6 +447,8 @@ def set_lead_contact(conn, lead_id: int, email: str | None, linkedin_url: str | 
     conn.execute("UPDATE leads SET email = ?, linkedin_url = ? WHERE id = ?", (email, linkedin_url, lead_id))
     if old and (old["email"] or "") != (email or ""):
         conn.execute("UPDATE leads SET email_bounced = 0, email_updated_at = ? WHERE id = ?", (iso(now or utcnow()), lead_id))
+        conn.execute("""UPDATE email_drafts SET status = 'discarded', note = 'email address changed', done_at = ?
+                        WHERE lead_id = ? AND status IN ('pending', 'approved')""", (iso(now or utcnow()), lead_id))
 
 
 def _advance(conn, e: dict, k: int, now: datetime) -> None:
@@ -459,7 +467,8 @@ def complete_task(conn, task_id: int, action: str, body: str | None = None, now:
         raise ValueError("task already handled")
     e = one(conn, "SELECT * FROM enrollments WHERE id = ?", t["enrollment_id"])
     if action == "replied":
-        mark_replied(conn, e["lead_id"], "linkedin", now, enrollment=e, detail="marked from queue")
+        mark_replied(conn, e["lead_id"], "whatsapp" if t["channel"] == WHATSAPP else "linkedin", now, enrollment=e,
+                     detail="marked from queue")
         return
     if t["channel"] == ENGAGE:
         _complete_engage(conn, t, e, action, body, engage or {}, now, actor)
@@ -693,6 +702,8 @@ def gate(st: dict, e: dict, now: datetime, due: datetime,
         return "email address bounced (fix it on the contact to resume email)", False
     if ch in LI and not e["linkedin_url"]:
         return "no LinkedIn URL", False
+    if ch == WHATSAPP and not wa_digits(lead_phone(e)):
+        return "no phone number with country code", False
     if st["condition"] == "if_was_connected" and not e.get("was_connected"):
         return "needed an invite (other branch)", False
     if st["condition"] == "if_was_invited" and e.get("was_connected"):
@@ -783,8 +794,8 @@ def process_campaign(conn, c: dict, boxes: Mailboxes, tracker, now: datetime, se
         return
     start = parse(c["start_at"])
     today = iso(day_start(c, now))
-    li_today = scalar(conn, "SELECT COUNT(*) FROM events WHERE campaign_id = ? AND type = 'task_created' AND at >= ?",
-                      c["id"], today)
+    li_today = scalar(conn, """SELECT COUNT(*) FROM events WHERE campaign_id = ? AND type = 'task_created' AND at >= ?
+                               AND COALESCE(channel, '') != 'whatsapp'""", c["id"], today)
     queue = []
     # Acceptances first, and outside the campaign's daily LinkedIn limit: they answer an invite already counted
     # there (the bot's own message limit still paces sending).
@@ -842,17 +853,18 @@ def process_campaign(conn, c: dict, boxes: Mailboxes, tracker, now: datetime, se
             if st["channel"] == "email":
                 queue.append((e, k, st))
                 break
-            if li_today >= c["li_daily_cap"]:
+            is_li = st["channel"] != WHATSAPP
+            if is_li and li_today >= c["li_daily_cap"]:
                 break
             try:
-                body = linkedin_text(render_text(st["body"], lead_context(e)))
+                body = (linkedin_text if is_li else whatsapp_text)(render_text(st["body"], lead_context(e)))
             except TemplateError as ex:
                 _fail(conn, e, k, f"template: {ex}", log, permanent=True)
                 break
             conn.execute("INSERT INTO tasks (enrollment_id, step_pos, channel, body, created_at) VALUES (?, ?, ?, ?, ?)",
                          (e["id"], k, st["channel"], body, iso(now)))
             event(conn, e["lead_id"], "task_created", enrollment=e, channel=st["channel"], step_pos=k, at=now)
-            li_today += 1
+            li_today += is_li
             break
     if c["li_engage"]:
         # Sequence steps took their share of today's LinkedIn budget first; engagement uses what's left.
@@ -875,22 +887,40 @@ def mailbox_remaining(conn, account: str, c: dict, now: datetime) -> int:
 
 
 def send_emails(conn, c, steps, queue, boxes: Mailboxes, tracker, now, send, sleep, log) -> None:
-    if not in_window(c, now) and not is_dummy(c):
+    """Email steps that are due. In draft mode (the default) each email is saved in Outlook's Drafts folder and
+    waits for you to approve it; approved drafts, and everything in auto mode, go out inside the send window."""
+    draft_mode = (c.get("email_mode") or "draft") != "auto"
+    window = in_window(c, now) or is_dummy(c)
+    if not window and not draft_mode:
         log(f"{c['name']}: outside send window, {len(queue)} emails waiting")
         return
     sent_today = scalar(conn, "SELECT COUNT(*) FROM sends WHERE campaign_id = ? AND sent_at >= ?",
                         c["id"], iso(day_start(c, now)))
+    drafts = {(d["enrollment_id"], d["step_pos"]): d for d in rows(
+        conn, "SELECT * FROM email_drafts WHERE campaign_id = ? AND status IN ('pending', 'approved')", c["id"])}
     budget = max(0, min(MAX_EMAILS_PER_TICK, c["email_daily_cap"] - sent_today))
+    # Never more drafts waiting than could go out in a day.
+    draft_budget = max(0, min(MAX_EMAILS_PER_TICK, c["email_daily_cap"] - sent_today - len(drafts)))
     queue.sort(key=lambda q: q[0]["conversation_id"] is None)  # follow-ups first: time-sensitive
     first_email = next(s for s in steps if s["channel"] == "email")
     fallback = c["sender"] or default_sender(conn)
     remaining: dict[str, int] = {}
     warned: set[str] = set()
-    sent = 0
+    sent = drafted = waiting = 0
     for e, k, st in queue:
-        if sent >= budget:
+        d = drafts.get((e["id"], k))
+        if d and d["status"] == "pending" and draft_mode:
+            continue  # written, waiting for you
+        if d and not window:
+            waiting += 1
+            continue  # approved: goes out when the window opens
+        if not d and draft_mode and drafted >= draft_budget:
+            continue
+        if d and sent >= budget:
+            continue
+        if not d and not draft_mode and sent >= budget:
             break
-        acct = e["sender"] or fallback  # follow-ups stay in the mailbox that started the thread
+        acct = (d and d["sender"]) or e["sender"] or fallback  # follow-ups stay in the mailbox that started the thread
         if not acct:
             log(f"{c['name']}: no mailbox connected, {len(queue)} emails waiting")
             return
@@ -899,10 +929,30 @@ def send_emails(conn, c, steps, queue, boxes: Mailboxes, tracker, now, send, sle
             continue
         if acct not in remaining:
             remaining[acct] = mailbox_remaining(conn, acct, c, now)
-        if remaining[acct] <= 0:
+        if remaining[acct] <= 0 and (d or not draft_mode):
             if acct not in warned:
                 warned.add(acct)
                 log(f"{acct}: daily cap reached, emails wait until tomorrow")
+            continue
+        if d:
+            if not send:
+                log(f"[dry run] {c['name']} step {k + 1} {acct} -> {e['email']}: approved draft")
+                continue
+            if sent:
+                sleep(random.uniform(*(DUMMY_GAP if is_dummy(c) else (c["gap_min"], c["gap_max"]))))
+            try:
+                if e["conversation_id"] and _replied_meanwhile(conn, graph, e, acct, fallback, log):
+                    continue
+                outcome = send_draft_row(conn, graph, d, now, log)
+            except NetworkError as ex:
+                boxes.hold(acct, f"network problem ({ex}).")
+                continue
+            except GraphError as ex:
+                _fail(conn, e, k, str(ex), log, permanent=False)
+                continue
+            if outcome == "sent":
+                remaining[acct] -= 1
+                sent += 1
             continue
         sid = secrets.token_urlsafe(9)
         ctx = lead_context(e)
@@ -911,6 +961,7 @@ def send_emails(conn, c, steps, queue, boxes: Mailboxes, tracker, now, send, sle
         link = (lambda u, sid=sid: u if tracker.owns(u) else tracker.click_url(sid, u)) \
             if tracker and c["track_clicks"] else None
         pixel = tracker.open_url(sid) if tracker and c["track_opens"] else None
+        tracked = (1 if pixel else 0) | (2 if link else 0)
         try:
             subject = render_text(st["subject"] or first_email["subject"], ctx)
             html = email_html(st["body"], c["signature"], ctx, link=link, pixel=pixel)
@@ -924,22 +975,24 @@ def send_emails(conn, c, steps, queue, boxes: Mailboxes, tracker, now, send, sle
         if not send:
             log(f"[dry run] {c['name']} step {k + 1} {acct} -> {e['email']}: {subject}")
             continue
-        if sent:
+        if sent and not draft_mode:
             sleep(random.uniform(*(DUMMY_GAP if is_dummy(c) else (c["gap_min"], c["gap_max"]))))
         try:
-            if e["conversation_id"]:
-                # Replies can land between the batch check and now; recheck before nudging.
-                watch = [w for w in rows(conn, EMAIL_WATCH_SQL + " AND e.lead_id = ?", e["lead_id"])
-                         if (w["acct"] or fallback) == acct]
-                if watch and check_lead_email(conn, graph, watch, log):
-                    continue
+            if e["conversation_id"] and _replied_meanwhile(conn, graph, e, acct, fallback, log):
+                continue
             conv = e["conversation_id"]
             if st["in_thread"] and not conv and e["first_email_at"]:
                 # Earlier emails went out before the app tracked this lead (imported history): find that thread.
                 conv = graph.last_thread_with(e["email"], parse(e["first_email_at"]) - timedelta(days=1))
-            if st["in_thread"] and conv:
+            threaded = bool(st["in_thread"] and conv)
+            strip = tracker.base if tracker else None
+            if draft_mode:
+                dr = (graph.draft_in_thread(conv, e["email"], ctx["name"], html, "Re: " + subject, strip_pixels=strip,
+                                            attachments=files) if threaded
+                      else graph.draft_new(e["email"], ctx["name"], subject, html, attachments=files))
+            elif threaded:
                 cid = graph.send_in_thread(conv, e["email"], ctx["name"], html, "Re: " + subject,
-                                           strip_pixels=tracker.base if tracker else None, attachments=files)
+                                           strip_pixels=strip, attachments=files)
             else:
                 cid = graph.send_new(e["email"], ctx["name"], subject, html, attachments=files)
         except NetworkError as ex:
@@ -948,17 +1001,205 @@ def send_emails(conn, c, steps, queue, boxes: Mailboxes, tracker, now, send, sle
         except GraphError as ex:
             _fail(conn, e, k, str(ex), log, permanent=False)
             continue
-        conn.execute("""UPDATE enrollments SET step_pos = ?, status = 'active', conversation_id = ?, failures = 0,
-                          note = NULL, sender = ?, first_email_at = COALESCE(first_email_at, ?), last_step_at = ?
-                        WHERE id = ?""", (k, cid, acct, iso(now), iso(now), e["id"]))
-        conn.execute("""INSERT INTO sends (id, enrollment_id, campaign_id, lead_id, step_pos, sender, subject, tracked, sent_at,
-                          body) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                     (sid, e["id"], c["id"], e["lead_id"], k, acct, subject, (1 if pixel else 0) | (2 if link else 0),
-                      iso(now), plain_text(html)[:20000]))
-        event(conn, e["lead_id"], "sent", enrollment=e, channel="email", step_pos=k, detail=subject, at=now)
+        if draft_mode:
+            conn.execute("""INSERT INTO email_drafts (lead_id, enrollment_id, campaign_id, step_pos, sender, to_email, subject,
+                              html, outlook_id, web_link, conversation_id, threaded, sid, tracked, created_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                         (e["lead_id"], e["id"], c["id"], k, acct, e["email"], subject, html, dr.get("id"), dr.get("webLink"),
+                          dr.get("conversationId"), int(threaded), sid, tracked, iso(now)))
+            event(conn, e["lead_id"], "draft_created", enrollment=e, channel="email", step_pos=k, detail=subject, at=now)
+            drafted += 1
+            log(f"drafted {c['name']} step {k + 1} {acct} -> {e['email']} (in Outlook Drafts, waiting for your approval)")
+            continue
+        record_sent(conn, lead_id=e["lead_id"], enrollment=e, campaign_id=c["id"], step_pos=k, acct=acct,
+                    conversation_id=cid, sid=sid, subject=subject, body_text=plain_text(html), tracked=tracked, at=now)
         remaining[acct] -= 1
         sent += 1
         log(f"sent {c['name']} step {k + 1} {acct} -> {e['email']}")
+    if waiting:
+        log(f"{c['name']}: outside send window, {waiting} approved emails waiting")
+
+
+def _replied_meanwhile(conn, graph, e: dict, acct: str, fallback: str | None, log) -> bool:
+    """Replies can land between the batch check and now; recheck this lead before nudging."""
+    watch = [w for w in rows(conn, EMAIL_WATCH_SQL + " AND e.lead_id = ?", e["lead_id"]) if (w["acct"] or fallback) == acct]
+    return bool(watch and check_lead_email(conn, graph, watch, log))
+
+
+def record_sent(conn, *, lead_id: int, enrollment: dict | None, campaign_id: int | None, step_pos: int | None, acct: str,
+                conversation_id: str | None, sid: str | None, subject: str, body_text: str, tracked: int,
+                at: datetime) -> None:
+    """Bookkeeping for one email that has left the mailbox: the sequence moves on, and it's in the log."""
+    e = enrollment
+    if e and e["status"] in ("pending", "active") and e["step_pos"] < step_pos:
+        conn.execute("""UPDATE enrollments SET step_pos = ?, status = 'active', conversation_id = ?, failures = 0,
+                          note = NULL, sender = ?, first_email_at = COALESCE(first_email_at, ?), last_step_at = ?
+                        WHERE id = ?""", (step_pos, conversation_id, acct, iso(at), iso(at), e["id"]))
+    conn.execute("""INSERT INTO sends (id, enrollment_id, campaign_id, lead_id, step_pos, sender, subject, tracked, sent_at,
+                      body) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                 (sid or secrets.token_urlsafe(9), e and e["id"], campaign_id, lead_id, -1 if step_pos is None else step_pos,
+                  acct, subject, tracked, iso(at), body_text[:20000]))
+    event(conn, lead_id, "sent", enrollment=e, channel="email", step_pos=step_pos, detail=subject, at=at,
+          content=None if e else body_text[:5000])
+
+
+# ---------- email drafts ----------
+
+def send_draft_row(conn, graph, d: dict, now: datetime, log) -> str:
+    """Send one approved draft as it stands in Outlook (your edits there included). Returns 'sent', or 'skipped'
+    when the draft is gone from Outlook. If you already sent it from Outlook yourself, that's recorded instead."""
+    st = graph.draft_state(d["outlook_id"])
+    if st["state"] in ("deleted", "missing"):
+        skip_draft(conn, d, "deleted in Outlook", now, graph=None)
+        conn.execute("UPDATE email_drafts SET outlook_id = NULL WHERE id = ?", (d["id"],))  # yours to keep or purge
+        log(f"draft to {d['to_email']} was deleted in Outlook: that email is skipped")
+        return "skipped"
+    if st["state"] == "draft":
+        graph.send_draft(d["outlook_id"])
+    at = (parse(st.get("sent_at")) if st["state"] == "sent" else None) or now
+    finish_draft(conn, d, st, at)
+    log(f"sent {'(from Outlook) ' if st['state'] == 'sent' else ''}{d['sender']} -> {d['to_email']}: {st.get('subject') or d['subject']}")
+    return "sent"
+
+
+def finish_draft(conn, d: dict, st: dict, at: datetime) -> None:
+    subject = st.get("subject") or d["subject"]
+    # A reply draft's body carries the quoted thread; log our own text. A fresh email is logged as it went out.
+    body = plain_text(d["html"] if d["threaded"] or not st.get("html") else st["html"])
+    conn.execute("UPDATE email_drafts SET status = 'sent', done_at = ?, subject = ? WHERE id = ?", (iso(at), subject, d["id"]))
+    e = one(conn, "SELECT * FROM enrollments WHERE id = ?", d["enrollment_id"]) if d["enrollment_id"] else None
+    record_sent(conn, lead_id=d["lead_id"], enrollment=e, campaign_id=d["campaign_id"], step_pos=d["step_pos"],
+                acct=d["sender"], conversation_id=st.get("conversation_id") or d["conversation_id"], sid=d["sid"],
+                subject=subject, body_text=body, tracked=d["tracked"], at=at)
+
+
+def skip_draft(conn, d: dict, reason: str, now: datetime, graph=None) -> None:
+    """Don't send this email; the sequence carries on with the next step."""
+    conn.execute("UPDATE email_drafts SET status = 'skipped', note = ?, done_at = ? WHERE id = ?", (reason, iso(now), d["id"]))
+    if graph and d["outlook_id"]:
+        graph.delete_draft(d["outlook_id"])
+        conn.execute("UPDATE email_drafts SET outlook_id = NULL WHERE id = ?", (d["id"],))
+    e = one(conn, "SELECT * FROM enrollments WHERE id = ?", d["enrollment_id"]) if d["enrollment_id"] else None
+    if e and e["status"] in ("pending", "active") and e["step_pos"] < d["step_pos"]:
+        _advance(conn, e, d["step_pos"], now)
+        event(conn, e["lead_id"], "step_skipped", enrollment=e, channel="email", step_pos=d["step_pos"],
+              detail=f"email not sent: {reason}", at=now)
+
+
+def thread_for(conn, lead_id: int) -> tuple[str | None, str | None, str]:
+    """(mailbox, conversation id, signature) for a one-off email to a lead: the thread and mailbox their sequence
+    used, when there is one, so it lands on top of what they've already had from you."""
+    e = one(conn, """SELECT e.sender, e.conversation_id, c.sender c_sender, c.signature FROM enrollments e
+                     JOIN campaigns c ON c.id = e.campaign_id WHERE e.lead_id = ?
+                     ORDER BY e.conversation_id IS NOT NULL DESC, e.last_step_at DESC, e.id DESC LIMIT 1""", lead_id)
+    acct = (e and (e["sender"] or e["c_sender"])) or default_sender(conn)
+    return acct, (e and e["conversation_id"]) or None, (e and e["signature"]) or ""
+
+
+def approve_drafts(conn, ids: list[int], now: datetime | None = None) -> int:
+    marks = ",".join("?" * len(ids)) or "NULL"
+    return conn.execute(f"UPDATE email_drafts SET status = 'approved', approved_at = ? WHERE status = 'pending' "
+                        f"AND id IN ({marks})", (iso(now or utcnow()), *ids)).rowcount
+
+
+def sync_drafts(conn, boxes: Mailboxes, now: datetime, send: bool, log, check_outlook: bool) -> None:
+    """Keep drafts honest: drop ones whose sequence has stopped, send one-off emails you approved, and (on the
+    full pass) notice drafts you sent or deleted in Outlook yourself."""
+    for d in rows(conn, """SELECT d.*, e.status e_status, e.step_pos e_pos, l.dnc FROM email_drafts d
+                           JOIN leads l ON l.id = d.lead_id LEFT JOIN enrollments e ON e.id = d.enrollment_id
+                           WHERE d.status IN ('pending', 'approved') ORDER BY d.id"""):
+        stale = d["dnc"] or (d["enrollment_id"] and (d["e_status"] not in ("pending", "active") or d["e_pos"] >= d["step_pos"]))
+        if stale and not check_outlook:
+            continue  # decided on the full pass, where Outlook can say whether you sent it yourself
+        one_off_go = d["step_pos"] is None and d["status"] == "approved"
+        graph = boxes.get(d["sender"]) if send and (check_outlook or one_off_go) else None
+        try:
+            if graph and d["outlook_id"] and (check_outlook or d["status"] == "approved"):
+                st = graph.draft_state(d["outlook_id"])
+                if st["state"] == "sent":  # you sent it from Outlook
+                    finish_draft(conn, d, st, parse(st.get("sent_at")) or now)
+                    log(f"sent (from Outlook) {d['sender']} -> {d['to_email']}: {st.get('subject') or d['subject']}")
+                    continue
+                if st["state"] in ("deleted", "missing"):
+                    skip_draft(conn, d, "deleted in Outlook", now)
+                    conn.execute("UPDATE email_drafts SET outlook_id = NULL WHERE id = ?", (d["id"],))
+                    log(f"draft to {d['to_email']} was deleted in Outlook: that email is skipped")
+                    continue
+            if stale:
+                conn.execute("UPDATE email_drafts SET status = 'discarded', note = ?, done_at = ? WHERE id = ?",
+                             ("do not contact" if d["dnc"] else "sequence stopped or moved on", iso(now), d["id"]))
+                continue
+            if graph and d["step_pos"] is None and d["status"] == "approved":  # a one-off you asked to send now
+                send_draft_row(conn, graph, d, now, log)
+        except NetworkError as ex:
+            boxes.hold(d["sender"], f"network problem ({ex}).")
+        except GraphError as ex:
+            log(f"draft to {d['to_email']}: {ex}")
+    if not (send and check_outlook):
+        return
+    # Outlook copies of drafts that will never be sent are removed, so nothing stale can be sent by mistake.
+    for d in rows(conn, "SELECT id, sender, outlook_id FROM email_drafts WHERE status IN ('skipped', 'discarded') "
+                        "AND outlook_id IS NOT NULL"):
+        graph = boxes.get(d["sender"])
+        if graph:
+            graph.delete_draft(d["outlook_id"])
+            conn.execute("UPDATE email_drafts SET outlook_id = NULL WHERE id = ?", (d["id"],))
+
+
+# ---------- mailbox sync: emails with leads that didn't go through a sequence ----------
+
+def sync_mail(conn, boxes: Mailboxes, now: datetime, log) -> None:
+    """The CRM's log covers every email with a lead, not only sequence emails: ones you write by hand in Outlook
+    and everything they send after their first reply are picked up here. Read-only; never stops a sequence."""
+    by_email = {l["email"].lower(): l["id"] for l in rows(conn, "SELECT id, email FROM leads WHERE email IS NOT NULL")}
+    if not by_email:
+        return
+    for s in rows(conn, "SELECT account FROM senders ORDER BY created_at, account"):
+        acct = s["account"]
+        graph = boxes.get(acct)
+        if not graph:
+            continue
+        cur_in = parse(db.get_setting(conn, f"mail_sync_in:{acct}")) or now - MAIL_SYNC_LOOKBACK
+        cur_out = parse(db.get_setting(conn, f"mail_sync_out:{acct}")) or now - MAIL_SYNC_LOOKBACK
+        try:
+            inbound, outbound, me = graph.messages_since(cur_in), graph.sent_since(cur_out), graph.my_address()
+        except GraphError as ex:
+            log(f"mail sync for {acct} failed: {ex}")
+            continue
+        n = 0
+        for m in inbound:
+            lead_id = by_email.get(_sender(m))
+            if not lead_id or _sender(m) == me or not m.get("receivedDateTime"):
+                continue
+            at = parse(m["receivedDateTime"])
+            if scalar(conn, """SELECT 1 FROM events WHERE lead_id = ? AND (ref = ? OR (at = ? AND type IN
+                               ('reply', 'auto_reply', 'bounce', 'email_in')))""", lead_id, m["id"], iso(at)):
+                continue
+            event(conn, lead_id, "email_in", channel="email", detail=m.get("subject"), content=m.get("bodyPreview"),
+                  at=at, ref=m["id"])
+            n += 1
+        for m in outbound:
+            if not m.get("sentDateTime"):
+                continue
+            at = parse(m["sentDateTime"])
+            for r in m.get("toRecipients") or []:
+                lead_id = by_email.get(((r.get("emailAddress") or {}).get("address") or "").lower())
+                if not lead_id:
+                    continue
+                # The app's own sends are already logged (within moments of Outlook's timestamp).
+                if scalar(conn, "SELECT 1 FROM events WHERE lead_id = ? AND ref = ?", lead_id, m["id"]) or scalar(
+                        conn, "SELECT 1 FROM sends WHERE lead_id = ? AND sent_at BETWEEN ? AND ?", lead_id,
+                        iso(at - timedelta(minutes=3)), iso(at + timedelta(minutes=3))):
+                    continue
+                event(conn, lead_id, "email_out", channel="email", detail=m.get("subject"),
+                      content=m.get("bodyPreview"), at=at, ref=m["id"])
+                n += 1
+        if inbound:
+            db.set_setting(conn, f"mail_sync_in:{acct}", max(m.get("receivedDateTime") or "" for m in inbound) or iso(cur_in))
+        if outbound:
+            db.set_setting(conn, f"mail_sync_out:{acct}", max(m.get("sentDateTime") or "" for m in outbound) or iso(cur_out))
+        if n:
+            log(f"mail sync {acct}: {n} email(s) with leads added to their history")
 
 
 def tick(conn, factory, *, tracker=None, now: datetime | None = None, send: bool = True, sleep=time.sleep,
@@ -973,6 +1214,11 @@ def tick(conn, factory, *, tracker=None, now: datetime | None = None, send: bool
     if checks:
         check_email(conn, boxes, now, log)
         check_linkedin(conn, boxes, now, log)
+        try:
+            sync_mail(conn, boxes, now, log)
+        except Exception as ex:  # the history log is best-effort; never block sending on it
+            log(f"mail sync failed: {ex!r}")
+    sync_drafts(conn, boxes, now, send, log, check_outlook=checks)
     if tracker and not checks:
         tracker = tracker if db.get_setting(conn, "tracker_ok", True) else None
     elif tracker:
@@ -989,4 +1235,12 @@ def tick(conn, factory, *, tracker=None, now: datetime | None = None, send: bool
                 log(f"tracking pull failed: {ex}")
     for c in rows(conn, "SELECT * FROM campaigns WHERE status = 'active' ORDER BY id"):
         process_campaign(conn, c, boxes, tracker, now, send, sleep, log)
+    from . import crm
+
+    crm.refresh_followups(conn, now)
+    if send:
+        try:
+            crm.maybe_send_digest(conn, boxes, now, log)
+        except Exception as ex:  # a reminder email must never break a run
+            log(f"daily reminder email failed: {ex!r}")
     db.set_setting(conn, "last_tick", iso(utcnow()))
