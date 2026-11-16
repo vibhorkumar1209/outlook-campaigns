@@ -17,6 +17,8 @@ SCOPES = ["Mail.Send", "Mail.ReadWrite", "User.Read"]
 CACHE_PATH = os.path.expanduser("~/.outlook-campaigns/token_cache.bin")
 MSG_FIELDS = "id,conversationId,from,subject,bodyPreview,receivedDateTime,isDraft,internetMessageHeaders"
 RETRY_STATUS = {429, 502, 503, 504}
+# Ask Graph for ids that survive a move between folders (Drafts -> Sent Items), so a saved draft can be followed.
+IMMUTABLE = 'IdType="ImmutableId"'
 
 
 class AuthError(RuntimeError):
@@ -167,28 +169,20 @@ class Graph:
     def my_address(self) -> str:
         return self.profile()["email"]
 
-    def _send_draft(self, draft_id: str) -> None:
-        try:
-            self._req("POST", f"/me/messages/{draft_id}/send")
-        except GraphError:
-            try:
-                self._req("DELETE", f"/me/messages/{draft_id}")  # don't leave orphan drafts
-            except GraphError:
-                pass
-            raise
-
     def _attach(self, draft_id: str, attachments: list[dict] | None) -> None:
         import base64
 
         for a in attachments or []:
-            self._req("POST", f"/me/messages/{draft_id}/attachments", json={
+            self._req("POST", f"/me/messages/{draft_id}/attachments", headers={"Prefer": IMMUTABLE}, json={
                 "@odata.type": "#microsoft.graph.fileAttachment",
                 "name": a["name"], "contentType": a["type"], "contentBytes": base64.b64encode(a["data"]).decode(),
             })
 
-    def send_new(self, to_email: str, to_name: str, subject: str, html: str, attachments: list[dict] | None = None) -> str:
-        """Send a fresh message. Returns its conversationId."""
-        draft = self._req("POST", "/me/messages", json={
+    def draft_new(self, to_email: str, to_name: str, subject: str, html: str,
+                  attachments: list[dict] | None = None) -> dict:
+        """Save a fresh message in Drafts without sending. Returns {id, conversationId, webLink}; the id is
+        immutable, so it still names the message after it's sent or moved."""
+        draft = self._req("POST", "/me/messages", headers={"Prefer": IMMUTABLE}, json={
             "subject": subject,
             "body": {"contentType": "HTML", "content": html},
             "toRecipients": [_rcpt(to_email, to_name)],
@@ -196,30 +190,72 @@ class Graph:
         try:
             self._attach(draft["id"], attachments)
         except GraphError:
-            self._req("DELETE", f"/me/messages/{draft['id']}")
+            self._req("DELETE", f"/me/messages/{draft['id']}", headers={"Prefer": IMMUTABLE})
             raise
-        self._send_draft(draft["id"])
+        return draft
+
+    def send_new(self, to_email: str, to_name: str, subject: str, html: str, attachments: list[dict] | None = None) -> str:
+        """Send a fresh message. Returns its conversationId."""
+        draft = self.draft_new(to_email, to_name, subject, html, attachments)
+        self.send_draft(draft["id"])
         return draft["conversationId"]
 
-    def send_in_thread(self, conversation_id: str, to_email: str, to_name: str, html: str, fallback_subject: str,
-                       strip_pixels: str | None = None, attachments: list[dict] | None = None) -> str:
-        """Reply on top of our last sent message in the thread, so follow-ups stack like a human's would.
-        strip_pixels: tracker base URL; earlier open pixels are removed from the quoted text so they
-        don't fire again (and misattribute opens) when the follow-up is read."""
+    def send_draft(self, draft_id: str) -> None:
+        """Send a message saved by draft_new / draft_in_thread, as it is now (edits made in Outlook included)."""
+        self._req("POST", f"/me/messages/{draft_id}/send", headers={"Prefer": IMMUTABLE})
+
+    def delete_draft(self, draft_id: str) -> None:
+        try:
+            self._req("DELETE", f"/me/messages/{draft_id}", headers={"Prefer": IMMUTABLE})
+        except GraphError:
+            pass  # already gone
+
+    def draft_state(self, draft_id: str) -> dict:
+        """What became of a saved draft: {state: 'draft'|'sent'|'deleted'|'missing', subject, html, sent_at,
+        conversation_id}. 'sent' = you sent it from Outlook yourself; 'deleted' = it's in Deleted Items."""
+        try:
+            m = self._req("GET", f"/me/messages/{draft_id}", headers={"Prefer": IMMUTABLE},
+                          params={"$select": "id,isDraft,subject,body,sentDateTime,conversationId,parentFolderId"})
+        except GraphError as e:
+            if "-> 404" in str(e):
+                return {"state": "missing"}
+            raise
+        state = "draft"
+        if not m.get("isDraft"):
+            state = "sent"
+        elif m.get("parentFolderId") == self._deleted_folder():
+            state = "deleted"
+        return {"state": state, "subject": m.get("subject") or "", "html": (m.get("body") or {}).get("content") or "",
+                "sent_at": m.get("sentDateTime"), "conversation_id": m.get("conversationId")}
+
+    def _deleted_folder(self) -> str | None:
+        if not hasattr(self, "_deleted_id"):
+            try:
+                self._deleted_id = self._req("GET", "/me/mailFolders/deleteditems", headers={"Prefer": IMMUTABLE},
+                                             params={"$select": "id"})["id"]
+            except GraphError:
+                self._deleted_id = None
+        return self._deleted_id
+
+    def draft_in_thread(self, conversation_id: str, to_email: str, to_name: str, html: str, fallback_subject: str,
+                        strip_pixels: str | None = None, attachments: list[dict] | None = None) -> dict:
+        """Save (not send) a reply on top of our last sent message in the thread, so follow-ups stack like a
+        human's would. strip_pixels: tracker base URL; earlier open pixels are removed from the quoted text so
+        they don't fire again (and misattribute opens) when the follow-up is read. Returns like draft_new."""
         sent = self._list(
             "/me/mailFolders/sentitems/messages",
             filter=f"conversationId eq '{_q(conversation_id)}'",
             select="id,sentDateTime",
         )
         if not sent:
-            return self.send_new(to_email, to_name, fallback_subject, html, attachments)
+            return self.draft_new(to_email, to_name, fallback_subject, html, attachments)
         last = max(sent, key=lambda m: m.get("sentDateTime") or "")
         draft = self._req("POST", f"/me/messages/{last['id']}/createReply",
-                          headers={"Prefer": 'outlook.body-content-type="html"'})
+                          headers={"Prefer": IMMUTABLE + ', outlook.body-content-type="html"'})
         quoted = draft["body"]["content"]
         if strip_pixels:
             quoted = re.sub(r"<img[^>]*" + re.escape(strip_pixels) + r"/o/[^>]*>", "", quoted, flags=re.I)
-        self._req("PATCH", f"/me/messages/{draft['id']}", json={
+        self._req("PATCH", f"/me/messages/{draft['id']}", headers={"Prefer": IMMUTABLE}, json={
             "body": {"contentType": "HTML", "content": _insert_top(quoted, html)},
             "toRecipients": [_rcpt(to_email, to_name)],
             "ccRecipients": [],
@@ -227,10 +263,20 @@ class Graph:
         try:
             self._attach(draft["id"], attachments)
         except GraphError:
-            self._req("DELETE", f"/me/messages/{draft['id']}")
+            self._req("DELETE", f"/me/messages/{draft['id']}", headers={"Prefer": IMMUTABLE})
             raise
-        self._send_draft(draft["id"])
-        return conversation_id
+        return {**draft, "conversationId": conversation_id}
+
+    def send_in_thread(self, conversation_id: str, to_email: str, to_name: str, html: str, fallback_subject: str,
+                       strip_pixels: str | None = None, attachments: list[dict] | None = None) -> str:
+        draft = self.draft_in_thread(conversation_id, to_email, to_name, html, fallback_subject, strip_pixels, attachments)
+        self.send_draft(draft["id"])
+        return draft["conversationId"]
+
+    def sent_since(self, since: datetime) -> list[dict]:
+        """Everything you sent after `since` (for the CRM's log of emails written by hand in Outlook)."""
+        return self._list("/me/mailFolders/sentitems/messages", filter=f"sentDateTime gt {_iso(since)}",
+                          select="id,subject,bodyPreview,sentDateTime,toRecipients,conversationId", top="100")
 
     def last_thread_with(self, email: str, since: datetime) -> str | None:
         """conversationId of the newest email you sent to `email` since `since` (e.g. one sent by hand before the

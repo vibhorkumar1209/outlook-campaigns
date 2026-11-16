@@ -3,7 +3,7 @@
 {%- endmacro %}
 
 {% macro chip(channel) -%}
-<span class="chip {{ 'email' if channel == 'email' else 'linkedin' }}">{{ channel_label(channel) }}</span>
+<span class="chip {{ channel if channel in ('email', 'whatsapp') else 'linkedin' }}">{{ channel_label(channel) }}</span>
 {%- endmacro %}
 
 {% macro lead_name(l) -%}

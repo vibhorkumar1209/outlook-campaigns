@@ -1,0 +1,69 @@
+{% extends "base.html" %}
+{% block title %}Email drafts{% endblock %}
+{% block main %}
+<header class="head">
+  <div>
+    <h1>Email drafts <span class="meta">· <span id="drafts-left">{{ n_pending }}</span> waiting for you</span></h1>
+    <p class="sub">Sequence emails are written here and saved in your Outlook Drafts folder; nothing goes out until you approve it. Approved emails are sent by the app inside the campaign's send window, spaced out like the rest. Edit one in Outlook first if you like: it's sent as it stands there. Send or delete it in Outlook yourself and the app notices within a few minutes.</p>
+  </div>
+  <div class="actions">
+    <form method="get">
+      <select name="campaign" onchange="this.form.submit()" aria-label="Campaign">
+        <option value="">All campaigns</option>
+        {% for c in campaigns %}<option value="{{ c.id }}" {{ 'selected' if campaign == c.id }}>{{ c.name }}{% if c.n %} ({{ c.n }}){% endif %}</option>{% endfor %}
+      </select>
+    </form>
+    {% if n_pending %}<button class="btn primary" data-approve-all data-campaign="{{ campaign or '' }}" data-n="{{ n_pending }}">Approve all {{ n_pending }}</button>{% endif %}
+  </div>
+</header>
+
+{% set autos = campaigns | selectattr("email_mode", "equalto", "auto") | list %}
+{% if autos %}<div class="flash">Sending without review is on for: {{ autos | map(attribute="name") | join(", ") }}. Change it in the campaign's Settings tab.</div>{% endif %}
+
+{% if not drafts %}
+  <div class="empty">No drafts waiting. When a sequence reaches an email step, the email appears here (and in Outlook's Drafts) for you to approve.</div>
+{% else %}
+<section class="card">
+  <div class="tbl-wrap"><table class="t drafts-t">
+    <thead><tr><th>To</th><th>Subject</th><th>Campaign</th><th>Written</th><th>State</th><th></th></tr></thead>
+    <tbody>
+    {% for d in drafts %}
+      <tr data-draft="{{ d.id }}">
+        <td><a href="/leads/{{ d.lead_id }}">{{ d.first_name }} {{ d.last_name }}</a><div class="meta">{{ d.company }} · {{ d.to_email }}</div></td>
+        <td>{{ "Re: " if d.threaded and not d.subject.lower().startswith("re:") }}{{ d.subject }}<div class="meta">from {{ d.sender }}{% if d.threaded %} · reply in their thread{% endif %}</div></td>
+        <td class="meta">{{ d.campaign or "one-off" }}{% if d.step_pos is not none %} · step {{ d.step_pos + 1 }}/{{ d.n_steps }}{% endif %}</td>
+        <td class="meta">{{ d.created_at | ago }}</td>
+        <td>{% if d.status == "approved" %}<span class="pill good">approved</span><div class="meta">{% if d.campaign %}sends in the window ({{ d.window_start }}–{{ d.window_end }}){% else %}sending now{% endif %}</div>
+            {% else %}<span class="pill warning">needs you</span>{% endif %}</td>
+        <td><div class="row-act">
+          <button class="btn sm ghost" data-draft-preview="{{ d.id }}" aria-expanded="false">Preview</button>
+          {% if d.web_link %}<a class="btn sm ghost" href="{{ d.web_link }}" target="_blank" rel="noopener" title="Edit it in Outlook; it's sent as it stands there">Edit in Outlook ↗</a>{% endif %}
+          {% if d.status == "pending" %}
+            <button class="btn sm primary" data-draft-act="approve">Approve &amp; send</button>
+            <button class="btn sm" data-draft-act="skip" data-ask="Don't send this email? {{ 'The sequence moves on to its next step.' if d.campaign else 'The draft is dropped.' }}">Skip</button>
+          {% else %}
+            <button class="btn sm" data-draft-act="hold">Hold</button>
+          {% endif %}
+        </div></td>
+      </tr>
+      <tr class="history-row" hidden><td colspan="6"><iframe class="draft-frame" sandbox="allow-popups" title="Draft preview" data-src="/drafts/{{ d.id }}/preview"></iframe></td></tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+</section>
+{% endif %}
+
+{% if recent %}
+<details class="card">
+  <summary><b>Recently handled</b> <span class="meta">· last {{ recent | length }}</span></summary>
+  <div class="tbl-wrap"><table class="t">
+    <thead><tr><th>To</th><th>Subject</th><th>Campaign</th><th>Outcome</th><th>When</th></tr></thead>
+    <tbody>{% for d in recent %}<tr>
+      <td><a href="/leads/{{ d.lead_id }}">{{ d.first_name }} {{ d.last_name }}</a></td><td>{{ d.subject }}</td>
+      <td class="meta">{{ d.campaign or "one-off" }}</td>
+      <td>{% if d.status == "sent" %}<span class="pill good">sent</span>{% else %}<span class="pill muted">{{ d.status }}</span> <span class="meta">{{ d.note or "" }}</span>{% endif %}</td>
+      <td class="meta">{{ d.done_at | ago if d.done_at else "" }}</td></tr>{% endfor %}</tbody>
+  </table></div>
+</details>
+{% endif %}
+{% endblock %}

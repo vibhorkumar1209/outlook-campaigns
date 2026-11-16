@@ -34,6 +34,26 @@
       <p class="meta">Each person running the app on their own computer has their own copy of the data; this team list is for this copy.</p>
     </section>
 
+    <section class="card" id="reminders">
+      <div class="card-head"><h2>Follow-ups &amp; daily reminder</h2></div>
+      <form method="post" action="/settings/reminders" class="stack-y" style="gap:10px">
+        <div class="form-grid">
+          <label class="f">Warm: follow up every (days)<input type="number" name="crm_warm_days" min="1" max="60" value="{{ crm_cfg.crm_warm_days }}"></label>
+          <label class="f">Cold: re-engage every (days)<input type="number" name="crm_cold_days" min="7" max="730" value="{{ crm_cfg.crm_cold_days }}"></label>
+          <label class="f">Reminder email hour (0–23, this {{ MACHINE }}'s time)<input type="number" name="digest_hour" min="0" max="23" value="{{ crm_cfg.digest_hour }}"></label>
+        </div>
+        <div class="days">
+          <label><input type="checkbox" name="digest_enabled" value="1" {{ 'checked' if crm_cfg.digest_enabled }}> Email me the day's actions</label>
+          <label><input type="checkbox" name="digest_team" value="1" {{ 'checked' if crm_cfg.digest_team }}> Also email each team member their own leads' actions</label>
+          <label><input type="checkbox" name="digest_skip_weekends" value="1" {{ 'checked' if crm_cfg.digest_skip_weekends }}> Skip weekends</label>
+        </div>
+        <div class="actions"><button class="btn primary">Save</button>
+          <a class="btn ghost" href="/reminders/email" target="_blank" rel="noopener">Preview today's email</a></div>
+      </form>
+      <form method="post" action="/settings/reminders/test" style="margin-top:8px"><button class="btn">Send it to me now</button></form>
+      <p class="meta">Follow-up dates count from each lead's last contact (any email, LinkedIn message, WhatsApp, call or meeting). Warm and Cold leads appear on <a href="/today">Today</a> when due and keep coming back at that rhythm until their status changes. The email goes out once a day from your main mailbox, at the first run after the hour above, and only when something is waiting. {% if digest_sent_on %}Last sent {{ digest_sent_on }}.{% endif %} Its links open this dashboard, so they work on this {{ MACHINE }}.</p>
+    </section>
+
     <section class="card">
       <div class="card-head"><h2>Open &amp; click tracking</h2></div>
       {% if not tracker %}

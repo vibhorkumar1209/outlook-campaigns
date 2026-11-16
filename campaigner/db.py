@@ -17,7 +17,7 @@ CREATE TABLE IF NOT EXISTS campaigns (
     id INTEGER PRIMARY KEY,
     name TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'draft',          -- draft|active|paused
-    timezone TEXT,                                  -- IANA; NULL = this Mac's zone
+    timezone TEXT,                                  -- IANA; NULL = this computer's zone
     start_at TEXT,                                  -- UTC ISO; NULL = as soon as enrolled
     window_days TEXT NOT NULL DEFAULT 'mon,tue,wed,thu,fri',
     window_start TEXT NOT NULL DEFAULT '09:30',
@@ -172,6 +172,33 @@ CREATE TABLE IF NOT EXISTS activities (
 );
 
 CREATE INDEX IF NOT EXISTS ix_activities_lead ON activities (lead_id, at);
+
+-- Emails written by a sequence (or by you from a lead's page) that wait in Outlook's Drafts folder until you
+-- approve them. One row per email; `outlook_id` is the draft's immutable id in the mailbox.
+CREATE TABLE IF NOT EXISTS email_drafts (
+    id INTEGER PRIMARY KEY,
+    lead_id INTEGER NOT NULL REFERENCES leads(id) ON DELETE CASCADE,
+    enrollment_id INTEGER REFERENCES enrollments(id) ON DELETE CASCADE,
+    campaign_id INTEGER REFERENCES campaigns(id) ON DELETE CASCADE,
+    step_pos INTEGER,                               -- NULL: a one-off email you composed
+    sender TEXT NOT NULL,                           -- senders.account
+    to_email TEXT NOT NULL,
+    subject TEXT NOT NULL DEFAULT '',
+    html TEXT NOT NULL DEFAULT '',
+    outlook_id TEXT,
+    web_link TEXT,
+    conversation_id TEXT,
+    threaded INTEGER NOT NULL DEFAULT 0,            -- a reply on top of an earlier email (body includes the quote)
+    sid TEXT,                                       -- tracking id baked into the draft's pixel/links
+    tracked INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'pending',         -- pending|approved|sent|skipped|discarded
+    note TEXT,
+    created_at TEXT NOT NULL,
+    approved_at TEXT,
+    done_at TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_drafts_status ON email_drafts (status);
+CREATE INDEX IF NOT EXISTS ix_drafts_enrollment ON email_drafts (enrollment_id, step_pos);
 CREATE INDEX IF NOT EXISTS ix_sends_campaign ON sends (campaign_id, step_pos);
 CREATE INDEX IF NOT EXISTS ix_sends_sender ON sends (sender, sent_at);
 CREATE INDEX IF NOT EXISTS ix_events_lead ON events (lead_id, at);
@@ -208,6 +235,13 @@ MIGRATIONS = [
     ("campaigns", "owner_id", "INTEGER"),                          # default owner for the campaign's leads
     ("sends", "body", "TEXT"),                                     # plain-text copy of what was sent
     ("events", "content", "TEXT"),                                 # message text for replies (preview)
+    ("events", "ref", "TEXT"),                                     # mailbox message id, for emails synced from Outlook
+    ("leads", "status", "TEXT NOT NULL DEFAULT 'New'"),            # New|Warm|Cold|Converted|Closed/Lost
+    ("leads", "status_changed_at", "TEXT"),
+    ("leads", "last_contacted_at", "TEXT"),                        # newest email/LinkedIn/WhatsApp/call/meeting, either way
+    ("leads", "next_followup_at", "TEXT"),                         # from status cadence, or the next step you set
+    ("leads", "followup_snoozed_until", "TEXT"),
+    ("campaigns", "email_mode", "TEXT NOT NULL DEFAULT 'draft'"),  # draft: emails wait for your approval | auto
 ]
 
 
@@ -244,6 +278,11 @@ def connect(path: Path = DB_PATH) -> sqlite3.Connection:
                           SELECT MIN(replied_at) FROM enrollments e WHERE e.lead_id = leads.id AND e.status = 'replied')
                         WHERE id IN (SELECT lead_id FROM enrollments WHERE status = 'replied')""")
         set_setting(conn, "stage_backfilled", True)
+    if not get_setting(conn, "status_backfilled"):
+        # Statuses arrived after leads existed: anyone who replied starts Warm, do-not-contact is Closed/Lost.
+        conn.execute("UPDATE leads SET status = 'Warm' WHERE stage = 'lead' AND status = 'New'")
+        conn.execute("UPDATE leads SET status = 'Closed/Lost' WHERE dnc = 1")
+        set_setting(conn, "status_backfilled", True)
     if not get_setting(conn, "voicemails_to_calls"):
         _voicemails_to_calls(conn)
         set_setting(conn, "voicemails_to_calls", True)
@@ -286,12 +325,12 @@ def scalar(conn, sql: str, *args):
 
 def event(conn, lead_id: int, type: str, *, enrollment: dict | None = None, channel: str | None = None,
           step_pos: int | None = None, detail: str | None = None, at: datetime | None = None,
-          content: str | None = None) -> None:
+          content: str | None = None, ref: str | None = None) -> None:
     conn.execute(
-        "INSERT INTO events (lead_id, enrollment_id, campaign_id, step_pos, type, channel, detail, at, content) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO events (lead_id, enrollment_id, campaign_id, step_pos, type, channel, detail, at, content, ref) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (lead_id, enrollment and enrollment["id"], enrollment and enrollment["campaign_id"],
-         step_pos, type, channel, detail, iso(at or utcnow()), content),
+         step_pos, type, channel, detail, iso(at or utcnow()), content, ref),
     )
 
 

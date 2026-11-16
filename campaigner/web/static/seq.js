@@ -30,6 +30,7 @@
     li_connect: '<circle cx="9" cy="8" r="3.5"/><path d="M2.5 20c.8-3.6 3.4-5.5 6.5-5.5s5.7 1.9 6.5 5.5"/><path d="M19 8v6M16 11h6"/>',
     li_message: '<path d="M4 5h16v11H9l-5 4z"/><path d="M8 9.5h8M8 12.5h5"/>',
     li_view: '<path d="M2 12s3.6-6.5 10-6.5S22 12 22 12s-3.6 6.5-10 6.5S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>',
+    whatsapp: '<path d="M4 20l1.4-4A8 8 0 1 1 8.2 18.7z"/><path d="M9.5 9.2c.3 2.3 2.2 4.400 4.800 5.300l1.200-1.300"/>',
     start: '<path d="M8 5v14l11-7z"/>',
     end: '<path d="M6 6h12v12H6z"/>',
   };
@@ -62,7 +63,7 @@
     return m < 1 ? `${Math.round(m * 60)}s` : `${Math.round(m * 10) / 10}m`;
   };
   const kb = (n) => n > 1048576 ? `${(n / 1048576).toFixed(1)} MB` : `${Math.max(1, Math.round(n / 1024))} KB`;
-  const isLI = (ch) => ch !== "email";
+  const chClass = (ch) => (ch === "email" ? "ch-email" : ch === "whatsapp" ? "ch-wa" : "ch-li");
   const gated = (s) => s.channel === "li_message" || s.condition !== "always";
   const priorEmail = (i) => steps.slice(0, i).some((x) => x.channel === "email");
   const waitsForConnect = (s) => s.channel === "li_message" && s.condition === "always";
@@ -126,7 +127,7 @@
       st.replies && `↩ ${st.replies} replied`,
     ].filter(Boolean);
     const el = h("div", {
-      class: `fnode step ${isLI(s.channel) ? "ch-li" : "ch-email"}${i === sel ? " sel" : ""}${errSteps.has(i) ? " err" : ""}`,
+      class: `fnode step ${chClass(s.channel)}${i === sel ? " sel" : ""}${errSteps.has(i) ? " err" : ""}`,
       draggable: "true", tabindex: "0", role: "button",
       "aria-label": `Step ${i + 1}: ${CH[s.channel]}, day ${fmt(day)}`,
       onclick: () => selectStep(i),
@@ -195,7 +196,7 @@
     closeMenu();
     menu = h("div", { class: "fmenu", role: "menu" },
       Object.entries(CH).map(([k, v]) => h("button", {
-        type: "button", role: "menuitem", class: isLI(k) ? "ch-li" : "ch-email",
+        type: "button", role: "menuitem", class: chClass(k),
         onclick: (e) => { e.stopPropagation(); insertStep(index, k); },
       }, icon(k), v)));
     btn.parentElement.append(menu);
@@ -323,6 +324,8 @@
           h("div", { class: "vars" }, VARS.map((v) => h("button", { type: "button", onclick: () => insertVar(v) }, `{{ ${v} }}`))),
           h("p", { class: "meta" }, s.channel === "email"
             ? "**bold**, *italic*, lines starting “- ” or “1. ” for lists, [text](https://…) for links. A blank line starts a paragraph. Fallback: {{ title | default('there', true) }}."
+            : s.channel === "whatsapp"
+            ? "A task opens WhatsApp with this text ready; you press send. Needs a phone number with a country code on the lead (leads without one skip this step). **bold** and *italic* become WhatsApp's own *bold* and _italic_."
             : "LinkedIn messages are plain text: **bold** and *italic* become Unicode bold/italic letters, “- ” lines become • bullets. Use sparingly (screen readers read styled letters awkwardly)."),
           s.channel === "email" ? attachmentsField(s) : null,
         ]),

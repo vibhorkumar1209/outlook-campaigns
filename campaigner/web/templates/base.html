@@ -11,17 +11,25 @@
 <body>
 <div class="shell">
   <aside class="side">
-    <div class="brand"><b>▌</b>outreach</div>
+    <a class="brand" href="/today"><img src="{{ asset('favicon-32.png') }}" alt="" width="22" height="22">Outreach</a>
     <nav class="nav">
-      {% set nav = [("/", "Overview"), ("/tasks", "LinkedIn queue"), ("/campaigns", "Campaigns"), ("/status", "Campaign Status"), ("/leads", "Leads"), ("/prospects", "Prospects"), ("/senders", "Senders"), ("/import", "Import"), ("/settings", "Settings")] %}
-      {% for href, label in nav %}
-        {% set here = active or path %}
-        {% set on = here == href or (href != "/" and here.startswith(href)) %}
-        <a href="{{ href }}" class="{{ 'on' if on }}" {% if href == '/tasks' %}id="nav-tasks"{% endif %}>
-          <span>{{ label }}</span>
-          {% if href == "/tasks" and open_tasks %}<span class="badge">{{ open_tasks }}</span>{% endif %}
-          {% if href == "/" and follow_ups_due %}<span class="badge warn" title="Follow-ups due today or overdue">{{ follow_ups_due }}</span>{% endif %}
-        </a>
+      {% set nav = [
+        ("Do", [("/today", "Today"), ("/drafts", "Email drafts"), ("/tasks", "Task queue")]),
+        ("Outreach", [("/", "Overview"), ("/campaigns", "Campaigns"), ("/status", "Campaign Status")]),
+        ("People", [("/leads", "Leads"), ("/prospects", "Prospects"), ("/import", "Import")]),
+        ("Setup", [("/senders", "Senders"), ("/settings", "Settings")])] %}
+      {% set here = active or path %}
+      {% for group, links in nav %}
+        <div class="nav-group">{{ group }}</div>
+        {% for href, label in links %}
+          {% set on = here == href or (href != "/" and here.startswith(href)) %}
+          <a href="{{ href }}" class="{{ 'on' if on }}" {% if href == '/tasks' %}id="nav-tasks"{% elif href == '/drafts' %}id="nav-drafts"{% endif %} {% if on %}aria-current="page"{% endif %}>
+            <span>{{ label }}</span>
+            {% if href == "/tasks" and open_tasks %}<span class="badge">{{ open_tasks }}</span>{% endif %}
+            {% if href == "/drafts" and drafts_pending %}<span class="badge warn" title="Emails waiting for your approval">{{ drafts_pending }}</span>{% endif %}
+            {% if href == "/today" and today_count %}<span class="badge" title="Things waiting on you">{{ today_count }}</span>{% endif %}
+          </a>
+        {% endfor %}
       {% endfor %}
     </nav>
     <div class="side-foot">
@@ -37,7 +45,7 @@
       <div class="banner">{{ (senders_nav | rejectattr("connected") | map(attribute="email") | join(", ")) }} needs to sign in again. Its emails wait. <a href="/senders">Reconnect →</a></div>
     {% endif %}
     {% if li_bot.mode == "bot" and li_bot.paused and path != "/settings" %}
-      <div class="banner">LinkedIn bot paused: {{ li_bot.paused.reason }}. LinkedIn tasks are back in your manual queue. <a href="/settings#linkedin-bot">Resolve and resume →</a></div>
+      <div class="banner">LinkedIn bot paused: {{ li_bot.paused.reason }}. LinkedIn tasks are back in your queue. <a href="/settings#linkedin-bot">Resolve and resume →</a></div>
     {% endif %}
     {% if msg %}<div class="flash">{{ msg }}</div>{% endif %}
     {% if err %}<div class="flash err">{{ err }}</div>{% endif %}
@@ -46,6 +54,7 @@
 </div>
 <div id="tip" class="tip" hidden></div>
 {% include "_call_dialog.html" %}
+{% include "_compose_dialog.html" %}
 <script src="{{ asset('app.js') }}"></script>
 {% block scripts %}{% endblock %}
 </body>

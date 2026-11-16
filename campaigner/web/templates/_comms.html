@@ -3,11 +3,11 @@
 <ul class="comms{{ ' compact' if compact }}">
   {% for c in comms %}
     <li class="cm {{ c.channel }} {{ c.direction }}">
-      <span class="cm-ic" aria-hidden="true">{{ {"email": "✉", "linkedin": "in", "call": "☎", "meeting": "◷", "note": "✎"}[c.channel] }}</span>
+      <span class="cm-ic" aria-hidden="true">{{ {"email": "✉", "linkedin": "in", "whatsapp": "wa", "call": "☎", "meeting": "◷", "note": "✎"}[c.channel] }}</span>
       <div class="cm-body">
         <div class="cm-head">
           <b>{{ c.label }}</b>
-          <span class="meta">{{ "→ sent" if c.direction == "out" and c.channel in ("email", "linkedin") else ("← received" if c.direction == "in" else "") }}</span>
+          <span class="meta">{{ "→ sent" if c.direction == "out" and c.channel in ("email", "linkedin", "whatsapp") else ("← received" if c.direction == "in" else "") }}</span>
           {% if c.outcome %}<span class="pill {{ 'good' if c.outcome in RESPONDED else 'muted' }}">{{ c.outcome }}</span>{% endif %}
           {% if c.extra and c.channel == "email" %}<span class="pill info">{{ c.extra }}</span>{% endif %}
           {% if c.campaign %}<span class="meta">· {{ c.campaign }}</span>{% endif %}

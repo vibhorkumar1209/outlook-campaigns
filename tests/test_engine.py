@@ -33,6 +33,37 @@ def mail(sender, subject="Re: Hi", cid=None, at=MON, preview="", headers=()):
 class FakeGraph:
     def __init__(self, me=ME):
         self.me, self.sent, self.inbox = me, [], []
+        self.drafts, self.outbox = {}, []   # Outlook's Drafts folder by id; emails written by hand in Outlook
+
+    def draft_new(self, to, name, subject, html, attachments=None):
+        i = f"draft-{self.me}-{len(self.drafts) + 1}"
+        self.drafts[i] = {"state": "draft", "kind": "new", "to": to, "subject": subject, "html": html,
+                          "conv": f"conv-{i}", "files": [a["name"] for a in attachments or []]}
+        return {"id": i, "conversationId": f"conv-{i}", "webLink": f"https://outlook.example/{i}"}
+
+    def draft_in_thread(self, cid, to, name, html, fallback, strip_pixels=None, attachments=None):
+        i = f"draft-{self.me}-{len(self.drafts) + 1}"
+        self.drafts[i] = {"state": "draft", "kind": "thread", "to": to, "subject": fallback, "html": html, "conv": cid,
+                          "files": [a["name"] for a in attachments or []]}
+        return {"id": i, "conversationId": cid, "webLink": f"https://outlook.example/{i}"}
+
+    def draft_state(self, i):
+        d = self.drafts.get(i)
+        if not d:
+            return {"state": "missing"}
+        return {"state": d["state"], "subject": d["subject"], "html": d["html"], "sent_at": d.get("sent_at"),
+                "conversation_id": d["conv"]}
+
+    def send_draft(self, i):
+        d = self.drafts[i]
+        d["state"] = "sent"
+        self.sent.append((d["kind"], d["to"], d["subject"], d["html"]))
+
+    def delete_draft(self, i):
+        self.drafts.pop(i, None)
+
+    def sent_since(self, since):
+        return [m for m in self.outbox if datetime.fromisoformat(m["sentDateTime"]) > since]
 
     def my_address(self):
         return self.me
@@ -70,6 +101,7 @@ class Base(unittest.TestCase):
             self.conn.execute("INSERT INTO senders (account, email, created_at) VALUES (?, ?, ?)",
                               (acct, acct, iso(MON + timedelta(seconds=i))))
         self.logs = []
+        db.set_setting(self.conn, "digest_enabled", False)  # the 8:00 reminder email has its own tests
         self.cid = self.campaign()
         importer.import_rows(self.conn, [
             {"Email": "jane@x.com", "Name": "Jane Doe", "Company": "Acme", "LinkedIn": "https://linkedin.com/in/JaneDoe?x=1"},
@@ -83,8 +115,9 @@ class Base(unittest.TestCase):
         self.tmp.cleanup()
 
     def campaign(self, steps=STEPS, name="c", **kw):
+        # Most tests exercise sending itself; drafts-first (the app's default) is covered by DraftTest.
         cols = {"name": name, "status": "active", "timezone": "UTC", "window_days": "mon,tue,wed,thu,fri,sat,sun",
-                "window_start": "09:00", "window_end": "17:00", "created_at": iso(MON), **kw}
+                "window_start": "09:00", "window_end": "17:00", "created_at": iso(MON), "email_mode": "auto", **kw}
         cid = self.conn.execute(f"INSERT INTO campaigns ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
                                 tuple(cols.values())).lastrowid
         for i, (ch, delay, subj, body) in enumerate(steps):
@@ -696,8 +729,9 @@ class HistoryImportTest(Base):
         self.assertEqual((cells["di@x.com"]["LI Status"], cells["di@x.com"]["LI 1st Msg"], cells["di@x.com"]["EM1"]),
                          ("Request Accepted", "09-Oct-26", "Undelivered"))
         self.assertEqual((cells["ed@x.com"]["LI 1st Msg"], cells["ed@x.com"]["EM1"]), ("-", "12-Oct-26 (OOO)"))
-        self.assertEqual(cells["fa@x.com"]["Lead Status"], "Demo Scheduled")
-        self.assertEqual(cols[-8:], ["VM1", "VM2", "VM3", "Calls", "Last Call", "Next Step", "Last Touch", "Touches"])
+        self.assertEqual((cells["fa@x.com"]["Status Note"], cells["fa@x.com"]["Lead Status"]), ("Demo Scheduled", "New"))
+        self.assertEqual(cols[-11:], ["WhatsApp", "VM1", "VM2", "VM3", "Calls", "Last Call", "Last Contacted",
+                                      "Next Follow-up", "Next Step", "Last Touch", "Touches"])
         all_cols, all_rows = stats.campaign_status(self.conn, None, timezone.utc)   # every campaign
         self.assertEqual(all_cols[:3], ["#", "Campaign", "Name"])
         self.assertEqual({r["cells"]["Campaign"] for r in all_rows}, {"c", "hist"})
@@ -1438,17 +1472,18 @@ class CrmTest(Base):
         with self.assertRaises(ValueError):
             crm.log_activity(self.conn, bob["id"], kind="call", outcome="Telepathy")
 
-    def test_follow_ups_due(self):
+    def test_next_step_reminder_due_then_rescheduled(self):
         from campaigner import crm
         jane = self.lead("jane@x.com")
         today = datetime.now(timezone.utc).date()
         crm.log_activity(self.conn, jane["id"], kind="call", outcome="No answer", next_step="Try again",
-                         next_step_at=(today - timedelta(days=1)).isoformat())
-        due = crm.follow_ups(self.conn, timezone.utc)
-        self.assertEqual([(d["lead_id"], d["overdue"]) for d in due], [(jane["id"], True)])
+                         next_step_at=(today - timedelta(days=1)).isoformat(), at=MON)
+        due = crm.reminders(self.conn, timezone.utc)
+        self.assertEqual([(d["lead_id"], d["overdue_days"], d["kind"], d["reason"]) for d in due],
+                         [(jane["id"], 1, "next_step", "Try again")])
         crm.log_activity(self.conn, jane["id"], kind="call", outcome="No answer",
-                         next_step_at=(today + timedelta(days=30)).isoformat())
-        self.assertEqual(crm.follow_ups(self.conn, timezone.utc), [])          # rescheduled beyond the window
+                         next_step_at=(today + timedelta(days=30)).isoformat(), at=MON + timedelta(hours=1))
+        self.assertEqual(crm.reminders(self.conn, timezone.utc), [])              # rescheduled beyond today
 
     def test_owners_campaign_default_and_import_column(self):
         from campaigner import crm
@@ -1502,10 +1537,310 @@ class CrmTest(Base):
                        headers={"Origin": f"http://127.0.0.1:{webapp.PORT}"})
             self.assertEqual(r.status_code, 200, r.text)
             for path in ("/status", f"/leads/{self.lead('jane@x.com')['id']}", "/", "/settings", "/leads", "/prospects",
+                         "/today", "/drafts", "/tasks", "/reminders/email", "/campaigns", f"/campaigns/{self.cid}?tab=sequence",
                          f"/leads/{self.lead('jane@x.com')['id']}/history", f"/campaigns/{self.cid}?tab=status",
                          f"/campaigns/{self.cid}?tab=settings"):
                 self.assertEqual(c.get(path).status_code, 200, path)
+            # Compose from a lead page: saved as an Outlook draft, sent only when asked; approvals go through the API.
+            jane, origin = self.lead("jane@x.com"), {"Origin": f"http://127.0.0.1:{webapp.PORT}"}
+            kicks = []
+            with mock.patch.object(webapp, "mail_client", lambda acct: self.graphs[acct]), \
+                    mock.patch.object(webapp, "_kick", lambda: kicks.append(1)):
+                r = c.post(f"/api/leads/{jane['id']}/compose", json={"subject": "", "body": "Hi"}, headers=origin)
+                self.assertEqual(r.status_code, 422)                       # no thread yet: a subject is needed
+                r = c.post(f"/api/leads/{jane['id']}/compose", headers=origin,
+                           json={"subject": "Quick one", "body": "Hi {{ first_name }}", "send": False})
+                self.assertEqual((r.status_code, r.json()["sent"], kicks), (200, False, []))
+                d = one(self.conn, "SELECT * FROM email_drafts WHERE lead_id = ?", jane["id"])
+                self.assertEqual((d["status"], d["step_pos"], d["subject"], "Hi Jane" in d["html"]), ("pending", None, "Quick one", True))
+                self.assertEqual(self.g.sent, [])
+                r = c.post("/api/drafts/approve", json={"ids": [d["id"]]}, headers=origin)
+                self.assertEqual((r.json()["approved"], kicks), (1, [1]))
+                r = c.post(f"/api/drafts/{d['id']}", json={"action": "hold"}, headers=origin)
+                self.assertEqual(one(self.conn, "SELECT status FROM email_drafts WHERE id = ?", d["id"])["status"], "pending")
+                self.assertEqual(c.get(f"/drafts/{d['id']}/preview").status_code, 200)
+                r = c.post(f"/api/leads/{jane['id']}", json={"action": "status", "status": "Cold"}, headers=origin)
+                self.assertEqual((r.status_code, self.lead("jane@x.com")["status"]), (200, "Cold"))
+                r = c.post(f"/api/leads/{jane['id']}", json={"action": "update", "email": "jane@x.com", "phone": "+44 20 7946 0000",
+                                                             "linkedin_url": "https://www.linkedin.com/in/janedoe"}, headers=origin)
+                self.assertEqual(r.status_code, 200, r.text)
+                self.assertIn("442079460000", c.get(f"/leads/{jane['id']}").text)
         # The app's request threads opened these; drop them so Windows can delete the temp database.
         import gc
         opened.clear()
         gc.collect()
+
+
+class DraftTest(Base):
+    """The default: sequence emails are saved in Outlook's Drafts and go out only after you approve them."""
+
+    def setUp(self):
+        super().setUp()
+        self.conn.execute("UPDATE campaigns SET email_mode = 'draft'")
+        self.tick(MON)                                                        # LinkedIn step first
+        engine.complete_task(self.conn, self.task("jane@x.com")["id"], "done", now=MON)
+
+    def drafts(self, status=None):
+        return rows(self.conn, "SELECT d.*, l.email FROM email_drafts d JOIN leads l ON l.id = d.lead_id "
+                               + ("WHERE d.status = ? " if status else "WHERE ? IS NULL ") + "ORDER BY d.id", status)
+
+    def test_email_is_drafted_not_sent_until_approved(self):
+        day1 = MON + timedelta(days=1)
+        self.tick(day1)
+        self.assertEqual(self.g.sent, [])                                     # nothing left the mailbox
+        ds = self.drafts("pending")
+        self.assertEqual(sorted(d["email"] for d in ds), ["bob@x.com", "jane@x.com"])
+        self.assertEqual(len(self.g.drafts), 2)                               # both sit in Outlook's Drafts
+        self.assertEqual(self.enr("jane@x.com")["step_pos"], 0)               # the sequence waits on you
+        self.tick(day1 + timedelta(minutes=1))
+        self.assertEqual(len(self.drafts()), 2)                               # no second draft for the same step
+        jane = next(d for d in ds if d["email"] == "jane@x.com")
+        self.assertEqual(engine.approve_drafts(self.conn, [jane["id"]]), 1)
+        self.tick(day1 + timedelta(minutes=2))
+        self.assertEqual([(k, to, subj) for k, to, subj, _ in self.g.sent], [("new", "jane@x.com", "Hi Acme")])
+        e = self.enr("jane@x.com")
+        self.assertEqual((e["step_pos"], e["conversation_id"] is not None), (1, True))
+        self.assertEqual(one(self.conn, "SELECT body FROM sends WHERE enrollment_id = ?", e["id"])["body"], "Hello Jane")
+        self.assertEqual(self.enr("bob@x.com")["step_pos"], 0)                # Bob's still waits
+
+    def test_approved_draft_waits_for_the_send_window(self):
+        self.tick(MON + timedelta(days=1))
+        engine.approve_drafts(self.conn, [d["id"] for d in self.drafts()])
+        night = MON + timedelta(days=1, hours=12)                             # 22:00 UTC: outside 09:00-17:00
+        self.tick(night)
+        self.assertEqual(self.g.sent, [])
+        self.assertTrue(any("approved emails waiting" in l for l in self.logs))
+        self.tick(MON + timedelta(days=2))
+        self.assertEqual(len(self.g.sent), 2)
+
+    def test_drafts_are_written_outside_the_window_for_review(self):
+        self.tick(MON + timedelta(days=1, hours=12))
+        self.assertEqual(len(self.drafts("pending")), 2)
+
+    def test_skip_moves_the_sequence_on(self):
+        self.tick(MON + timedelta(days=1))
+        d = next(x for x in self.drafts() if x["email"] == "bob@x.com")
+        engine.skip_draft(self.conn, d, "skipped by you", MON + timedelta(days=1))
+        self.assertEqual(self.enr("bob@x.com")["step_pos"], 1)
+        self.tick(MON + timedelta(days=1, minutes=1))
+        self.assertEqual(self.g.sent, [])
+        self.assertEqual(len(self.drafts("pending")), 1)                      # no re-draft of the skipped step
+
+    def test_sent_or_deleted_in_outlook_is_noticed(self):
+        self.tick(MON + timedelta(days=1))
+        jane = next(d for d in self.drafts() if d["email"] == "jane@x.com")
+        bob = next(d for d in self.drafts() if d["email"] == "bob@x.com")
+        sent_at = MON + timedelta(days=1, hours=1)
+        self.g.drafts[jane["outlook_id"]].update(state="sent", subject="Hi Acme (edited)", sent_at=iso(sent_at))
+        self.g.drafts[bob["outlook_id"]]["state"] = "deleted"
+        self.tick(MON + timedelta(days=1, hours=2))                            # full pass checks Outlook
+        self.assertEqual(self.g.sent, [])                                      # the app sent nothing itself
+        s = one(self.conn, "SELECT subject, sent_at FROM sends WHERE lead_id = ?", jane["lead_id"])
+        self.assertEqual((s["subject"], s["sent_at"]), ("Hi Acme (edited)", iso(sent_at)))
+        self.assertEqual(self.enr("jane@x.com")["step_pos"], 1)
+        self.assertEqual((self.drafts("skipped")[0]["email"], self.enr("bob@x.com")["step_pos"]), ("bob@x.com", 1))
+
+    def test_reply_before_approval_drops_the_draft(self):
+        self.conn.execute("UPDATE campaigns SET email_mode = 'auto'")
+        self.tick(MON + timedelta(days=1))                                     # email 1 goes out
+        self.conn.execute("UPDATE campaigns SET email_mode = 'draft'")
+        self.tick(MON + timedelta(days=6))                                     # Bob's LinkedIn step skips (no URL)
+        self.tick(MON + timedelta(days=9))                                     # follow-up drafted (reply in thread)
+        ds = [d for d in self.drafts("pending") if d["email"] == "bob@x.com"]
+        self.assertEqual((len(ds), ds[0]["threaded"]), (1, 1))
+        self.g.inbox.append(mail("bob@x.com", "Re: Hi Beta", cid=self.conv("bob@x.com"), at=MON + timedelta(days=9, hours=1)))
+        engine.approve_drafts(self.conn, [ds[0]["id"]])
+        n = len(self.g.sent)
+        self.tick(MON + timedelta(days=9, hours=2))
+        self.assertEqual(len(self.g.sent), n)                                  # never nudges someone who answered
+        self.assertEqual(self.enr("bob@x.com")["status"], "replied")
+        self.assertEqual(one(self.conn, "SELECT status FROM email_drafts WHERE id = ?", ds[0]["id"])["status"], "discarded")
+        self.assertNotIn(ds[0]["outlook_id"], self.g.drafts)                   # and the Outlook copy is removed
+
+    def test_auto_mode_sends_pending_drafts(self):
+        self.tick(MON + timedelta(days=1))
+        self.conn.execute("UPDATE campaigns SET email_mode = 'auto'")
+        self.tick(MON + timedelta(days=1, minutes=1))
+        self.assertEqual(len(self.g.sent), 2)
+
+    def test_one_off_email_sends_when_approved_and_is_logged(self):
+        from campaigner import crm
+        jane = one(self.conn, "SELECT * FROM leads WHERE email = 'jane@x.com'")
+        dr = self.g.draft_new("jane@x.com", "Jane Doe", "Quick question", "<p>Hi Jane</p>")
+        self.conn.execute("""INSERT INTO email_drafts (lead_id, sender, to_email, subject, html, outlook_id, status, created_at)
+                             VALUES (?, ?, 'jane@x.com', 'Quick question', '<p>Hi Jane</p>', ?, 'approved', ?)""",
+                          (jane["id"], ME, dr["id"], iso(MON)))
+        engine.tick(self.conn, self.factory, now=MON + timedelta(hours=12), sleep=lambda s: None, log=self.logs.append,
+                    checks=False)                                              # quick pass, outside any window
+        self.assertEqual([(to, subj) for _, to, subj, _ in self.g.sent], [("jane@x.com", "Quick question")])
+        c = next(x for x in crm.communications(self.conn, lead_id=jane["id"]) if x["channel"] == "email")
+        self.assertEqual((c["label"], c["subject"], c["content"]), ("Email", "Quick question", "Hi Jane"))
+
+
+class StatusTest(Base):
+    def lead(self, email):
+        return one(self.conn, "SELECT * FROM leads WHERE email = ?", email)
+
+    def test_default_new_reply_makes_warm_and_unsubscribe_closes(self):
+        self.assertEqual(self.lead("jane@x.com")["status"], "New")
+        engine.mark_replied(self.conn, self.lead("jane@x.com")["id"], "email", MON)
+        self.assertEqual(self.lead("jane@x.com")["status"], "Warm")
+        engine.unsubscribe(self.conn, self.lead("bob@x.com")["id"], MON)
+        self.assertEqual(self.lead("bob@x.com")["status"], "Closed/Lost")
+
+    def test_warm_and_cold_cadence_from_last_contact(self):
+        from campaigner import crm
+        jane, bob = self.lead("jane@x.com"), self.lead("bob@x.com")
+        now = datetime.now(timezone.utc)
+        crm.log_activity(self.conn, jane["id"], kind="call", outcome="Connected – interested", status="Warm",
+                         at=now - timedelta(days=3))
+        crm.log_activity(self.conn, bob["id"], kind="call", outcome="Connected – not interested", status="Cold",
+                         at=now - timedelta(days=10))
+        crm.refresh_followups(self.conn, tz=timezone.utc)
+        j, b = self.lead("jane@x.com"), self.lead("bob@x.com")
+        self.assertEqual((j["status"], j["next_followup_at"]), ("Warm", now.date().isoformat()))       # 3 days on
+        self.assertEqual((b["status"], b["next_followup_at"]), ("Cold", (now.date() + timedelta(days=80)).isoformat()))
+        due = crm.reminders(self.conn, timezone.utc)
+        self.assertEqual([(d["lead_id"], d["kind"], d["status"]) for d in due], [(jane["id"], "warm", "Warm")])
+        self.assertEqual(due[0]["last_contacted_at"], iso(now - timedelta(days=3)))
+        # A new contact restarts the clock; so does a snooze.
+        crm.log_activity(self.conn, jane["id"], kind="whatsapp", outcome="Sent", at=now)
+        crm.refresh_followups(self.conn, tz=timezone.utc)
+        self.assertEqual(crm.reminders(self.conn, timezone.utc), [])
+        self.conn.execute("UPDATE activities SET at = ? WHERE lead_id = ? AND kind = 'whatsapp'", (iso(now - timedelta(days=4)), jane["id"]))
+        crm.refresh_followups(self.conn, tz=timezone.utc)
+        self.assertEqual(len(crm.reminders(self.conn, timezone.utc)), 1)
+        until = crm.snooze(self.conn, jane["id"], tz=timezone.utc)
+        self.assertEqual(until, (now.date() + timedelta(days=3)).isoformat())
+        self.assertEqual(crm.reminders(self.conn, timezone.utc), [])
+
+    def test_cold_recurs_every_90_days_until_status_changes(self):
+        from campaigner import crm
+        bob = self.lead("bob@x.com")
+        now = datetime.now(timezone.utc)
+        crm.log_activity(self.conn, bob["id"], kind="call", outcome="No answer", status="Cold", at=now - timedelta(days=91))
+        crm.refresh_followups(self.conn, tz=timezone.utc)
+        self.assertEqual([d["kind"] for d in crm.reminders(self.conn, timezone.utc)], ["cold"])
+        crm.snooze(self.conn, bob["id"], tz=timezone.utc)                        # reminded again in 90 days
+        self.assertEqual(self.lead("bob@x.com")["next_followup_at"], (now.date() + timedelta(days=90)).isoformat())
+        crm.set_status(self.conn, bob["id"], "Closed/Lost")
+        self.assertIsNone(self.lead("bob@x.com")["next_followup_at"])
+        self.assertEqual(self.enr("bob@x.com")["status"], "stopped")             # closing ends the sequence
+
+    def test_sequence_email_updates_last_contacted(self):
+        self.tick(MON)
+        engine.complete_task(self.conn, self.task("jane@x.com")["id"], "done", now=MON)
+        self.tick(MON + timedelta(days=1))
+        self.assertEqual(self.lead("bob@x.com")["last_contacted_at"], iso(MON + timedelta(days=1)))
+        self.assertEqual(self.lead("jane@x.com")["last_contacted_at"], iso(MON + timedelta(days=1)))
+
+    def test_import_status_column_and_closed_not_enrolled(self):
+        s = importer.import_rows(self.conn, [{"Email": "w@x.com", "Name": "Wa Rm", "Status": "warm"},
+                                             {"Email": "l@x.com", "Name": "Lo St", "Status": "Closed-Lost"}],
+                                 importer.guess_mapping(["Email", "Name", "Status"]), self.cid)
+        self.assertEqual((self.lead("w@x.com")["status"], self.lead("l@x.com")["status"]), ("Warm", "Closed/Lost"))
+        self.assertEqual((s["enrolled"], s["not_enrolled"]), (1, 1))
+
+    def test_daily_reminder_email(self):
+        from campaigner import crm
+        db.set_setting(self.conn, "digest_enabled", True)
+        priya = crm.add_member(self.conn, "Priya", "priya@co.com")
+        jane = self.lead("jane@x.com")
+        crm.set_owner(self.conn, jane["id"], priya)
+        now = datetime.now(timezone.utc).replace(hour=9, minute=0, second=0, microsecond=0)
+        crm.log_activity(self.conn, jane["id"], kind="call", outcome="Connected – interested", status="Warm",
+                         at=now - timedelta(days=5))
+        crm.refresh_followups(self.conn, tz=timezone.utc)
+        boxes = engine.Mailboxes(self.factory, self.logs.append)
+        early = now.replace(hour=7)
+        self.assertEqual(crm.maybe_send_digest(self.conn, boxes, early, self.logs.append, tz=timezone.utc), 0)   # before 8:00
+        self.assertEqual(crm.maybe_send_digest(self.conn, boxes, now, self.logs.append, tz=timezone.utc), 2)     # you + Priya
+        to = [x[1] for x in self.g.sent]
+        self.assertEqual(to, [ME, "priya@co.com"])
+        html = self.g.sent[0][3]
+        for needle in ("Jane Doe", "Warm", f"/leads/{jane['id']}?compose=1", "Send email / message",
+                       (now - timedelta(days=5)).strftime("%d %b %Y")):
+            self.assertIn(needle, html)
+        self.assertEqual(crm.maybe_send_digest(self.conn, boxes, now + timedelta(hours=1), self.logs.append, tz=timezone.utc), 0)  # once a day
+        self.assertEqual(scalar(self.conn, "SELECT COUNT(*) FROM sends"), 0)       # a reminder isn't outreach
+
+    def test_nothing_due_sends_nothing(self):
+        from campaigner import crm
+        db.set_setting(self.conn, "digest_enabled", True)
+        now = datetime.now(timezone.utc).replace(hour=9)
+        self.assertEqual(crm.maybe_send_digest(self.conn, engine.Mailboxes(self.factory, self.logs.append), now,
+                                               self.logs.append, tz=timezone.utc), 0)
+        self.assertEqual(self.g.sent, [])
+
+
+class WhatsAppTest(Base):
+    def setUp(self):
+        super().setUp()
+        self.wid = self.campaign([("whatsapp", 0, None, "Hi {{ first_name }}, **quick** one"),
+                                  ("email", 1, "Hi", "Hello")], name="wa")
+        importer.import_rows(self.conn, [{"Email": "pat@x.com", "Name": "Pat Kim", "Mobile": "+1 (440) 555-0100"},
+                                         {"Email": "nop@x.com", "Name": "No Phone"}],
+                             importer.guess_mapping(["Email", "Name", "Mobile"]), self.wid)
+        self.conn.execute("UPDATE enrollments SET enrolled_at = ? WHERE campaign_id = ?", (iso(MON), self.wid))
+
+    def test_whatsapp_step_is_a_task_and_skips_without_a_phone(self):
+        from campaigner import crm
+        self.tick(MON)
+        t = one(self.conn, """SELECT t.*, e.lead_id FROM tasks t JOIN enrollments e ON e.id = t.enrollment_id
+                              WHERE e.campaign_id = ? AND t.status = 'open'""", self.wid)
+        self.assertEqual((t["channel"], t["body"]), ("whatsapp", "Hi Pat, *quick* one"))
+        nop = one(self.conn, "SELECT e.* FROM enrollments e JOIN leads l ON l.id = e.lead_id WHERE l.email = 'nop@x.com'")
+        self.assertEqual(nop["step_pos"], 0)                                       # skipped: no number to message
+        d = FakeDriver()
+        db.set_setting(self.conn, "li_mode", "bot")
+        db.set_setting(self.conn, "li_bot_hours", ["00:00", "23:59"])
+        db.set_setting(self.conn, "li_bot_days", "mon,tue,wed,thu,fri,sat,sun")
+        linkedin_bot.run(self.conn, lambda: d, now=MON, log=self.logs.append, sleep=lambda s: None, rng=Steady())
+        self.assertEqual(one(self.conn, "SELECT status FROM tasks WHERE id = ?", t["id"])["status"], "open")  # never the bot's
+        engine.complete_task(self.conn, t["id"], "done", now=MON)
+        c = crm.communications(self.conn, lead_id=t["lead_id"])[0]
+        self.assertEqual((c["channel"], c["direction"], c["label"]), ("whatsapp", "out", "WhatsApp message"))
+        crm.refresh_followups(self.conn)
+        self.assertEqual(one(self.conn, "SELECT last_contacted_at FROM leads WHERE id = ?", t["lead_id"])["last_contacted_at"],
+                         iso(MON))
+
+    def test_phone_helpers(self):
+        from campaigner.render import lead_phone, wa_digits, whatsapp_text
+        self.assertEqual(wa_digits("+1 (440) 555-0100"), "14405550100")
+        self.assertEqual(wa_digits("0044 20 7946 0000"), "442079460000")
+        self.assertEqual(wa_digits("555-0100"), "")
+        self.assertEqual(lead_phone({"data": json.dumps({"phone": "111", "mobile": "222"})}), "222")
+        self.assertEqual(whatsapp_text("**bold** and *it*\n- one"), "*bold* and _it_\n• one")
+
+
+class MailSyncTest(Base):
+    def test_hand_written_and_later_emails_are_logged_once(self):
+        from campaigner import crm
+        jane = one(self.conn, "SELECT * FROM leads WHERE email = 'jane@x.com'")
+        t0 = MON + timedelta(hours=1)
+        self.g.outbox.append({"id": "o1", "subject": "Following up", "bodyPreview": "As discussed…",
+                              "sentDateTime": iso(t0), "toRecipients": [{"emailAddress": {"address": "Jane@x.com"}}]})
+        self.g.inbox.append(mail("jane@x.com", "Thanks!", at=t0 + timedelta(hours=1), preview="Great, see you then"))
+        self.g.inbox.append(mail("stranger@y.com", "Hello", at=t0))
+        self.tick(MON + timedelta(hours=3))
+        self.tick(MON + timedelta(hours=4))                                        # second pass adds nothing
+        got = [(c["label"], c["subject"], c["content"]) for c in crm.communications(self.conn, lead_id=jane["id"])
+               if c["channel"] == "email"]
+        self.assertEqual(got, [("Email received", "Thanks!", "Great, see you then"),
+                               ("Email (written in Outlook)", "Following up", "As discussed…")])
+        self.assertEqual(one(self.conn, "SELECT last_contacted_at FROM leads WHERE id = ?", jane["id"])["last_contacted_at"],
+                         iso(t0 + timedelta(hours=1)))
+        self.assertEqual(self.enr("jane@x.com")["status"], "pending")              # an unrelated email stops nothing
+
+    def test_app_sends_are_not_logged_twice(self):
+        from campaigner import crm
+        self.tick(MON)
+        engine.complete_task(self.conn, self.task("jane@x.com")["id"], "done", now=MON)
+        at = MON + timedelta(days=1)
+        self.tick(at)                                                              # the app sends email 1
+        self.g.outbox.append({"id": "o9", "subject": "Hi Beta", "bodyPreview": "Hello Bob", "sentDateTime": iso(at + timedelta(seconds=20)),
+                              "toRecipients": [{"emailAddress": {"address": "bob@x.com"}}]})
+        self.tick(at + timedelta(minutes=30))
+        bob = one(self.conn, "SELECT id FROM leads WHERE email = 'bob@x.com'")["id"]
+        self.assertEqual([c["label"] for c in crm.communications(self.conn, lead_id=bob) if c["channel"] == "email"],
+                         ["Email · step 2"])

@@ -1,20 +1,21 @@
-{# One dialog for logging a call, meeting or note; opened by any [data-log] button (see app.js). #}
-<dialog id="log-dlg" class="dlg" aria-labelledby="log-title" data-me="{{ me or '' }}" data-responded='{{ RESPONDED | tojson }}'>
+{# One dialog for logging a call, meeting, message or note; opened by any [data-log] button (see app.js). #}
+<dialog id="log-dlg" class="dlg" aria-labelledby="log-title" data-me="{{ me or '' }}" data-responded='{{ RESPONDED | tojson }}'
+        data-suggested='{{ SUGGESTED_STATUS | tojson }}'>
   <form method="dialog" id="log-form" class="stack-y" style="gap:10px">
     <div class="card-head"><h2 id="log-title">Log a call</h2><button class="btn sm ghost" value="cancel" formnovalidate aria-label="Close">✕</button></div>
     <p class="meta" id="log-who"></p>
     <input type="hidden" name="lead">
     <input type="hidden" name="campaign_id">
     <div class="seg" role="radiogroup" aria-label="Type">
-      {% for k, label in {"call": "Call", "meeting": "Meeting", "note": "Note"}.items() %}
+      {% for k, label in {"call": "Call", "meeting": "Meeting", "whatsapp": "WhatsApp / SMS", "linkedin": "LinkedIn", "note": "Note"}.items() %}
         <label><input type="radio" name="kind" value="{{ k }}" {{ 'checked' if k == 'call' }}> {{ label }}</label>
       {% endfor %}
     </div>
     <div class="form-grid">
       <label class="f">When<input type="datetime-local" name="at" required></label>
-      <label class="f" data-for="call meeting">Outcome
+      <label class="f" data-for="call meeting whatsapp linkedin">Outcome
         <select name="outcome">
-          <option value="" data-kind="call meeting">Choose…</option>
+          <option value="" data-kind="call meeting whatsapp linkedin">Choose…</option>
           {% for k, opts in OUTCOMES.items() %}{% for o in opts %}<option value="{{ o }}" data-kind="{{ k }}">{{ o }}</option>{% endfor %}{% endfor %}
         </select>
       </label>
@@ -25,10 +26,14 @@
     </div>
     <label class="f">Notes<textarea name="notes" rows="4" placeholder="What was said, objections, who else is involved…"></textarea></label>
     <div class="form-grid">
+      <label class="f">Lead status after this
+        <select name="status">{% for st in STATUSES %}<option>{{ st }}</option>{% endfor %}</select>
+        <span class="meta" id="log-status-hint">Confirm it, or change it.</span>
+      </label>
       <label class="f">Next step<input name="next_step" placeholder="e.g. Call back after budget review"></label>
       <label class="f">Next step date<input type="date" name="next_step_at"></label>
     </div>
-    <label data-for="call meeting"><input type="checkbox" name="stop_sequences"> They responded: stop their email and LinkedIn sequences (moves them to Leads)</label>
+    <label data-for="call meeting whatsapp linkedin"><input type="checkbox" name="stop_sequences"> They responded: stop their email, LinkedIn and WhatsApp sequences (moves them to Leads)</label>
     {% if not team %}<p class="meta">Add your BDRs in <a href="/settings#team">Settings → Team</a> to record who logged it.</p>{% endif %}
     <div class="actions"><button class="btn primary" value="save" id="log-save">Save</button><span class="meta" id="log-phone"></span></div>
   </form>

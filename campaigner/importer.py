@@ -8,7 +8,7 @@ import re
 import sqlite3
 from urllib.parse import unquote
 
-from . import engine
+from . import crm, engine
 from .db import event, iso, one, utcnow
 
 FIELDS = {
@@ -20,6 +20,7 @@ FIELDS = {
     "title": "Title",
     "linkedin_url": "LinkedIn URL",
     "owner": "Owner (assigned to)",
+    "status": "Lead status (New / Warm / Cold / Converted / Closed-Lost)",
     # Optional history, so leads you've already worked outside the app start at the right step.
     "lead_status": "History: lead status",
     "li_status": "History: LinkedIn status",
@@ -37,6 +38,7 @@ GUESS = {
     "company": ["company", "company_name", "organization", "organisation", "account", "account_name", "employer"],
     "title": ["title", "job_title", "position", "role", "designation", "headline"],
     "owner": ["owner", "lead_owner", "assigned_to", "assignee", "bdr", "sdr", "rep", "sales_rep"],
+    "status": ["status", "lead_temperature", "temperature", "prospect_status", "crm_status"],
     "lead_status": ["lead_status"],
     "li_status": ["li_status", "linkedin_status", "connection_status"],
     "li_msg_1": ["li_1st_msg", "li_msg_1", "li_message_1", "linkedin_message_1", "li_msg1"],
@@ -119,9 +121,11 @@ def _keep_out(conn, lead_id: int, campaign_id: int) -> str | None:
     another live sequence would get two at once."""
     if one(conn, "SELECT 1 FROM enrollments WHERE lead_id = ? AND campaign_id = ?", lead_id, campaign_id):
         return None  # counted as already in the campaign
-    lead = one(conn, "SELECT stage, dnc FROM leads WHERE id = ?", lead_id)
+    lead = one(conn, "SELECT stage, dnc, status FROM leads WHERE id = ?", lead_id)
     if lead["dnc"]:
         return "unsubscribed / is do-not-contact"
+    if lead["status"] in crm.CLOSED:
+        return f"is {lead['status']}"
     if lead["stage"] == "lead":
         return "already replied (in Leads)"
     other = one(conn, """SELECT c.name FROM enrollments e JOIN campaigns c ON c.id = e.campaign_id
@@ -189,12 +193,16 @@ def import_rows(conn, rows: list[dict], mapping: dict[str, str], campaign_id: in
             lead_id = cur.lastrowid
             summary["created"] += 1
 
+        st = crm.normalize_status(val.get("status") or "")
+        if st:  # e.g. Warm for a high-intent source; everyone else starts New
+            conn.execute("UPDATE leads SET status = ?, status_changed_at = ? WHERE id = ? AND status != ?",
+                         (st, iso(now), lead_id, st))
         if (val.get("owner") or "").strip():
             oid = _owner_id(conn, val["owner"].strip(), owners)
             conn.execute("UPDATE leads SET owner_id = ? WHERE id = ?", (oid, lead_id))
 
         if campaign_id:
-            why = lead and _keep_out(conn, lead_id, campaign_id)
+            why = _keep_out(conn, lead_id, campaign_id)
             if why:
                 who = " ".join(x for x in (first or lead["first_name"], last or lead["last_name"]) if x) or email or li
                 summary["skipped"].append(f"row {n}: {who} {why}; not enrolled")
@@ -215,8 +223,6 @@ def import_rows(conn, rows: list[dict], mapping: dict[str, str], campaign_id: in
             else:
                 summary["already_enrolled"] += 1
     if campaign_id:
-        from . import crm
-
         crm.assign_campaign_owner(conn, campaign_id)  # anyone still unassigned gets the campaign's owner
     conn.execute("COMMIT")
     if owners:

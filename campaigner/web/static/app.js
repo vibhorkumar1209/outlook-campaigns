@@ -1,4 +1,4 @@
-// Shared dashboard behaviour: tooltips, API helper, toasts, LinkedIn queue actions, run-now.
+// Shared dashboard behaviour: tooltips, API helper, toasts, task queue, drafts, CRM dialogs, run-now.
 const $ = (s, el = document) => el.querySelector(s);
 const $$ = (s, el = document) => [...el.querySelectorAll(s)];
 
@@ -47,7 +47,7 @@ $$("[data-run]").forEach((b) => b.addEventListener("click", async () => {
   setTimeout(() => (b.disabled = false), 3000);
 }));
 
-// LinkedIn queue.
+// Task queue (LinkedIn and WhatsApp).
 function updateCount(card) {
   const ta = $(".task-body", card), c = $("[data-count]", card);
   if (!ta || !c) return;
@@ -104,6 +104,12 @@ $$(".task").forEach((card) => {
       btn.disabled = false;
       return;
     }
+    if (act === "open" && card.dataset.wa) {
+      window.open(`https://wa.me/${card.dataset.wa}?text=${encodeURIComponent(ta ? ta.value : "")}`, "_blank", "noopener");
+      $("[data-act=done]", card).classList.add("primary");
+      btn.classList.remove("primary");
+      return;
+    }
     if (act === "open") {
       if (ta && ta.value) {
         try { await navigator.clipboard.writeText(ta.value); toast("Copied. Paste it in LinkedIn."); }
@@ -143,6 +149,7 @@ $$("[data-lead-act]").forEach((b) => b.addEventListener("click", async () => {
   if (act === "update") {
     body.email = $("#lead-email").value;
     body.linkedin_url = $("#lead-li").value;
+    if ($("#lead-phone")) body.phone = $("#lead-phone").value;
   }
   try { await api(`/api/leads/${b.dataset.lead}`, body); location.reload(); }
   catch (err) { toast(err.message, true); }
@@ -246,7 +253,7 @@ $$("[data-history]").forEach((b) => b.addEventListener("click", async () => {
   }
 }));
 
-// Log a call / meeting / note.
+// Log a call / meeting / message / note. The lead's status is confirmed (or changed) with every log.
 const dlg = $("#log-dlg");
 if (dlg) {
   const form = $("#log-form");
@@ -256,12 +263,20 @@ if (dlg) {
     return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
   };
   const responded = new Set(JSON.parse(dlg.dataset.responded || "[]"));
+  const suggested = JSON.parse(dlg.dataset.suggested || "{}");
+  const TITLES = { call: "Log a call", meeting: "Log a meeting", whatsapp: "Log a WhatsApp / SMS", linkedin: "Log a LinkedIn message", note: "Add a note" };
+  let current = "New";
   const syncOutcome = () => {
-    form.stop_sequences.checked = form.kind.value !== "note" && responded.has(form.outcome.value);
+    const out = form.kind.value === "note" ? "" : form.outcome.value;
+    form.stop_sequences.checked = responded.has(out);
+    const want = suggested[out];
+    form.status.value = want && !["Converted", "Closed/Lost"].includes(current) ? want : current;
+    $("#log-status-hint").textContent = form.status.value !== current
+      ? `Was ${current}. Suggested from the outcome; change it if that's wrong.` : "Confirm it, or change it.";
   };
   const syncKind = () => {
     const kind = form.kind.value;
-    $("#log-title").textContent = { call: "Log a call", meeting: "Log a meeting", note: "Add a note" }[kind];
+    $("#log-title").textContent = TITLES[kind];
     $$("[data-for]", form).forEach((el) => { el.hidden = !el.dataset.for.split(" ").includes(kind); });
     $$("option[data-kind]", form.outcome).forEach((o) => {
       o.hidden = o.disabled = !o.dataset.kind.split(" ").includes(kind);
@@ -273,14 +288,14 @@ if (dlg) {
   $$("input[name=kind]", form).forEach((r) => r.addEventListener("change", syncKind));
   form.outcome.addEventListener("change", syncOutcome);
 
-  document.addEventListener("click", (e) => {
-    const b = e.target.closest("[data-log]");
-    if (!b) return;
+  window.openLog = (b, kind) => {
     form.reset();
     form.lead.value = b.dataset.lead;
     form.campaign_id.value = b.dataset.campaign || "";
     form.at.value = nowLocal();
     form.by_id.value = dlg.dataset.me || b.dataset.owner || "";
+    current = b.dataset.status || "New";
+    if (kind) form.kind.value = kind;
     $("#log-who").textContent = [b.dataset.name, b.dataset.company].filter(Boolean).join(" · ");
     const phone = b.dataset.phone || "";
     const ph = $("#log-phone");
@@ -292,7 +307,11 @@ if (dlg) {
       ph.appendChild(a);
     }
     syncKind();
-    dlg.showModal();
+    if (!dlg.open) dlg.showModal();
+  };
+  document.addEventListener("click", (e) => {
+    const b = e.target.closest("[data-log]");
+    if (b) window.openLog(b);
   });
 
   form.addEventListener("submit", async (e) => {
@@ -302,9 +321,10 @@ if (dlg) {
     if (kind !== "note" && !form.outcome.value) { toast("Pick an outcome", true); form.outcome.focus(); return; }
     const body = {
       kind, at: form.at.value, outcome: kind === "note" ? "" : form.outcome.value,
-      duration_min: kind === "note" ? "" : form.duration_min.value, notes: form.notes.value,
+      duration_min: ["call", "meeting"].includes(kind) ? form.duration_min.value : "", notes: form.notes.value,
       next_step: form.next_step.value, next_step_at: form.next_step_at.value, by_id: form.by_id.value,
       campaign_id: form.campaign_id.value, stop_sequences: kind !== "note" && form.stop_sequences.checked,
+      status: form.status.value,
     };
     $("#log-save").disabled = true;
     try {
@@ -316,6 +336,149 @@ if (dlg) {
     finally { $("#log-save").disabled = false; }
   });
 }
+
+// Lead status: Campaign Status cells and the lead page.
+$$("[data-status-of]").forEach((sel) => {
+  let before = sel.value;
+  sel.addEventListener("change", async () => {
+    const closing = ["Converted", "Closed/Lost"].includes(sel.value);
+    if (closing && !confirm(`Mark as ${sel.value}? This stops their sequences and their follow-up reminders.`)) { sel.value = before; return; }
+    try {
+      await api(`/api/leads/${sel.dataset.statusOf}`, { action: "status", status: sel.value });
+      before = sel.value;
+      $$(`[data-status-of="${sel.dataset.statusOf}"]`).forEach((o) => { o.value = sel.value; });
+      $$(`[data-log][data-lead="${sel.dataset.statusOf}"]`).forEach((b) => { b.dataset.status = sel.value; });
+      toast("Status saved");
+      if (sel.dataset.reload) setTimeout(() => location.reload(), 400);
+    } catch (err) { sel.value = before; toast(err.message, true); }
+  });
+});
+
+// Reminders: snooze by the status's own rhythm.
+document.addEventListener("click", async (e) => {
+  const b = e.target.closest("[data-snooze]");
+  if (!b) return;
+  b.disabled = true;
+  try {
+    const r = await api(`/api/leads/${b.dataset.snooze}`, { action: "snooze" });
+    toast(`Snoozed until ${r.until}`);
+    setTimeout(() => location.reload(), 500);
+  } catch (err) { b.disabled = false; toast(err.message, true); }
+});
+
+// Email drafts: preview, approve, skip, hold.
+const draftsBadge = (n) => {
+  const left = $("#drafts-left");
+  if (left) left.textContent = n;
+  const badge = $("#nav-drafts .badge");
+  if (badge) { if (n) badge.textContent = n; else badge.remove(); }
+};
+$$("[data-draft-preview]").forEach((b) => b.addEventListener("click", async () => {
+  const row = b.closest("tr").nextElementSibling, frame = $("iframe", row);
+  row.hidden = !row.hidden;
+  b.setAttribute("aria-expanded", String(!row.hidden));
+  b.textContent = row.hidden ? "Preview" : "Hide";
+  if (!row.hidden && !frame.srcdoc) {
+    // Shown from memory in a locked-down frame: nothing in the email can run, and no page load is needed.
+    try { frame.srcdoc = await (await fetch(frame.dataset.src)).text(); }
+    catch (err) { toast("Couldn't load the preview: " + err.message, true); }
+  }
+}));
+$$("[data-draft-act]").forEach((b) => b.addEventListener("click", async () => {
+  const tr = b.closest("tr"), id = tr.dataset.draft, act = b.dataset.draftAct;
+  if (b.dataset.ask && !confirm(b.dataset.ask)) return;
+  $$("button", tr).forEach((x) => (x.disabled = true));
+  try {
+    const r = act === "approve" ? await api("/api/drafts/approve", { ids: [id] }) : await api(`/api/drafts/${id}`, { action: act });
+    draftsBadge(r.pending);
+    toast(act === "approve" ? "Approved. It goes out on the next run inside the send window." : act === "skip" ? "Skipped" : "Back to waiting");
+    setTimeout(() => location.reload(), 600);
+  } catch (err) { toast(err.message, true); $$("button", tr).forEach((x) => (x.disabled = false)); }
+}));
+$$("[data-approve-all]").forEach((b) => b.addEventListener("click", async () => {
+  if (!confirm(`Approve all ${b.dataset.n} drafts? They're sent inside each campaign's send window, spaced out, within your daily limits.`)) return;
+  b.disabled = true;
+  try {
+    const r = await api("/api/drafts/approve", { all: true, campaign_id: b.dataset.campaign });
+    toast(`${r.approved} approved`);
+    setTimeout(() => location.reload(), 600);
+  } catch (err) { b.disabled = false; toast(err.message, true); }
+}));
+
+// Send email / message (the reminder quick action, and on lead pages).
+const cdlg = $("#compose-dlg");
+if (cdlg) {
+  const form = $("#compose-form");
+  let src = null;
+  const text = () => form.body.value.replaceAll("{{ first_name }}", src.dataset.first || "").trim();
+  const syncVia = () => {
+    const via = form.via.value;
+    $$("[data-via]", form).forEach((el) => { el.hidden = !el.dataset.via.split(" ").includes(via); });
+    $("#compose-wa-missing").hidden = !!src.dataset.wa;
+    $("#compose-open-wa").disabled = !src.dataset.wa;
+    $("#compose-open-li").disabled = !src.dataset.linkedin;
+  };
+  $$("input[name=via]", form).forEach((r) => r.addEventListener("change", syncVia));
+  window.openCompose = (b) => {
+    src = b;
+    form.reset();
+    form.lead.value = b.dataset.lead;
+    $("#compose-who").textContent = [b.dataset.name, b.dataset.company, b.dataset.email].filter(Boolean).join(" · ");
+    form.via.value = b.dataset.email ? "email" : b.dataset.wa ? "whatsapp" : "linkedin";
+    $$("input[name=via]", form).forEach((r) => {
+      r.disabled = (r.value === "email" && !b.dataset.email) || (r.value === "linkedin" && !b.dataset.linkedin);
+    });
+    syncVia();
+    cdlg.showModal();
+  };
+  document.addEventListener("click", (e) => {
+    const b = e.target.closest("[data-compose]");
+    if (b) window.openCompose(b);
+  });
+  form.addEventListener("submit", async (e) => {
+    if (e.submitter && e.submitter.value === "cancel") return;
+    e.preventDefault();
+    const send = e.submitter && e.submitter.value === "send";
+    $$("button", form).forEach((x) => (x.disabled = true));
+    try {
+      const r = await api(`/api/leads/${form.lead.value}/compose`, { subject: form.subject.value, body: form.body.value, send });
+      cdlg.close();
+      if (send) toast("Sending now. It will show in their history in a moment.");
+      else {
+        toast("Saved in your Outlook Drafts");
+        if (r.web_link) window.open(r.web_link, "_blank", "noopener");
+      }
+      setTimeout(() => location.reload(), 1200);
+    } catch (err) { toast(err.message, true); }
+    finally { $$("button", form).forEach((x) => (x.disabled = false)); syncVia(); }
+  });
+  $("#compose-open-wa").addEventListener("click", () => {
+    if (!text()) return toast("Write the message first", true);
+    window.open(`https://wa.me/${src.dataset.wa}?text=${encodeURIComponent(text())}`, "_blank", "noopener");
+  });
+  $("#compose-open-li").addEventListener("click", async () => {
+    if (text()) { try { await navigator.clipboard.writeText(text()); toast("Copied. Paste it in LinkedIn."); } catch { /* clipboard blocked */ } }
+    window.open(src.dataset.linkedin, "_blank", "noopener");
+  });
+  $("#compose-logged").addEventListener("click", async () => {
+    try {
+      await api(`/api/leads/${form.lead.value}/activities`, { kind: form.via.value, outcome: "Sent", notes: text(), at: "" });
+      cdlg.close();
+      toast("Logged");
+      setTimeout(() => location.reload(), 500);
+    } catch (err) { toast(err.message, true); }
+  });
+  // A reminder email's "Send email / message" button lands here.
+  if (new URLSearchParams(location.search).get("compose")) {
+    const b = $("[data-compose]");
+    if (b) window.openCompose(b);
+  }
+}
+
+// Dropdown menus close when you click elsewhere.
+document.addEventListener("click", (e) => {
+  $$("details.menu[open]").forEach((m) => { if (!m.contains(e.target)) m.open = false; });
+});
 
 document.addEventListener("click", async (e) => {
   const b = e.target.closest("[data-del-activity]");
