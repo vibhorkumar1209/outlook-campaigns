@@ -35,7 +35,10 @@ DEFAULTS = {
     "li_bot_hours": ["09:00", "18:00"],
     "li_bot_days": "mon,tue,wed,thu,fri",
     "li_bot_per_run": 8,
+    "li_bot_vary": True,                                    # a different rhythm every day (see day_plan)
 }
+# Hard ceilings: settings can go lower, never higher. Comfortably inside what LinkedIn tolerates for one person.
+CEILINGS = {"view": 80, "connect": 25, "message": 60, "like": 40, "comment": 15}
 # Human pacing. Between actions: the configured gap, stretched a little at random; now and then a few seconds of
 # read-only browsing (feed, notifications); every few actions a longer break. A run stops after MAX_RUN.
 WANDER_CHANCE = 0.35
@@ -49,6 +52,18 @@ ACCEPT_CHECK_EVERY = timedelta(minutes=15)  # "recently added" connections scan 
 ACCEPT_DEEP_EVERY = timedelta(days=1)       # once a day, read further back: catches older invites accepted
 ACCEPT_LIMIT, ACCEPT_DEEP_LIMIT = 40, 300
 APPROVAL_TIMEOUT = timedelta(days=7)  # unapproved comment drafts expire; the like still counts
+# Daily rhythm. Every day gets its own plan so no two days look alike: a later start and an earlier finish, a lunch
+# lull, caps somewhere between ~50% and 100% of the settings (now and then a light day), and a gentle ramp while the
+# account is new to the bot. Guards on what LinkedIn watches: bursts within an hour, total daily activity, the number
+# of open invites, and a low acceptance rate. The guards apply even with the varied rhythm turned off.
+HOUR_CAP = 12                    # actions in any rolling hour, all kinds together
+DAY_TOTAL = 90                   # actions a day, all kinds together (before the day's scaling)
+REST_BETWEEN_RUNS = (8, 35)      # minutes off after a run that did something
+DISTRACTED = (0.1, 2.0, 3.5)     # chance of a much longer pause between actions, and how much longer
+PENDING_MAX = 200                # open invites (sent, not yet accepted): new invites stop until some are accepted
+ACCEPT_MIN_RATE, ACCEPT_MIN_SAMPLE = 0.2, 40  # under 20% accepted (of 40+ invites 3-30 days old): invites halved
+RAMP = ((7, 0.5), (14, 0.75))    # days since the bot's first action -> share of the caps
+LIGHT_DAY = 0.15                 # chance a day is a light one (half the usual)
 class _ProfileLock:
     """One Chrome profile can only be open once. A file lock, so the dashboard's runs, its sign-in window and
     CLI commands (`linkedin-login`, `linkedin-check`) in other processes never open it at the same time."""
@@ -134,8 +149,108 @@ def parse_age_days(text: str) -> float | None:
 
 def settings(conn) -> dict:
     out = {k: db.get_setting(conn, k, v) for k, v in DEFAULTS.items()}
-    out["li_bot_caps"] = {**DEFAULTS["li_bot_caps"], **out["li_bot_caps"]}
+    caps = {**DEFAULTS["li_bot_caps"], **out["li_bot_caps"]}
+    out["li_bot_caps"] = {a: min(int(n), CEILINGS.get(a, int(n))) for a, n in caps.items()}
+    out["li_bot_week_invites"] = min(int(out["li_bot_week_invites"]), 100)
     return out
+
+
+# ---------- the day's rhythm ----------
+
+def _mins(hm: str) -> int:
+    h, m = hm.split(":")
+    return int(h) * 60 + int(m)
+
+
+def _hm(mins: float) -> str:
+    return f"{int(mins) // 60:02d}:{int(mins) % 60:02d}"
+
+
+def _local(now: datetime) -> datetime:
+    return now.astimezone(datetime.now().astimezone().tzinfo)
+
+
+def _seed(conn) -> str:
+    """Per install, so two people running this app don't share a rhythm."""
+    seed = db.get_setting(conn, "li_bot_seed")
+    if not seed:
+        seed = f"{random.getrandbits(64):016x}"
+        db.set_setting(conn, "li_bot_seed", seed)
+    return seed
+
+
+def invite_health(conn, now: datetime) -> dict:
+    """Open invites, and how many of the bot's invites from 3 to 30 days ago were accepted."""
+    pending = scalar(conn, "SELECT COUNT(*) FROM leads WHERE li_state = 'invited'")
+    sent = rows(conn, """SELECT DISTINCT b.lead_id, l.li_state FROM bot_actions b JOIN leads l ON l.id = b.lead_id
+                         WHERE b.ok = 1 AND b.action = 'connect' AND b.at >= ? AND b.at < ?""",
+                iso(now - timedelta(days=30)), iso(now - timedelta(days=3)))
+    accepted = sum(r["li_state"] == "connected" for r in sent)
+    return {"pending": pending, "sent": len(sent), "accepted": accepted,
+            "rate": accepted / len(sent) if sent else None}
+
+
+def day_plan(conn, cfg: dict, now: datetime) -> dict:
+    """Today's hours, lull and caps. The same all day (seeded by install and date), different every day."""
+    day = _local(now).date()
+    start, end = _mins(cfg["li_bot_hours"][0]), _mins(cfg["li_bot_hours"][1])
+    caps = dict(cfg["li_bot_caps"])
+    plan = {"day": day.isoformat(), "start": start, "end": end, "lunch": None, "light": False, "ramp": 1.0,
+            "total": DAY_TOTAL, "notes": []}
+    if cfg.get("li_bot_vary", True):
+        r = random.Random(f"{_seed(conn)}:{day.isoformat()}")
+        span = end - start
+        plan["start"] = start + r.uniform(0, min(50, span * 0.1))
+        plan["end"] = end - r.uniform(0, min(75, span * 0.15))
+        lunch_at = r.uniform(12 * 60, 13 * 60 + 30)
+        lunch = (lunch_at, lunch_at + r.uniform(30, 70))
+        if plan["start"] + 60 < lunch[0] and lunch[1] + 60 < plan["end"]:
+            plan["lunch"] = lunch
+        factor = r.uniform(0.6, 1.0)
+        if r.random() < LIGHT_DAY:
+            plan["light"], factor = True, factor * 0.5
+        first = parse(scalar(conn, "SELECT MIN(at) FROM bot_actions WHERE ok = 1"))
+        age = (now - first).days if first else 0
+        plan["ramp"] = next((share for days, share in RAMP if age < days), 1.0)
+        factor *= plan["ramp"]
+        caps = {a: (max(1, int(n * factor * r.uniform(0.85, 1.0))) if n else 0) for a, n in caps.items()}
+        plan["total"] = max(1, int(DAY_TOTAL * factor))
+        if plan["light"]:
+            plan["notes"].append("a light day")
+        if plan["ramp"] < 1:
+            plan["notes"].append(f"warming up: {plan['ramp']:.0%} of the caps while the bot is new to this account")
+    health = invite_health(conn, now)
+    plan["invites"] = health
+    if health["pending"] >= PENDING_MAX:
+        caps["connect"] = 0
+        plan["notes"].append(f"no invites: {health['pending']} are still open (withdraw old ones on LinkedIn: "
+                             "My Network → Manage → Sent)")
+    elif health["sent"] >= ACCEPT_MIN_SAMPLE and health["rate"] < ACCEPT_MIN_RATE:
+        caps["connect"] //= 2
+        plan["notes"].append(f"invites halved: only {health['rate']:.0%} accepted lately (aim for better-matched "
+                             "prospects or a personal note)")
+    plan["caps"] = caps
+    plan["hours"] = f"{_hm(plan['start'])}–{_hm(plan['end'])}"
+    plan["lunch_hours"] = f"{_hm(plan['lunch'][0])}–{_hm(plan['lunch'][1])}" if plan["lunch"] else None
+    return plan
+
+
+def in_plan(cfg: dict, plan: dict, now: datetime) -> bool:
+    local = _local(now)
+    days = {engine.DAYS.index(d.strip()[:3]) for d in cfg["li_bot_days"].split(",") if d.strip()[:3] in engine.DAYS}
+    m = local.hour * 60 + local.minute + local.second / 60
+    if local.weekday() not in days or not plan["start"] <= m < plan["end"]:
+        return False
+    return not (plan["lunch"] and plan["lunch"][0] <= m < plan["lunch"][1])
+
+
+def resting(conn, now: datetime) -> bool:
+    until = parse(db.get_setting(conn, "li_bot_rest_until"))
+    return bool(until and now < until)
+
+
+def recent_actions(conn, now: datetime, within: timedelta) -> int:
+    return scalar(conn, "SELECT COUNT(*) FROM bot_actions WHERE ok = 1 AND at >= ?", iso(now - within))
 
 
 def pause(conn, reason: str) -> None:
@@ -149,13 +264,6 @@ def resume(conn) -> None:
 def status(conn) -> dict:
     return {"mode": settings(conn)["li_mode"], "paused": db.get_setting(conn, "li_bot_paused"),
             "signed_in": bool(db.get_setting(conn, "li_bot_signed_in")), "profile_exists": PROFILE_DIR.exists()}
-
-
-def in_hours(cfg: dict, now: datetime) -> bool:
-    local = now.astimezone(datetime.now().astimezone().tzinfo)
-    days = {engine.DAYS.index(d.strip()[:3]) for d in cfg["li_bot_days"].split(",") if d.strip()[:3] in engine.DAYS}
-    start, end = cfg["li_bot_hours"]
-    return local.weekday() in days and start <= local.strftime("%H:%M") < end
 
 
 def used_today(conn, now: datetime) -> dict[str, int]:
@@ -223,6 +331,8 @@ def _between(driver, cfg, done: int, next_break: int, rng, sleep, log) -> int:
         sleep(secs)
         next_break = done + rng.randint(*BREAK_EVERY)
     gap = rng.uniform(*cfg["li_bot_gap"]) * rng.uniform(0.9, 1.3)
+    if rng.random() < DISTRACTED[0]:  # a call, a coffee, another tab
+        gap *= rng.uniform(*DISTRACTED[1:])
     wander = getattr(driver, "wander", None)
     if wander and rng.random() < WANDER_CHANCE:
         sleep(gap / 3)
@@ -251,9 +361,15 @@ def run(conn, driver_factory, *, now: datetime | None = None, log=print, sleep=N
     if db.get_setting(conn, "li_bot_paused"):
         return
     expire_unapproved(conn, now, log)
-    # Outside bot hours only dummy (test) campaigns' tasks run, so a test can finish in its 30 minutes.
-    hours_ok = in_hours(cfg, now)
-    caps, used = cfg["li_bot_caps"], used_today(conn, now)
+    plan = day_plan(conn, cfg, now)
+    # Outside today's hours (or resting between runs) only dummy (test) campaigns' tasks run, so a test can finish
+    # in its 30 minutes.
+    vary = cfg.get("li_bot_vary", True)
+    hours_ok = in_plan(cfg, plan, now) and not (vary and resting(conn, now))
+    caps, used = plan["caps"], used_today(conn, now)
+    room = min(HOUR_CAP - recent_actions(conn, now, timedelta(hours=1)), plan["total"] - sum(used.values()))
+    if room <= 0:
+        return
     week_invites = scalar(conn, "SELECT COUNT(*) FROM bot_actions WHERE ok = 1 AND action = 'connect' AND at >= ?",
                           iso(now - timedelta(days=7)))
 
@@ -276,8 +392,12 @@ def run(conn, driver_factory, *, now: datetime | None = None, log=print, sleep=N
         log("LinkedIn bot: browser profile busy (sign-in window open?), skipping this run")
         return
     todo = human_order(todo, rng)
+    per_run = cfg["li_bot_per_run"]
+    if vary:
+        per_run = min(per_run, rng.randint(max(2, per_run // 2), per_run))
+    per_run = min(per_run, room)
     driver = driver_factory()
-    done = 0
+    done = acted = 0
     next_break = rng.randint(*BREAK_EVERY)
     started = time.monotonic()
     try:
@@ -302,7 +422,7 @@ def run(conn, driver_factory, *, now: datetime | None = None, log=print, sleep=N
                 log(f"LinkedIn bot: acceptance check failed: {e}")
             db.set_setting(conn, "li_accept_checked_at", iso(now))
         for t, action in todo:
-            if done >= cfg["li_bot_per_run"]:
+            if done >= per_run:
                 break
             if time.monotonic() - started > MAX_RUN.total_seconds():
                 log("LinkedIn bot: run time limit reached, the rest waits for the next run")
@@ -319,6 +439,7 @@ def run(conn, driver_factory, *, now: datetime | None = None, log=print, sleep=N
                 if handle(conn, driver, t, action, now=now, log=log, draft=draft):
                     used[action] = used.get(action, 0) + 1
                     week_invites += action == "connect"
+                    acted += 1
                 done += 1
             except ActionError as e:
                 _fail(conn, t, str(e), log)
@@ -347,6 +468,10 @@ def run(conn, driver_factory, *, now: datetime | None = None, log=print, sleep=N
             driver.close()
         finally:
             PROFILE_LOCK.release()
+            if vary and acted:  # step away for a while before the next session
+                mins = rng.uniform(*REST_BETWEEN_RUNS)
+                ran = timedelta(seconds=time.monotonic() - started)
+                db.set_setting(conn, "li_bot_rest_until", iso(now + ran + timedelta(minutes=mins)))
 
 
 # ---------- replies on LinkedIn ----------

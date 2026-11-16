@@ -90,18 +90,27 @@
         <div class="meta" style="margin-bottom:6px">Daily caps (0 turns an action off). Used today:
           {% for a in ["view", "connect", "message", "like", "comment"] %}{{ a }} {{ bot_used.get(a, 0) }}{{ " · " if not loop.last }}{% endfor %}</div>
         <div class="form-grid">
-          <label class="f">Profile views<input type="number" min="0" max="200" name="cap_view" value="{{ bot.li_bot_caps.view }}"></label>
-          <label class="f">Invites<input type="number" min="0" max="200" name="cap_connect" value="{{ bot.li_bot_caps.connect }}"></label>
-          <label class="f">Messages<input type="number" min="0" max="200" name="cap_message" value="{{ bot.li_bot_caps.message }}"></label>
-          <label class="f">Likes<input type="number" min="0" max="200" name="cap_like" value="{{ bot.li_bot_caps.like }}"></label>
-          <label class="f">Comments (approved)<input type="number" min="0" max="200" name="cap_comment" value="{{ bot.li_bot_caps.comment }}"></label>
+          <label class="f">Profile views (max {{ bot_ceil.view }})<input type="number" min="0" max="{{ bot_ceil.view }}" name="cap_view" value="{{ bot.li_bot_caps.view }}"></label>
+          <label class="f">Invites (max {{ bot_ceil.connect }})<input type="number" min="0" max="{{ bot_ceil.connect }}" name="cap_connect" value="{{ bot.li_bot_caps.connect }}"></label>
+          <label class="f">Messages (max {{ bot_ceil.message }})<input type="number" min="0" max="{{ bot_ceil.message }}" name="cap_message" value="{{ bot.li_bot_caps.message }}"></label>
+          <label class="f">Likes (max {{ bot_ceil.like }})<input type="number" min="0" max="{{ bot_ceil.like }}" name="cap_like" value="{{ bot.li_bot_caps.like }}"></label>
+          <label class="f">Comments (approved) (max {{ bot_ceil.comment }})<input type="number" min="0" max="{{ bot_ceil.comment }}" name="cap_comment" value="{{ bot.li_bot_caps.comment }}"></label>
           <label class="f">Invites per 7 days (LinkedIn allows ~100)<input type="number" min="0" max="100" name="week_invites" value="{{ bot.li_bot_week_invites }}"></label>
           <label class="f">Gap between actions, min s<input type="number" min="0" name="gap_min" value="{{ bot.li_bot_gap[0] }}"></label>
           <label class="f">Gap between actions, max s<input type="number" min="0" name="gap_max" value="{{ bot.li_bot_gap[1] }}"></label>
           <label class="f">Bot hours start<input type="time" name="hours_start" value="{{ bot.li_bot_hours[0] }}"></label>
           <label class="f">Bot hours end<input type="time" name="hours_end" value="{{ bot.li_bot_hours[1] }}"></label>
         </div>
-        <p class="meta">Paced like a person: it works through people in a random order (never the same person twice in a row), skims each profile before acting, types at reading pace, sometimes browses the feed between actions, and takes a 4–10 minute break every 3–5 actions. At most {{ bot.li_bot_per_run }} actions per run.</p>
+        <div class="days" style="margin:12px 0 4px">
+          <label><input type="checkbox" name="vary" value="1" {{ 'checked' if bot.li_bot_vary }}> Vary the rhythm every day (recommended)</label>
+        </div>
+        <p class="meta">Paced like a person: it works through people in a random order (never the same person twice in a row), skims each profile before acting, types at reading pace, sometimes browses the feed or stops for a longer pause between actions, and takes a 4–10 minute break every 3–5 actions. A session is {{ (bot.li_bot_per_run // 2) if bot.li_bot_vary else bot.li_bot_per_run }}–{{ bot.li_bot_per_run }} actions{% if bot.li_bot_vary %}, then 8–35 minutes off{% endif %}; never more than {{ bot_hour_cap }} in an hour.
+          {% if bot.li_bot_vary %}Each day starts a little later and ends a little earlier than the hours above, has a lunch lull, and uses 50–100% of the caps, so no two days look the same.{% endif %}
+          New invites stop while 200 are still open, and halve when under 20% are accepted.</p>
+        <p class="meta"><b>Today:</b> {{ bot_plan.hours }}{% if bot_plan.lunch_hours %}, lunch {{ bot_plan.lunch_hours }}{% endif %} ·
+          views {{ bot_plan.caps.view }} · invites {{ bot_plan.caps.connect }} · messages {{ bot_plan.caps.message }} · likes {{ bot_plan.caps.like }} · comments {{ bot_plan.caps.comment }} · {{ bot_plan.total }} actions in all
+          {% for n in bot_plan.notes %} · {{ n }}{% endfor %}.
+          Open invites {{ bot_plan.invites.pending }}{% if bot_plan.invites.rate is not none %} · {{ "%.0f" | format(bot_plan.invites.rate * 100) }}% of recent invites accepted{% endif %}.</p>
         <div class="days" style="margin:12px 0">
           {% for d in ["mon", "tue", "wed", "thu", "fri", "sat", "sun"] %}
             <label><input type="checkbox" name="days" value="{{ d }}" {{ 'checked' if d in bot.li_bot_days }}> {{ d }}</label>

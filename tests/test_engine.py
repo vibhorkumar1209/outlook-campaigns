@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from campaigner import db, engine, importer, linkedin_bot, stats
-from campaigner.db import iso, one, rows, scalar
+from campaigner.db import iso, one, parse, rows, scalar
 from campaigner.graph import AuthError
 from campaigner.render import email_html
 from campaigner.tracking import Tracker
@@ -1036,6 +1036,82 @@ class Steady(random.Random):
     def randint(self, a, b): return 10 ** 6
 
 
+class RhythmTest(Base):
+    def setUp(self):
+        super().setUp()
+        db.set_setting(self.conn, "li_bot_hours", ["09:00", "17:00"])
+        self.cfg = linkedin_bot.settings(self.conn)
+
+    def plans(self, n=60):
+        return [linkedin_bot.day_plan(self.conn, self.cfg, MON + timedelta(days=d)) for d in range(n)]
+
+    def test_each_day_has_its_own_plan_inside_the_settings(self):
+        plans = self.plans()
+        caps = self.cfg["li_bot_caps"]
+        for p in plans:
+            self.assertGreaterEqual(p["start"], 9 * 60)
+            self.assertLessEqual(p["end"], 17 * 60)
+            for a, n in p["caps"].items():
+                self.assertLessEqual(n, caps[a])
+            if p["lunch"]:
+                self.assertTrue(p["start"] < p["lunch"][0] < p["lunch"][1] < p["end"])
+        self.assertGreater(len({p["hours"] for p in plans}), 30)
+        self.assertGreater(len({p["caps"]["connect"] for p in plans}), 3)
+        self.assertTrue(any(p["light"] for p in plans))
+        self.assertTrue(any(p["lunch"] for p in plans))
+        # stable within a day
+        again = linkedin_bot.day_plan(self.conn, self.cfg, MON + timedelta(hours=3))
+        self.assertEqual((again["hours"], again["caps"]), (plans[0]["hours"], plans[0]["caps"]))
+
+    def test_new_account_ramps_up(self):
+        self.assertEqual(self.plans(1)[0]["ramp"], 0.5)                # no history yet
+        self.conn.execute("INSERT INTO bot_actions (action, task_id, lead_id, ok, at) VALUES ('view', 0, 0, 1, ?)",
+                          (iso(MON - timedelta(days=10)),))
+        self.assertEqual(self.plans(1)[0]["ramp"], 0.75)
+        self.conn.execute("UPDATE bot_actions SET at = ?", (iso(MON - timedelta(days=30)),))
+        self.assertEqual(self.plans(1)[0]["ramp"], 1.0)
+
+    def test_fixed_rhythm_when_turned_off(self):
+        db.set_setting(self.conn, "li_bot_vary", False)
+        p = linkedin_bot.day_plan(self.conn, linkedin_bot.settings(self.conn), MON)
+        self.assertEqual((p["hours"], p["lunch"], p["caps"]), ("09:00–17:00", None, self.cfg["li_bot_caps"]))
+
+    def test_lunch_and_rest_between_sessions(self):
+        lock = linkedin_bot._ProfileLock()
+        lock.path = Path(self.tmp.name) / "profile.lock"
+        patcher = mock.patch.object(linkedin_bot, "PROFILE_LOCK", lock)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        db.set_setting(self.conn, "li_mode", "bot")
+        db.set_setting(self.conn, "li_bot_hours", ["00:00", "23:59"])
+        db.set_setting(self.conn, "li_bot_days", "mon,tue,wed,thu,fri,sat,sun")
+        cfg = linkedin_bot.settings(self.conn)
+        plan = linkedin_bot.day_plan(self.conn, cfg, MON)
+        local = MON.astimezone(datetime.now().astimezone().tzinfo)
+        day0 = local.replace(hour=0, minute=0, second=0, microsecond=0)
+        if plan["lunch"]:
+            self.assertFalse(linkedin_bot.in_plan(cfg, plan, day0 + timedelta(minutes=plan["lunch"][0] + 5)))
+        self.assertTrue(linkedin_bot.in_plan(cfg, plan, day0 + timedelta(minutes=plan["start"] + 5)))
+        at = next(MON + timedelta(minutes=m) for m in range(0, 600, 5)
+                  if linkedin_bot.in_plan(cfg, plan, MON + timedelta(minutes=m)))
+        self.tick(at)
+        run = lambda when: linkedin_bot.run(self.conn, lambda: d, now=when, log=self.logs.append, sleep=lambda s: None,
+                                            rng=Steady())
+        d = FakeDriver()
+        run(at)
+        self.assertIn("open", d.calls)
+        until = parse(db.get_setting(self.conn, "li_bot_rest_until"))
+        self.assertTrue(at + timedelta(minutes=8) <= until <= at + timedelta(minutes=36))
+        self.conn.execute("UPDATE leads SET linkedin_url = 'https://www.linkedin.com/in/bob' WHERE email = 'bob@x.com'")
+        self.tick(at + timedelta(minutes=1))
+        d = FakeDriver()
+        run(at + timedelta(minutes=2))
+        self.assertEqual(d.calls, [])                                    # resting
+        d = FakeDriver()
+        run(until + timedelta(minutes=1))
+        self.assertIn("open", d.calls)
+
+
 class FakeDriver:
     def __init__(self, posts=(), connect="sent", message="sent", blocked=False, connections=()):
         self.calls, self.posts, self.connect_result, self.message_result, self.blocked = [], list(posts), connect, message, blocked
@@ -1080,6 +1156,7 @@ class BotTest(Base):
         db.set_setting(self.conn, "li_mode", "bot")
         db.set_setting(self.conn, "li_bot_hours", ["00:00", "23:59"])
         db.set_setting(self.conn, "li_bot_days", "mon,tue,wed,thu,fri,sat,sun")
+        db.set_setting(self.conn, "li_bot_vary", False)  # RhythmTest covers the daily variation
         self.drivers = []
 
     def bot(self, driver=None, at=MON, draft=None):
@@ -1183,7 +1260,7 @@ class BotTest(Base):
         self.assertTrue(any("break" in l for l in logs))
         self.assertIn(linkedin_bot.BREAK_SECONDS[1], sleeps)
         self.assertEqual(nb, 6)
-        gap = 200 * 1.3
+        gap = 200 * 1.3 * linkedin_bot.DISTRACTED[2]  # random() 0 is also always distracted
         self.assertAlmostEqual(sum(x for x in sleeps if x != linkedin_bot.BREAK_SECONDS[1]), gap * 4)
 
     def test_wander_failure_never_costs_a_task(self):
@@ -1234,6 +1311,46 @@ class BotTest(Base):
         db.set_setting(self.conn, "li_bot_caps", {"connect": 15})
         db.set_setting(self.conn, "li_bot_days", "sat")  # MON is outside
         self.assertEqual(self.bot().calls, [])
+
+    def test_caps_never_exceed_the_ceilings(self):
+        db.set_setting(self.conn, "li_bot_caps", {"view": 500, "connect": 100, "message": 0})
+        db.set_setting(self.conn, "li_bot_week_invites", 400)
+        cfg = linkedin_bot.settings(self.conn)
+        self.assertEqual(cfg["li_bot_caps"]["view"], linkedin_bot.CEILINGS["view"])
+        self.assertEqual(cfg["li_bot_caps"]["connect"], linkedin_bot.CEILINGS["connect"])
+        self.assertEqual(cfg["li_bot_caps"]["message"], 0)
+        self.assertEqual(cfg["li_bot_week_invites"], 100)
+
+    def test_hourly_burst_guard(self):
+        self.tick(MON)
+        for i in range(linkedin_bot.HOUR_CAP):
+            self.conn.execute("INSERT INTO bot_actions (action, task_id, lead_id, ok, at) VALUES ('view', 0, 0, 1, ?)",
+                              (iso(MON - timedelta(minutes=50 - i)),))
+        self.assertEqual(self.bot().calls, [])                         # a full hour already
+        self.assertIn("open", self.bot(at=MON + timedelta(minutes=15)).calls)  # older ones aged out
+
+    def test_open_invites_and_low_acceptance_hold_invites_back(self):
+        cfg = linkedin_bot.settings(self.conn)
+        self.conn.execute("UPDATE leads SET li_state = 'none'")
+        lid = self.enr("jane@x.com")["lead_id"]
+        base = linkedin_bot.day_plan(self.conn, cfg, MON)["caps"]["connect"]
+        # 40 invites 10 days ago, 4 accepted: under 20%
+        for i in range(40):
+            self.conn.execute("INSERT INTO leads (email, first_name, li_state, created_at) VALUES (?, 'X', ?, ?)",
+                              (f"p{i}@y.com", "connected" if i < 4 else "invited", iso(MON)))
+            new = scalar(self.conn, "SELECT MAX(id) FROM leads")
+            self.conn.execute("INSERT INTO bot_actions (action, task_id, lead_id, ok, at) VALUES ('connect', 0, ?, 1, ?)",
+                              (new, iso(MON - timedelta(days=10))))
+        plan = linkedin_bot.day_plan(self.conn, cfg, MON)
+        self.assertEqual(plan["caps"]["connect"], base // 2)
+        self.assertTrue(any("halved" in n for n in plan["notes"]))
+        self.conn.execute("UPDATE leads SET li_state = 'invited' WHERE email LIKE 'p%' OR id = ?", (lid,))
+        for i in range(linkedin_bot.PENDING_MAX):
+            self.conn.execute("INSERT INTO leads (email, first_name, li_state, created_at) VALUES (?, 'Y', 'invited', ?)",
+                              (f"q{i}@y.com", iso(MON)))
+        plan = linkedin_bot.day_plan(self.conn, cfg, MON)
+        self.assertEqual(plan["caps"]["connect"], 0)
+        self.assertTrue(any("withdraw" in n for n in plan["notes"]))
 
     def engage_task(self):
         self.tick(MON)
