@@ -29,16 +29,17 @@ DEFAULTS = {
     "li_mode": "assisted",                                  # assisted | bot
     # Per day, 0 = off. Under LinkedIn's fair-use limits with margin: invites ~100/week (20/day), profile views
     # well under the ~80-100/day where free accounts get warnings, messages to connections well under ~100/day.
-    "li_bot_caps": {"view": 60, "connect": 20, "message": 40, "like": 30, "comment": 10},
+    "li_bot_caps": {"view": 60, "connect": 20, "message": 40, "like": 30, "comment": 10, "withdraw": 40},
     "li_bot_week_invites": 90,                              # rolling 7 days; LinkedIn's own limit is ~100/week
     "li_bot_gap": [45, 120],                                # seconds between actions
     "li_bot_hours": ["09:00", "18:00"],
     "li_bot_days": "mon,tue,wed,thu,fri",
     "li_bot_per_run": 8,
     "li_bot_vary": True,                                    # a different rhythm every day (see day_plan)
+    "li_bot_withdraw_weeks": 3,                             # withdraw invites pending longer than this; 0 = off
 }
 # Hard ceilings: settings can go lower, never higher. Comfortably inside what LinkedIn tolerates for one person.
-CEILINGS = {"view": 80, "connect": 25, "message": 60, "like": 40, "comment": 15}
+CEILINGS = {"view": 80, "connect": 25, "message": 60, "like": 40, "comment": 15, "withdraw": 50}
 # Human pacing. Between actions: the configured gap, stretched a little at random; now and then a few seconds of
 # read-only browsing (feed, notifications); every few actions a longer break. A run stops after MAX_RUN.
 WANDER_CHANCE = 0.35
@@ -64,6 +65,24 @@ PENDING_MAX = 200                # open invites (sent, not yet accepted): new in
 ACCEPT_MIN_RATE, ACCEPT_MIN_SAMPLE = 0.2, 40  # under 20% accepted (of 40+ invites 3-30 days old): invites halved
 RAMP = ((7, 0.5), (14, 0.75))    # days since the bot's first action -> share of the caps
 LIGHT_DAY = 0.15                 # chance a day is a light one (half the usual)
+WITHDRAW_PER_SESSION = (2, 5)    # old invites withdrawn per session, alongside the other actions
+NOTHING_OLD_RECHECK = timedelta(hours=12)  # after finding no old invites, look again this much later
+SENT_AGE_RE = re.compile(r"(\d+|an?)\s+(minute|hour|day|week|month|year)s?\s+ago", re.I)
+SENT_UNIT_DAYS = {"minute": 1 / 1440, "hour": 1 / 24, "day": 1, "week": 7, "month": 30, "year": 365}
+
+
+def sent_age_days(text: str) -> float | None:
+    """"Sent 3 weeks ago" -> 21. LinkedIn's Sent invitations list rounds down, so 3 weeks means 21-27 days."""
+    t = (text or "").lower()
+    if "today" in t:
+        return 0.0
+    if "yesterday" in t:
+        return 1.0
+    m = SENT_AGE_RE.search(t)
+    if not m:
+        return None
+    n = 1 if m.group(1).startswith("a") else int(m.group(1))
+    return n * SENT_UNIT_DAYS[m.group(2).lower()]
 class _ProfileLock:
     """One Chrome profile can only be open once. A file lock, so the dashboard's runs, its sign-in window and
     CLI commands (`linkedin-login`, `linkedin-check`) in other processes never open it at the same time."""
@@ -182,6 +201,9 @@ def _seed(conn) -> str:
 def invite_health(conn, now: datetime) -> dict:
     """Open invites, and how many of the bot's invites from 3 to 30 days ago were accepted."""
     pending = scalar(conn, "SELECT COUNT(*) FROM leads WHERE li_state = 'invited'")
+    seen = db.get_setting(conn, "li_pending_total")  # LinkedIn's own count, which includes invites sent elsewhere
+    if seen and parse(seen.get("at")) and now - parse(seen["at"]) < timedelta(days=3):
+        pending = max(pending, int(seen["n"]))
     sent = rows(conn, """SELECT DISTINCT b.lead_id, l.li_state FROM bot_actions b JOIN leads l ON l.id = b.lead_id
                          WHERE b.ok = 1 AND b.action = 'connect' AND b.at >= ? AND b.at < ?""",
                 iso(now - timedelta(days=30)), iso(now - timedelta(days=3)))
@@ -367,7 +389,9 @@ def run(conn, driver_factory, *, now: datetime | None = None, log=print, sleep=N
     vary = cfg.get("li_bot_vary", True)
     hours_ok = in_plan(cfg, plan, now) and not (vary and resting(conn, now))
     caps, used = plan["caps"], used_today(conn, now)
-    room = min(HOUR_CAP - recent_actions(conn, now, timedelta(hours=1)), plan["total"] - sum(used.values()))
+    # Withdrawals are housekeeping: they count toward the hourly limit, not the day's outreach total.
+    room = min(HOUR_CAP - recent_actions(conn, now, timedelta(hours=1)),
+               plan["total"] - sum(n for a, n in used.items() if a != "withdraw"))
     if room <= 0:
         return
     week_invites = scalar(conn, "SELECT COUNT(*) FROM bot_actions WHERE ok = 1 AND action = 'connect' AND at >= ?",
@@ -386,7 +410,11 @@ def run(conn, driver_factory, *, now: datetime | None = None, log=print, sleep=N
         todo.append((t, action))
     candidates = reply_candidates(conn) if hours_ok and reply_check_due(conn, now) else []
     invited = accept_candidates(conn) if hours_ok and accept_check_due(conn, now) else []
-    if not todo and not candidates and not invited:
+    weeks = cfg["li_bot_withdraw_weeks"]
+    withdraw_left = caps.get("withdraw", 0) - used.get("withdraw", 0)
+    nothing_old = parse(db.get_setting(conn, "li_withdraw_recheck_at"))
+    want_withdraw = bool(hours_ok and weeks and withdraw_left > 0 and not (nothing_old and now < nothing_old))
+    if not todo and not candidates and not invited and not want_withdraw:
         return
     if not PROFILE_LOCK.acquire(blocking=False):
         log("LinkedIn bot: browser profile busy (sign-in window open?), skipping this run")
@@ -421,6 +449,40 @@ def run(conn, driver_factory, *, now: datetime | None = None, log=print, sleep=N
             except Exception as e:  # read-only, like the reply check
                 log(f"LinkedIn bot: acceptance check failed: {e}")
             db.set_setting(conn, "li_accept_checked_at", iso(now))
+        if want_withdraw and getattr(driver, "sent_invites", None):
+            k = min(withdraw_left, per_run, rng.randint(*WITHDRAW_PER_SESSION) if vary else per_run)
+            try:
+                old, total = driver.sent_invites(weeks * 7, k)
+            except BlockedError:
+                raise
+            except Exception as e:  # read-only; never let it stop the outreach work
+                log(f"LinkedIn bot: couldn't read sent invitations: {e}")
+                old, total = [], None
+            if total is not None:
+                db.set_setting(conn, "li_pending_total", {"n": total, "at": iso(now)})
+            if total is not None and not old:
+                db.set_setting(conn, "li_withdraw_recheck_at", iso(now + NOTHING_OLD_RECHECK))
+            for inv in old[:k]:
+                if done:
+                    next_break = _between(driver, cfg, done, next_break, rng, sleep, log)
+                try:
+                    driver.withdraw(inv)
+                    record_withdrawn(conn, inv, now, log)
+                    used["withdraw"] = used.get("withdraw", 0) + 1
+                    acted += 1
+                except BlockedError:
+                    raise
+                except Exception as e:  # changed layout, slow page: try again next session
+                    note = f"{type(e).__name__}: {str(e).strip()[:200]}"
+                    conn.execute("INSERT INTO bot_actions (action, ok, detail, at) VALUES ('withdraw', 0, ?, ?)",
+                                 (f"{inv.get('name', '')}: {note}", iso(now)))
+                    log(f"LinkedIn bot: couldn't withdraw the invite to {inv.get('name', '?')}: {note}")
+                    snap = getattr(driver, "snapshot", None)
+                    if snap:
+                        snap("withdraw")
+                    done += 1
+                    break
+                done += 1
         for t, action in todo:
             if done >= per_run:
                 break
@@ -472,6 +534,22 @@ def run(conn, driver_factory, *, now: datetime | None = None, log=print, sleep=N
                 mins = rng.uniform(*REST_BETWEEN_RUNS)
                 ran = timedelta(seconds=time.monotonic() - started)
                 db.set_setting(conn, "li_bot_rest_until", iso(now + ran + timedelta(minutes=mins)))
+
+
+def record_withdrawn(conn, inv: dict, now: datetime, log) -> None:
+    """A withdrawn invite: logged, and the lead (if it's one of yours) is free to be invited again later."""
+    slug = (inv.get("slug") or "").lower()
+    lead = None
+    if slug:
+        lead = next((r for r in rows(conn, "SELECT id, linkedin_url, li_state FROM leads WHERE linkedin_url LIKE ?",
+                                     f"%/in/{slug}%") if ChromeDriver._slug(r["linkedin_url"] or "") == slug), None)
+    conn.execute("INSERT INTO bot_actions (action, lead_id, ok, detail, at) VALUES ('withdraw', ?, 1, ?, ?)",
+                 (lead and lead["id"], f"{inv.get('name', '')} ({inv.get('age', '')})", iso(now)))
+    if lead:
+        if lead["li_state"] == "invited":
+            conn.execute("UPDATE leads SET li_state = 'none' WHERE id = ?", (lead["id"],))
+        db.event(conn, lead["id"], "li_withdrawn", channel="linkedin", detail=inv.get("age") or None, at=now)
+    log(f"LinkedIn bot: withdrew the invite to {inv.get('name') or slug} ({(inv.get('age') or '').lower()})")
 
 
 # ---------- replies on LinkedIn ----------
@@ -1112,6 +1190,81 @@ class ChromeDriver:
             raise ActionError("couldn't identify the button to post the comment (left typed, not posted)")
         self._click(new[0])
         self._pause(2, 3)
+
+    # Sent invitations: each card has a profile link, a "Sent 3 weeks ago" line and a Withdraw control labelled
+    # "Withdraw invitation sent to <name>". The list shows 10 and loads 10 more when its last card comes into view.
+    _SENT_JS = r"""(target) => {
+      const main = document.querySelector('main') || document.body, out = [];
+      for (const w of main.querySelectorAll('a[aria-label^="Withdraw invitation sent to"], button[aria-label^="Withdraw invitation sent to"]')) {
+        let card = w;
+        while (card.parentElement && !card.querySelector('a[href*="/in/"]')) card = card.parentElement;
+        const link = card.querySelector('a[href*="/in/"]');
+        const m = link && (link.getAttribute('href') || '').match(/\/in\/([^/?#]+)/);
+        const slug = m ? decodeURIComponent(m[1]).toLowerCase() : '';
+        const age = [...card.querySelectorAll('*')].filter(e => !e.children.length).map(e => e.textContent.trim())
+          .find(t => /^Sent\b/i.test(t)) || '';
+        if (target && slug === target) { w.setAttribute('data-oc-withdraw', '1'); return true; }
+        out.push({slug, name: w.getAttribute('aria-label').replace(/^Withdraw invitation sent to\s*/i, ''), age});
+      }
+      if (target) return false;
+      const total = (main.innerText.match(/People\s*\(?([\d,]+)\)?/) || [])[1];
+      return {items: out, total: total ? parseInt(total.replace(/,/g, ''), 10) : null};
+    }"""
+
+    def sent_invites(self, min_days: float, want: int, max_loads: int = 70) -> tuple[list[dict], int | None]:
+        """Pending invitations older than min_days, oldest first, and LinkedIn's count of all pending ones.
+        The list is newest first, so this loads more until `want` old ones are in view or the list ends.
+        Read-only."""
+        self._goto(self.base + "/mynetwork/invitation-manager/sent/")
+        data = self.page.evaluate(self._SENT_JS, None)
+        old = lambda d: [x for x in d["items"] if (sent_age_days(x["age"]) or 0) >= min_days]  # noqa: E731
+        for _ in range(max_loads):
+            if len(old(data)) >= want or not data["items"]:
+                break
+            self.page.locator('main [aria-label^="Withdraw invitation sent to"]').last.scroll_into_view_if_needed()
+            self._pause(1.5, 3.0)
+            grown = self.page.evaluate(self._SENT_JS, None)
+            if len(grown["items"]) <= len(data["items"]):
+                self._pause(2.0, 3.5)  # slow to load: one more look before deciding the list has ended
+                grown = self.page.evaluate(self._SENT_JS, None)
+                if len(grown["items"]) <= len(data["items"]):
+                    break
+            data = grown
+        out = old(data)
+        for x in out:
+            x["days"] = sent_age_days(x["age"])
+        out.sort(key=lambda x: -x["days"])
+        return out, data["total"]
+
+    def withdraw(self, inv: dict) -> None:
+        """Withdraw one invitation from the Sent list (already open, from sent_invites)."""
+        if "invitation-manager/sent" not in self.page.url:
+            raise ActionError("not on the Sent invitations page")
+        if not self.page.evaluate(self._SENT_JS, inv["slug"]):
+            raise ActionError("invite no longer listed")
+        self._click(self.page.locator("[data-oc-withdraw]").first)
+        # "Withdraw invitation? You won't be able to resend for up to 3 weeks." [Cancel] [Withdraw]. Its button reads
+        # exactly "Withdraw" (its accessible name differs); the list's own controls are links, not buttons.
+        exact = re.compile(r"^\s*Withdraw\s*$", re.I)
+        confirm = None
+        for _ in range(16):
+            self.page.wait_for_timeout(500)
+            confirm = self._visible(self.page.get_by_role("button").filter(has_text=exact))
+            if confirm:
+                break
+        if not confirm:
+            self.page.keyboard.press("Escape")
+            raise ActionError("withdraw confirmation didn't appear")
+        self._pause(0.6, 1.5)  # reads the warning
+        self._click(confirm)
+        self._pause(2.0, 3.5)
+        self._check_blocked()
+        if "invitation-manager/sent" not in self.page.url:
+            raise ActionError(f"withdraw went to another page ({self.page.url.split('?')[0]})")
+        self.page.evaluate("() => document.querySelectorAll('[data-oc-withdraw]').forEach(e => e.removeAttribute('data-oc-withdraw'))")
+        if self.page.evaluate(self._SENT_JS, inv["slug"]):
+            self.page.evaluate("() => document.querySelectorAll('[data-oc-withdraw]').forEach(e => e.removeAttribute('data-oc-withdraw'))")
+            raise ActionError("still listed after Withdraw (dialog changed?)")
 
     def check(self, url: str) -> dict:
         """Read-only diagnostic: what the bot can see on a profile. Clicks nothing except "More" if present."""

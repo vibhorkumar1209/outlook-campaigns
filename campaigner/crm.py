@@ -453,7 +453,7 @@ def communications(conn, *, lead_id: int | None = None, campaign_id: int | None 
         LEFT JOIN sends s ON s.id = (SELECT id FROM sends WHERE enrollment_id = ev.enrollment_id
                                      AND step_pos = ev.step_pos ORDER BY sent_at DESC LIMIT 1)
         WHERE {w} AND ev.type IN ('sent', 'reply', 'auto_reply', 'bounce', 'unsubscribe', 'connected',
-                                  'email_in', 'email_out')""", *a):
+                                  'email_in', 'email_out', 'li_withdrawn')""", *a):
         t, ch = r["type"], r["channel"]
         if t == "reply" and (r["detail"] or "").startswith(LOGGED):
             continue
@@ -484,6 +484,8 @@ def communications(conn, *, lead_id: int | None = None, campaign_id: int | None 
             add(r, "email", "in", "Unsubscribed", content=r["detail"] or "")
         elif t == "connected":
             add(r, "linkedin", "in", "Connected on LinkedIn", content=r["detail"] or "")
+        elif t == "li_withdrawn":
+            add(r, "linkedin", "out", "LinkedIn invite withdrawn", content=f"Unanswered; {r['detail'].lower()}" if r["detail"] else "", by="bot")
 
     w, a = _scope("e", lead_id, campaign_id)
     labels = {"li_connect": "LinkedIn invite", "li_message": "LinkedIn message", "whatsapp": "WhatsApp message"}
