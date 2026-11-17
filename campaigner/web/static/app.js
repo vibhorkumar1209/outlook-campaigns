@@ -79,6 +79,19 @@ $$(".task").forEach((card) => {
       }
       return;
     }
+    if (act === "wa-approve") {
+      $$("button", card).forEach((b) => (b.disabled = true));
+      try {
+        await api("/api/tasks/" + card.dataset.task + "/wa-approve", { body: ta.value });
+        card.classList.add("gone");
+        setTimeout(() => card.remove(), 250);
+        toast("Approved. The WhatsApp bot sends it within its hours.");
+      } catch (err) {
+        toast(err.message, true);
+        $$("button", card).forEach((b) => (b.disabled = false));
+      }
+      return;
+    }
     if (act === "posts") {
       window.open(btn.dataset.posts, "_blank", "noopener");
       return;
@@ -414,8 +427,18 @@ if (cdlg) {
   const syncVia = () => {
     const via = form.via.value;
     $$("[data-via]", form).forEach((el) => { el.hidden = !el.dataset.via.split(" ").includes(via); });
+    // WhatsApp is only for Warm leads and old contacts; with the bot on, it can send for you.
+    const block = src.dataset.waBlock || "", bot = !!src.dataset.waBot && !block && !!src.dataset.wa;
+    const wa = via === "whatsapp";
     $("#compose-wa-missing").hidden = !!src.dataset.wa;
-    $("#compose-open-wa").disabled = !src.dataset.wa;
+    $("#compose-wa-blocked").hidden = !(wa && block);
+    $("#compose-wa-blocked").textContent = block ? block + '. Tick "Old contact" on their page if you know them.' : "";
+    $("#compose-open-wa").disabled = !src.dataset.wa || !!block;
+    $("#compose-logged").disabled = wa && !!block;
+    $("#compose-wa-send").hidden = $("#compose-wa-draft").hidden = !(wa && bot);
+    $("#compose-wa-bot-how").hidden = !bot;
+    $("#compose-wa-how").hidden = bot;
+    $("#compose-open-wa").classList.toggle("primary", !bot);
     $("#compose-open-li").disabled = !src.dataset.linkedin;
   };
   $$("input[name=via]", form).forEach((r) => r.addEventListener("change", syncVia));
@@ -452,6 +475,19 @@ if (cdlg) {
     } catch (err) { toast(err.message, true); }
     finally { $$("button", form).forEach((x) => (x.disabled = false)); syncVia(); }
   });
+  const waBot = async (send) => {
+    if (!form.body.value.trim()) return toast("Write the message first", true);
+    $$("button", form).forEach((x) => (x.disabled = true));
+    try {
+      await api("/api/leads/" + form.lead.value + "/whatsapp", { body: form.body.value, send });
+      cdlg.close();
+      toast(send ? "Queued: the WhatsApp bot sends it shortly, within its hours" : "Draft saved on their page");
+      setTimeout(() => location.reload(), 1200);
+    } catch (err) { toast(err.message, true); }
+    finally { $$("button", form).forEach((x) => (x.disabled = false)); syncVia(); }
+  };
+  $("#compose-wa-send").addEventListener("click", () => waBot(true));
+  $("#compose-wa-draft").addEventListener("click", () => waBot(false));
   $("#compose-open-wa").addEventListener("click", () => {
     if (!text()) return toast("Write the message first", true);
     window.open(`https://wa.me/${src.dataset.wa}?text=${encodeURIComponent(text())}`, "_blank", "noopener");
@@ -485,4 +521,79 @@ document.addEventListener("click", async (e) => {
   if (!b || !confirm("Delete this entry? This can't be undone.")) return;
   try { await api(`/api/activities/${b.dataset.delActivity}/delete`); location.reload(); }
   catch (err) { toast(err.message, true); }
+});
+
+// Leads / Prospects lists: pick rows, then tag, mark old contacts or add to a campaign.
+const bulk = $("#bulk");
+if (bulk) {
+  const picks = () => $$("[data-pick]:checked").map((c) => c.dataset.pick);
+  const sync = () => { const n = picks().length; bulk.hidden = !n; $("#bulk-n").textContent = n; };
+  $$("[data-pick]").forEach((c) => c.addEventListener("change", sync));
+  $$("[data-pick-all]").forEach((a) => a.addEventListener("change", () => {
+    $$("[data-pick]").forEach((c) => (c.checked = a.checked));
+    sync();
+  }));
+  $$("[data-bulk]", bulk).forEach((b) => b.addEventListener("click", async () => {
+    const act = b.dataset.bulk, body = { ids: picks(), action: act };
+    if (act === "tag" || act === "untag") {
+      body.tag = $("#bulk-tag").value.trim();
+      if (!body.tag) return toast("Type a tag first", true);
+    }
+    if (act === "old_contact") body.value = !!b.dataset.value;
+    if (act === "enroll") {
+      body.campaign_id = $("#bulk-campaign").value;
+      if (!body.campaign_id) return toast("Pick a campaign", true);
+    }
+    b.disabled = true;
+    try {
+      const r = await api("/api/leads/bulk", body);
+      toast(r.msg);
+      setTimeout(() => location.reload(), 1200);
+    } catch (err) { toast(err.message, true); b.disabled = false; }
+  }));
+}
+// "Filter by tag": picking from the list applies it straight away (Enter works too).
+$("#tag-add input[list]")?.addEventListener("change", (e) => { if (e.target.value.trim()) e.target.form.submit(); });
+
+// A lead's tags (lead page).
+const tagBox = $("#lead-tags");
+if (tagBox) {
+  const lid = tagBox.dataset.lead, max = +tagBox.dataset.max;
+  const current = () => $$(".tag[data-tag]", tagBox).map((t) => t.dataset.tag);
+  const save = async (tags) => {
+    try { await api(`/api/leads/${lid}`, { action: "tags", tags }); location.reload(); }
+    catch (err) { toast(err.message, true); }
+  };
+  tagBox.addEventListener("click", (e) => {
+    const x = e.target.closest("[data-untag]");
+    if (x) save(current().filter((t) => t !== x.dataset.untag));
+  });
+  $("#tag-new")?.addEventListener("keydown", (e) => {
+    if (e.key !== "Enter") return;
+    e.preventDefault();
+    const add = e.target.value.split(/[,;]/).map((t) => t.trim()).filter(Boolean);
+    if (!add.length) return;
+    const tags = current().concat(add);
+    if (tags.length > max) return toast(`At most ${max} tags per lead`, true);
+    save(tags);
+  });
+}
+$("#old-contact")?.addEventListener("change", async (e) => {
+  try {
+    await api(`/api/leads/${e.target.dataset.lead}`, { action: "old_contact", value: e.target.checked });
+    toast(e.target.checked ? "Marked as an old contact: WhatsApp allowed" : "No longer an old contact");
+    setTimeout(() => location.reload(), 700);
+  } catch (err) { toast(err.message, true); }
+});
+// One-off WhatsApp drafts waiting on a lead's page.
+document.addEventListener("click", async (e) => {
+  const b = e.target.closest("[data-wa-outbox]");
+  if (!b) return;
+  if (b.dataset.ask && !confirm(b.dataset.ask)) return;
+  b.disabled = true;
+  try {
+    await api(`/api/wa-outbox/${b.dataset.waOutbox}`, { action: b.dataset.act });
+    toast(b.dataset.act === "send" ? "Queued: the WhatsApp bot sends it shortly, within its hours" : "Cancelled");
+    setTimeout(() => location.reload(), 700);
+  } catch (err) { toast(err.message, true); b.disabled = false; }
 });

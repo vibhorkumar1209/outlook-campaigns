@@ -17,7 +17,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from jinja2 import TemplateError, TemplateSyntaxError
 
-from .. import ai, attachments, crm, db, domain_health, engine, importer, linkedin_bot, osutil, stats, updater
+from .. import ai, attachments, crm, db, domain_health, engine, importer, linkedin_bot, osutil, stats, updater, whatsapp_bot
 from ..db import iso, one, parse, rows, scalar, utcnow
 from ..graph import AuthError, Graph, GraphError
 from ..render import (ENV, WRAP, email_html, lead_context, lead_phone, linkedin_text, render_text, text_to_html,
@@ -138,6 +138,8 @@ def page(request: Request, name: str, conn, **ctx):
         "account": next((s["email"] for s in senders if s["connected"]), None),
         "n_connected": sum(s["connected"] for s in senders),
         "li_bot": linkedin_bot.status(conn),
+        "wa_status": whatsapp_bot.status(conn),
+        "wa_bot_on": whatsapp_bot.settings(conn)["wa_mode"] == "bot",
         "last_tick": db.get_setting(conn, "last_tick"),
         "open_tasks": scalar(conn, OPEN_TASKS_SQL),
         "updates_behind": (runner.update_info or {}).get("behind", 0),
@@ -225,6 +227,9 @@ def drafts_page(request: Request, campaign: int | None = None):
     camps = rows(conn, """SELECT c.id, c.name, c.email_mode, COUNT(d.id) n FROM campaigns c
                           LEFT JOIN email_drafts d ON d.campaign_id = c.id AND d.status = 'pending'
                           WHERE c.status != 'draft' GROUP BY c.id ORDER BY c.status = 'active' DESC, c.id DESC""")
+    ooo = crm.out_of_office(conn, {d["lead_id"] for d in items})
+    for d in items:
+        d["ooo"] = ooo.get(d["lead_id"])
     return page(request, "drafts.html", conn, drafts=items, recent=recent, campaigns=camps, campaign=campaign,
                 n_pending=sum(1 for d in items if d["status"] == "pending"))
 
@@ -320,6 +325,62 @@ async def compose(lid: int, request: Request):
     return {"ok": True, "web_link": dr.get("webLink"), "sent": send}
 
 
+@app.post("/api/leads/{lid}/whatsapp")
+async def whatsapp_compose(lid: int, request: Request):
+    """A one-off WhatsApp to a lead, for the WhatsApp bot: sent on its next session (send) or kept as a draft."""
+    p = await request.json()
+    conn = db.connect()
+    l = one(conn, "SELECT * FROM leads WHERE id = ?", lid)
+    if not l:
+        raise HTTPException(404)
+    why = crm.wa_blocked(l)
+    if why:
+        raise HTTPException(409, why + ". Mark them as an old contact on their page if you know them.")
+    if not wa_digits(lead_phone(l)):
+        raise HTTPException(422, "No phone number with a country code. Add one under Details.")
+    try:
+        text = whatsapp_text(render_text((p.get("body") or "").strip(), lead_context(l)))
+    except TemplateError as ex:
+        raise HTTPException(422, f"Template: {ex}")
+    if not text.strip():
+        raise HTTPException(422, "Write the message")
+    send = bool(p.get("send"))
+    if send and whatsapp_bot.settings(conn)["wa_mode"] != "bot":
+        raise HTTPException(409, "The WhatsApp bot is off (Settings → WhatsApp automation). Use Open WhatsApp instead.")
+    conn.execute("INSERT INTO wa_outbox (lead_id, body, status, created_at) VALUES (?, ?, ?, ?)",
+                 (lid, text, "queued" if send else "draft", iso(utcnow())))
+    if send:
+        import threading
+        threading.Thread(target=runner.run_wa, daemon=True).start()
+    return {"ok": True}
+
+
+@app.post("/api/wa-outbox/{oid}")
+async def wa_outbox_action(oid: int, request: Request):
+    p = await request.json()
+    conn = db.connect()
+    o = one(conn, "SELECT o.*, l.status lead_status, l.dnc, l.old_contact FROM wa_outbox o JOIN leads l ON l.id = o.lead_id "
+                  "WHERE o.id = ?", oid)
+    if not o or o["status"] not in ("draft", "queued", "failed"):
+        raise HTTPException(409, "Already sent or cancelled")
+    act = p.get("action")
+    if act == "cancel":
+        conn.execute("UPDATE wa_outbox SET status = 'cancelled' WHERE id = ?", (oid,))
+    elif act == "send":
+        why = crm.wa_blocked({"dnc": o["dnc"], "status": o["lead_status"], "old_contact": o["old_contact"]})
+        if why:
+            raise HTTPException(409, why)
+        if whatsapp_bot.settings(conn)["wa_mode"] != "bot":
+            raise HTTPException(409, "The WhatsApp bot is off (Settings → WhatsApp automation)")
+        body = (p.get("body") or o["body"]).strip()
+        conn.execute("UPDATE wa_outbox SET status = 'queued', body = ?, attempts = 0, note = NULL WHERE id = ?", (body, oid))
+        import threading
+        threading.Thread(target=runner.run_wa, daemon=True).start()
+    else:
+        raise HTTPException(400, "bad action")
+    return {"ok": True}
+
+
 # ---------- task queue: LinkedIn and WhatsApp ----------
 
 @app.get("/tasks")
@@ -347,10 +408,19 @@ def tasks(request: Request, campaign: int | None = None):
     done_today = scalar(conn, "SELECT COUNT(*) FROM events WHERE type = 'task_done' AND at >= ?",
                         iso(utcnow().astimezone(local_tz()).replace(hour=0, minute=0, second=0)))
     camps = rows(conn, "SELECT id, name FROM campaigns WHERE status = 'active' ORDER BY name")
-    bot = linkedin_bot.settings(conn)
+    bot, wa = linkedin_bot.settings(conn), whatsapp_bot.settings(conn)
+    wa_on = wa["wa_mode"] == "bot" and not db.get_setting(conn, "wa_bot_paused")
+    ids = [t["lead_id"] for t in items if t["channel"] == engine.WHATSAPP]
+    wa_leads = {r["id"]: r for r in rows(conn, f"SELECT id, status, dnc, old_contact FROM leads WHERE id IN ({','.join('?' * len(ids))})", *ids)} if ids else {}
     for t in items:
-        t["bot_will"] = (bot["li_mode"] == "bot" and t["bot_attempts"] < linkedin_bot.MAX_ATTEMPTS
-                         and t["comment_status"] != "needs_approval" and t["channel"] != engine.WHATSAPP)
+        if t["channel"] == engine.WHATSAPP:
+            t["wa_block"] = crm.wa_blocked(wa_leads.get(t["lead_id"]) or {})
+            t["wa_needs_ok"] = wa_on and wa["wa_approve"] and t["comment_status"] != "approved" and not t["wa_block"]
+            t["bot_will"] = (wa_on and t["bot_attempts"] < whatsapp_bot.MAX_ATTEMPTS and bool(t["wa"])
+                             and not t["wa_needs_ok"] and not t["wa_block"])
+        else:
+            t["bot_will"] = (bot["li_mode"] == "bot" and t["bot_attempts"] < linkedin_bot.MAX_ATTEMPTS
+                             and t["comment_status"] != "needs_approval")
     return page(request, "tasks.html", conn, tasks=items, campaigns=camps, campaign=campaign, done_today=done_today,
                 since=since, ai_ready=bool(os.environ.get("ANTHROPIC_API_KEY")))
 
@@ -379,6 +449,22 @@ async def task_approve(task_id: int, request: Request):
                        "AND comment_status = 'needs_approval'", (comment, task_id))
     if not cur.rowcount:
         raise HTTPException(409, "task already handled")
+    return {"ok": True, "open": scalar(conn, OPEN_TASKS_SQL)}
+
+
+@app.post("/api/tasks/{task_id}/wa-approve")
+async def task_wa_approve(task_id: int, request: Request):
+    """Approve a sequence WhatsApp message (edited or not); the WhatsApp bot sends it on its next session."""
+    body = ((await request.json()).get("body") or "").strip()
+    if not body:
+        raise HTTPException(422, "The message is empty")
+    conn = db.connect()
+    cur = conn.execute("UPDATE tasks SET body = ?, comment_status = 'approved', bot_attempts = 0, bot_note = NULL "
+                       "WHERE id = ? AND status = 'open' AND channel = 'whatsapp'", (body, task_id))
+    if not cur.rowcount:
+        raise HTTPException(409, "task already handled")
+    import threading
+    threading.Thread(target=runner.run_wa, daemon=True).start()
     return {"ok": True, "open": scalar(conn, OPEN_TASKS_SQL)}
 
 
@@ -474,7 +560,7 @@ def campaign_settings(cid: int, name: str = Form(...), timezone: str = Form(""),
                       email_daily_cap: int = Form(40), li_daily_cap: int = Form(20), gap_min: int = Form(45),
                       gap_max: int = Form(120), signature: str = Form(""), sender: str = Form(""),
                       track_opens: str = Form(""), track_clicks: str = Form(""), li_engage: str = Form(""),
-                      owner_id: str = Form(""), email_mode: str = Form("draft")):
+                      owner_id: str = Form(""), email_mode: str = Form("draft"), audience: str = Form("new")):
     conn = db.connect()
     get_campaign(conn, cid)
     url = f"/campaigns/{cid}"
@@ -497,8 +583,8 @@ def campaign_settings(cid: int, name: str = Form(...), timezone: str = Form(""),
                   max(0, email_daily_cap), max(0, li_daily_cap), gap_min, gap_max, signature, sender or None,
                   1 if track_opens else 0, 1 if track_clicks else 0, 1 if li_engage else 0, cid))
     owner = int(owner_id) if owner_id.isdigit() and one(conn, "SELECT 1 FROM team WHERE id = ?", int(owner_id)) else None
-    conn.execute("UPDATE campaigns SET owner_id = ?, email_mode = ? WHERE id = ?",
-                 (owner, "auto" if email_mode == "auto" else "draft", cid))
+    conn.execute("UPDATE campaigns SET owner_id = ?, email_mode = ?, audience = ? WHERE id = ?",
+                 (owner, "auto" if email_mode == "auto" else "draft", "warm" if audience == "warm" else "new", cid))
     n = crm.assign_campaign_owner(conn, cid)
     return back(url, tab="settings", msg="Saved" + (f". {n} unassigned lead(s) given to the campaign owner." if n else ""))
 
@@ -812,6 +898,10 @@ def contacts_page(request: Request, stage: str, q: str, owner: str = "", status:
     owner_arg = [int(owner)] if owner.isdigit() else []
     if status in crm.STATUSES:
         owner_sql, owner_arg = owner_sql + " AND l.status = ?", owner_arg + [status]
+    tags = [t for t in (crm.clean_tag(x) for x in request.query_params.getlist("tag")) if t]
+    tag_sql, tag_args = crm.tag_filter_sql(tags)
+    if request.query_params.get("old") == "1":
+        tag_sql += " AND l.old_contact = 1"
     items = rows(conn, """
         SELECT l.*, tm.name owner, (SELECT COUNT(*) FROM enrollments e WHERE e.lead_id = l.id) n_campaigns,
           (SELECT status FROM enrollments e WHERE e.lead_id = l.id ORDER BY e.id DESC LIMIT 1) last_status,
@@ -822,11 +912,18 @@ def contacts_page(request: Request, stage: str, q: str, owner: str = "", status:
         LEFT JOIN campaigns rc ON rc.id = r.campaign_id
         LEFT JOIN team tm ON tm.id = l.owner_id
         WHERE l.stage = ? AND (? = '' OR l.first_name || ' ' || l.last_name LIKE ? OR l.email LIKE ? OR l.company LIKE ?)
-        """ + owner_sql + """
-        ORDER BY COALESCE(l.became_lead_at, '') DESC, l.id DESC LIMIT 500""", stage, q.strip(), like, like, like, *owner_arg)
+        """ + owner_sql + tag_sql + """
+        ORDER BY COALESCE(l.became_lead_at, '') DESC, l.id DESC LIMIT 500""",
+        stage, q.strip(), like, like, like, *owner_arg, *tag_args)
+    ids = [l["id"] for l in items]
+    tag_map, ooo = crm.tags_of(conn, ids), crm.out_of_office(conn, ids)
+    for l in items:
+        l["tags"], l["ooo"] = tag_map.get(l["id"], []), ooo.get(l["id"])
     counts = {r["stage"]: r["n"] for r in rows(conn, "SELECT stage, COUNT(*) n FROM leads GROUP BY stage")}
+    camps = rows(conn, "SELECT id, name, status, audience FROM campaigns ORDER BY status = 'active' DESC, id DESC")
     return page(request, "leads.html", conn, leads=items, q=q, stage=stage, counts=counts, owner=owner, status=status,
-                today=datetime.now(local_tz()).date().isoformat())
+                tags=tags, all_tags=crm.all_tags(conn), old=request.query_params.get("old") == "1",
+                campaigns_all=camps, max_tags=crm.MAX_TAGS, today=datetime.now(local_tz()).date().isoformat())
 
 
 @app.get("/leads")
@@ -838,6 +935,43 @@ def leads(request: Request, q: str = "", owner: str = "", status: str = ""):
 @app.get("/prospects")
 def prospects(request: Request, q: str = "", owner: str = "", status: str = ""):
     return contacts_page(request, "prospect", q, owner, status)
+
+
+@app.post("/api/leads/bulk")
+async def leads_bulk(request: Request):
+    """Several leads at once (picked on the Leads / Prospects lists): add or remove a tag, mark or unmark as old
+    contacts, add to a campaign."""
+    p = await request.json()
+    conn = db.connect()
+    ids = [int(i) for i in p.get("ids") or [] if str(i).isdigit()]
+    if not ids:
+        raise HTTPException(422, "Pick at least one person")
+    act = p.get("action")
+    if act == "tag":
+        tags = crm.split_tags(p.get("tag") or "")
+        if not tags:
+            raise HTTPException(422, "Type a tag")
+        r = crm.add_tags(conn, ids, tags)
+        note = f" ({r['full']} already had {crm.MAX_TAGS} tags, left as they were)" if r["full"] else ""
+        return {"ok": True, "msg": f"Tagged {r['tagged']}{note}"}
+    if act == "untag":
+        n = crm.remove_tag(conn, ids, p.get("tag") or "")
+        return {"ok": True, "msg": f"Removed from {n}"}
+    if act == "old_contact":
+        on = 1 if p.get("value", True) else 0
+        conn.execute(f"UPDATE leads SET old_contact = ? WHERE id IN ({','.join('?' * len(ids))})", (on, *ids))
+        return {"ok": True, "msg": f"{len(ids)} marked as {'old contacts' if on else 'not old contacts'}"}
+    if act == "enroll":
+        cid = int(p["campaign_id"]) if str(p.get("campaign_id") or "").isdigit() else 0
+        c = get_campaign(conn, cid)
+        r = importer.enroll_leads(conn, ids, cid)
+        msg = f"{r['enrolled']} added to {c['name']}"
+        if r["already_enrolled"]:
+            msg += f", {r['already_enrolled']} already in it"
+        if r["not_enrolled"]:
+            msg += f", {r['not_enrolled']} not added: " + "; ".join(r["skipped"][:5]) + ("…" if len(r["skipped"]) > 5 else "")
+        return {"ok": True, "msg": msg}
+    raise HTTPException(400, "bad action")
 
 
 @app.get("/leads/{lid}")
@@ -862,6 +996,10 @@ def lead(request: Request, lid: int):
                 has_thread=bool(conv), compose_from=acct, today=datetime.now(local_tz()).date().isoformat(),
                 lead_drafts=rows(conn, "SELECT * FROM email_drafts WHERE lead_id = ? AND status IN ('pending', 'approved') "
                                        "ORDER BY id", lid),
+                tags=crm.tags_of(conn, [lid])[lid], all_tags=crm.all_tags(conn), max_tags=crm.MAX_TAGS,
+                ooo=crm.out_of_office(conn, [lid]).get(lid), wa_block=crm.wa_blocked(l),
+                wa_outbox=rows(conn, "SELECT * FROM wa_outbox WHERE lead_id = ? AND (status IN ('draft', 'queued') "
+                                     "OR (status = 'failed' AND created_at >= ?)) ORDER BY id", lid, iso(utcnow() - timedelta(days=14))),
                 active="/leads" if l["stage"] == "lead" else "/prospects")
 
 
@@ -941,6 +1079,13 @@ async def lead_action(lid: int, request: Request):
             crm.set_status(conn, lid, p.get("status") or "", now)
         except ValueError as ex:
             raise HTTPException(422, str(ex))
+    elif act == "tags":
+        try:
+            return {"ok": True, "tags": crm.set_tags(conn, lid, p.get("tags") or [])}
+        except ValueError as ex:
+            raise HTTPException(422, str(ex))
+    elif act == "old_contact":
+        conn.execute("UPDATE leads SET old_contact = ? WHERE id = ?", (1 if p.get("value") else 0, lid))
     elif act == "snooze":
         days = int(p["days"]) if str(p.get("days") or "").isdigit() else None
         return {"ok": True, "until": crm.snooze(conn, lid, days, local_tz())}
@@ -1079,6 +1224,8 @@ def settings(request: Request):
                 bot=linkedin_bot.settings(conn), bot_status=linkedin_bot.status(conn),
                 bot_used=linkedin_bot.used_today(conn, utcnow()), bot_plan=linkedin_bot.day_plan(conn, linkedin_bot.settings(conn), utcnow()),
                 bot_ceil=linkedin_bot.CEILINGS, bot_hour_cap=linkedin_bot.HOUR_CAP, li_login_state=runner.li_login_state,
+                wa=whatsapp_bot.settings(conn), wa_status=whatsapp_bot.status(conn), wa_login_state=runner.wa_login_state,
+                wa_used=whatsapp_bot.sent_today(conn, utcnow()), wa_ceiling=whatsapp_bot.CEILING, wa_hour_cap=whatsapp_bot.HOUR_CAP,
                 ai_ready=bool(os.environ.get("ANTHROPIC_API_KEY")),
                 tracker=tracker, tracker_error=tracker.health() if tracker else None,
                 track_cursor=db.get_setting(conn, "track_cursor", 0),
@@ -1212,6 +1359,40 @@ async def settings_linkedin_bot(request: Request):
     return back("/settings", msg="LinkedIn bot settings saved")
 
 
+@app.post("/settings/whatsapp-bot")
+async def settings_whatsapp_bot(request: Request):
+    f = await request.form()
+    conn = db.connect()
+    num = lambda k, d, hi: min(max(int(f.get(k) or d), 0), hi)  # noqa: E731
+    db.set_setting(conn, "wa_mode", "bot" if f.get("wa_mode") == "bot" else "assisted")
+    db.set_setting(conn, "wa_approve", bool(f.get("wa_approve")))
+    db.set_setting(conn, "wa_read", bool(f.get("wa_read")))
+    db.set_setting(conn, "wa_daily_cap", num("wa_daily_cap", 15, whatsapp_bot.CEILING))
+    gmin = max(30, num("gap_min", 90, 3600))
+    db.set_setting(conn, "wa_gap", [gmin, max(gmin, num("gap_max", 240, 3600))])
+    start, end = str(f.get("hours_start") or "10:00"), str(f.get("hours_end") or "18:30")
+    if start >= end:
+        return back("/settings", err="WhatsApp hours must end after they start")
+    db.set_setting(conn, "wa_hours", [start, end])
+    days = [d for d in f.getlist("days") if d in engine.DAYS]
+    db.set_setting(conn, "wa_days", ",".join(days) or "mon,tue,wed,thu,fri")
+    return back("/settings", msg="WhatsApp settings saved")
+
+
+@app.post("/api/whatsapp/login")
+def whatsapp_login():
+    runner.start_wa_login()
+    return {"ok": True}
+
+
+@app.post("/api/whatsapp/resume")
+def whatsapp_resume():
+    whatsapp_bot.resume(db.connect())
+    import threading
+    threading.Thread(target=runner.run_wa, daemon=True).start()
+    return {"ok": True}
+
+
 @app.post("/api/linkedin/login")
 def linkedin_login():
     runner.start_li_login()
@@ -1239,5 +1420,5 @@ def start_login():
 
 @app.get("/api/state")
 def state():
-    return {"busy": runner.busy, "login": runner.login_state, "li_login": runner.li_login_state,
+    return {"busy": runner.busy, "login": runner.login_state, "li_login": runner.li_login_state, "wa_login": runner.wa_login_state,
             "logs": list(runner.logs)[-120:]}

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import html as _html
 import os
+import re
 from datetime import date, datetime, timedelta
 from urllib.parse import quote
 
@@ -43,6 +44,232 @@ ROLES = ["BDR", "SDR", "AE", "Manager", "Other"]
 
 def local_tz():
     return datetime.now().astimezone().tzinfo
+
+
+# ---------- tags ----------
+
+MAX_TAGS = 6
+TAG_LEN = 40
+
+
+def clean_tag(t) -> str:
+    """One tag: trimmed, single-spaced, no commas (they separate tags), at most TAG_LEN characters."""
+    return " ".join(str(t or "").replace(",", " ").replace(";", " ").split())[:TAG_LEN].strip()
+
+
+def split_tags(s) -> list[str]:
+    """'Fintech, P1; 2024' -> ['Fintech', 'P1', '2024'], duplicates (any case) dropped."""
+    out: list[str] = []
+    for t in re.split(r"[,;|\n]", str(s or "")):
+        t = clean_tag(t)
+        if t and t.lower() not in {x.lower() for x in out}:
+            out.append(t)
+    return out
+
+
+def _spelling(conn, tag: str) -> str:
+    """The spelling already in use for this tag (tags match case-insensitively), so 'fintech' joins 'Fintech'."""
+    return scalar(conn, "SELECT tag FROM lead_tags WHERE tag = ? LIMIT 1", tag) or tag
+
+
+def tags_of(conn, lead_ids) -> dict[int, list[str]]:
+    ids = [int(i) for i in lead_ids]
+    out: dict[int, list[str]] = {i: [] for i in ids}
+    for i in range(0, len(ids), 500):
+        part = ids[i:i + 500]
+        for r in rows(conn, f"SELECT lead_id, tag FROM lead_tags WHERE lead_id IN ({','.join('?' * len(part))}) "
+                            "ORDER BY rowid", *part):
+            out[r["lead_id"]].append(r["tag"])
+    return out
+
+
+def set_tags(conn, lead_id: int, tags) -> list[str]:
+    """Replace a lead's tags. ValueError over MAX_TAGS."""
+    tags = split_tags(",".join(tags) if isinstance(tags, (list, tuple)) else tags)
+    if len(tags) > MAX_TAGS:
+        raise ValueError(f"At most {MAX_TAGS} tags per lead")
+    tags = [_spelling(conn, t) for t in tags]
+    conn.execute("DELETE FROM lead_tags WHERE lead_id = ?", (lead_id,))
+    for t in tags:
+        conn.execute("INSERT OR IGNORE INTO lead_tags (lead_id, tag) VALUES (?, ?)", (lead_id, t))
+    return tags
+
+
+def add_tags(conn, lead_ids, tags) -> dict:
+    """Add tags to many leads; a lead that would go over MAX_TAGS keeps what it has. Returns counts."""
+    tags = [_spelling(conn, t) for t in split_tags(",".join(tags) if isinstance(tags, (list, tuple)) else tags)]
+    have = tags_of(conn, lead_ids)
+    added = full = 0
+    for lid, cur in have.items():
+        new = [t for t in tags if t.lower() not in {c.lower() for c in cur}]
+        if not new:
+            continue
+        if len(cur) + len(new) > MAX_TAGS:
+            full += 1
+            continue
+        for t in new:
+            conn.execute("INSERT OR IGNORE INTO lead_tags (lead_id, tag) VALUES (?, ?)", (lid, t))
+        added += 1
+    return {"tagged": added, "full": full}
+
+
+def remove_tag(conn, lead_ids, tag: str) -> int:
+    ids = [int(i) for i in lead_ids]
+    n = 0
+    for i in range(0, len(ids), 500):
+        part = ids[i:i + 500]
+        n += conn.execute(f"DELETE FROM lead_tags WHERE tag = ? AND lead_id IN ({','.join('?' * len(part))})",
+                          (clean_tag(tag), *part)).rowcount
+    return n
+
+
+def all_tags(conn) -> list[dict]:
+    """Every tag in use with how many leads carry it, most used first."""
+    return rows(conn, "SELECT MIN(tag) tag, COUNT(*) n FROM lead_tags GROUP BY tag ORDER BY n DESC, tag LIMIT 300")
+
+
+def tag_filter_sql(tags: list[str], alias: str = "l") -> tuple[str, list]:
+    """SQL (AND ...) keeping leads that carry every one of these tags."""
+    sql, args = "", []
+    for t in tags:
+        sql += f" AND EXISTS (SELECT 1 FROM lead_tags lt WHERE lt.lead_id = {alias}.id AND lt.tag = ?)"
+        args.append(clean_tag(t))
+    return sql, args
+
+
+# ---------- WhatsApp: only for people who know you ----------
+
+WA_STATUSES = ("Warm", "Converted")
+
+
+def wa_blocked(lead: dict) -> str | None:
+    """Why WhatsApp mustn't be used with this lead, or None. WhatsApp is personal: only Warm (they responded) or
+    Converted leads, and people marked as old contacts."""
+    if lead.get("dnc"):
+        return "do not contact"
+    if lead.get("status") == "Closed/Lost":
+        return "Closed/Lost"
+    if lead.get("status") in WA_STATUSES or lead.get("old_contact"):
+        return None
+    return "WhatsApp is only for Warm leads and old contacts"
+
+
+# ---------- out-of-office replies ----------
+
+_MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"]
+_MON = r"(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|sept?(?:ember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\.?"
+_WD = r"\b(mon|tue|wed|thu|fri|sat|sun)[a-z]*\b"
+_DAY = r"(\d{1,2})(?:st|nd|rd|th)?"
+_CUE = re.compile(r"\b(return\w*|back|until|till|til|through|thru|resum\w*|in the office|reachable|available again"
+                  r"|away from .{0,30}? to|out of (?:the )?office from .{0,30}? to|on leave from .{0,30}? to)\b", re.I)
+_DATE_PATTERNS = [
+    ("dmy", re.compile(_DAY + r"\s*(?:of\s+)?" + _MON + r",?(?:\s+(\d{4}))?", re.I)),
+    ("mdy", re.compile(_MON + r"\s+" + _DAY + r"\b,?(?:\s+(\d{4}))?", re.I)),
+    ("iso", re.compile(r"\b(\d{4})-(\d{1,2})-(\d{1,2})\b")),
+    ("num", re.compile(r"\b(\d{1,2})[/.](\d{1,2})(?:[/.](\d{2,4}))?\b(?!\s*(?:am|pm|h\b))", re.I)),
+    ("tomorrow", re.compile(r"\btomorrow\b", re.I)),
+    ("weekday", re.compile(_WD, re.I)),
+]
+OOO_RE = re.compile(r"out of (the )?office|\booo\b|on (annual |maternity |paternity |sick |parental )?leave|vacation|holiday"
+                    r"|travel|away from|\baway\b|limited (access|connectivity)|return|back (in|on|at)|abwesen|absent", re.I)
+LEFT_RE = re.compile(r"no longer (with|at|work|employed|part of)|has left|left the (company|organi[sz]ation)"
+                     r"|(mailbox|e-?mail address|address) is (no longer|not) (monitored|in use|active)", re.I)
+OOO_FRESH = timedelta(days=14)   # an out-of-office without a return date counts this long
+
+
+def _ymd(y: int | None, m: int, d: int, after: date) -> date | None:
+    """The date; without a year, the first one on or after `after` (less a day: 'back today')."""
+    try:
+        if y:
+            return date(y + 2000 if y < 100 else y, m, d)
+        dt = date(after.year, m, d)
+        return dt if dt >= after - timedelta(days=1) else date(after.year + 1, m, d)
+    except ValueError:
+        return None
+
+
+def ooo_return(text: str, received: datetime) -> date | None:
+    """The day an out-of-office reply says they're back, if it says. Heuristic, English dates only:
+    'back on Monday 24 November', 'returning 24/11', 'out until Nov 24th', 'back tomorrow'."""
+    t = " ".join((text or "").replace("\u2019", "'").split())
+    after = received.date()
+    for cue in _CUE.finditer(t):
+        win = t[cue.end(): cue.end() + 60]
+        best = None
+        for kind, rx in _DATE_PATTERNS:
+            m = rx.search(win)
+            # A weekday alone counts only when no actual date follows it ('back Monday 24 Nov' is the 24th).
+            if m and (best is None or m.start() < best[1].start()) and not (kind == "weekday" and best):
+                best = (kind, m)
+        if not best:
+            continue
+        kind, m = best
+        if kind == "dmy":
+            got = _ymd(int(m.group(3)) if m.group(3) else None, _MONTHS.index(m.group(2)[:3].lower()) + 1, int(m.group(1)), after)
+        elif kind == "mdy":
+            got = _ymd(int(m.group(3)) if m.group(3) else None, _MONTHS.index(m.group(1)[:3].lower()) + 1, int(m.group(2)), after)
+        elif kind == "iso":
+            got = _ymd(int(m.group(1)), int(m.group(2)), int(m.group(3)), after)
+        elif kind == "num":
+            a, b, y = int(m.group(1)), int(m.group(2)), int(m.group(3)) if m.group(3) else None
+            # Day-first or month-first: whichever is a real date soonest after the reply.
+            options = [x for x in (_ymd(y, b, a, after), _ymd(y, a, b, after)) if x and x >= after - timedelta(days=1)]
+            got = min(options) if options else None
+        elif kind == "tomorrow":
+            got = after + timedelta(days=1)
+        else:
+            want = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"].index(m.group(1).lower())
+            got = after + timedelta(days=(want - after.weekday() - 1) % 7 + 1)
+        if got and after - timedelta(days=1) <= got <= after + timedelta(days=180):
+            return got
+    return None
+
+
+def auto_reply_kind(text: str) -> str:
+    """'left' (they've left the company), 'ooo' (out of office) or 'auto' (some other automatic reply)."""
+    if LEFT_RE.search(text or ""):
+        return "left"
+    return "ooo" if OOO_RE.search(text or "") else "auto"
+
+
+def auto_reply_info(subject: str | None, content: str | None, at: str) -> dict:
+    text = f"{subject or ''} \n {content or ''}"
+    kind = auto_reply_kind(text)
+    back = ooo_return(text, parse(at)) if kind == "ooo" else None
+    return {"kind": kind, "back": back, "at": at}
+
+
+def out_of_office(conn, lead_ids=None, now: datetime | None = None, tz=None) -> dict[int, dict]:
+    """Per lead, their latest automatic reply when it still applies: an out-of-office with a return date still
+    ahead (or with none, from the last OOO_FRESH), or a 'no longer with the company' notice.
+    {lead_id: {kind, back (date|None), at, label}}."""
+    now, tz = now or utcnow(), tz or local_tz()
+    where, args = "", []
+    if lead_ids is not None:
+        ids = [int(i) for i in lead_ids]
+        if not ids:
+            return {}
+        where, args = f" AND lead_id IN ({','.join('?' * len(ids))})", ids
+    out = {}
+    for r in rows(conn, f"""SELECT lead_id, detail, content, at FROM events WHERE id IN (
+                              SELECT MAX(id) FROM events WHERE type = 'auto_reply' AND at >= ?{where} GROUP BY lead_id)""",
+                  iso(now - timedelta(days=180)), *args):
+        # Ignore it once they've written to us since (a real reply or email after the auto-reply).
+        info = auto_reply_info(r["detail"], r["content"], r["at"])
+        today = now.astimezone(tz).date()
+        if info["kind"] == "ooo":
+            if info["back"]:
+                if info["back"] < today:
+                    continue
+            elif now - parse(r["at"]) > OOO_FRESH:
+                continue
+            info["label"] = f"Out of office · back {info['back'].strftime('%d %b')}" if info["back"] else "Out of office"
+        elif info["kind"] == "left":
+            info["label"] = "Left the company?"
+        else:
+            continue
+        out[r["lead_id"]] = info
+    return out
 
 
 def settings(conn) -> dict:
@@ -175,7 +402,7 @@ def delete_activity(conn, activity_id: int) -> None:
 _LAST_CONTACT_SQL = """
     UPDATE leads SET last_contacted_at = NULLIF(MAX(
       COALESCE((SELECT MAX(at) FROM events ev WHERE ev.lead_id = leads.id
-                AND ev.type IN ('sent', 'reply', 'email_in', 'email_out')), ''),
+                AND ev.type IN ('sent', 'reply', 'email_in', 'email_out', 'wa_in', 'wa_out')), ''),
       COALESCE((SELECT MAX(t.done_at) FROM tasks t JOIN enrollments e ON e.id = t.enrollment_id
                 WHERE e.lead_id = leads.id AND t.status = 'done'
                   AND t.channel IN ('li_connect', 'li_message', 'whatsapp')), ''),
@@ -260,7 +487,11 @@ def reminders(conn, tz=None, owner_id: int | None = None, ahead: int = 0) -> lis
                     "reason": reason, "due": l["next_followup_at"], "overdue_days": max(0, (today - due).days),
                     "today": due == today, "last_contacted_at": l["last_contacted_at"], "owner": l["owner"],
                     "owner_id": l["owner_id"], "email": l["email"], "phone": phone, "wa": wa_digits(phone),
+                    "wa_block": wa_blocked(l), "ooo": None,
                     "linkedin_url": l["linkedin_url"]})
+    ooo = out_of_office(conn, [r["lead_id"] for r in out], tz=tz)
+    for r in out:
+        r["ooo"] = ooo.get(r["lead_id"])
     return out
 
 
@@ -276,12 +507,15 @@ def actions(conn, tz=None, owner_id: int | None = None) -> dict:
                             WHERE d.status = 'pending'{own} ORDER BY d.created_at""", *args)
     # With the bot on, LinkedIn tasks are its job; only the ones it couldn't do come to you.
     bot_on = db.get_setting(conn, "li_mode", "assisted") == "bot" and not db.get_setting(conn, "li_bot_paused")
+    wa_on = db.get_setting(conn, "wa_mode", "assisted") == "bot" and not db.get_setting(conn, "wa_bot_paused")
+    wa_approve = db.get_setting(conn, "wa_approve", True)
     li = wa = comments = 0
     for t in rows(conn, f"""SELECT t.channel, t.comment_status, t.bot_attempts FROM tasks t
                             JOIN enrollments e ON e.id = t.enrollment_id JOIN campaigns c ON c.id = e.campaign_id
                             JOIN leads l ON l.id = e.lead_id WHERE t.status = 'open' AND c.status = 'active'{own}""", *args):
         if t["channel"] == "whatsapp":
-            wa += 1
+            # With the WhatsApp bot on, only drafts to approve and messages it couldn't send need you.
+            wa += not wa_on or (wa_approve and t["comment_status"] != "approved") or t["bot_attempts"] >= 2
         elif t["comment_status"] == "needs_approval":
             comments += 1
         elif not bot_on or t["bot_attempts"] >= 2:
@@ -291,6 +525,9 @@ def actions(conn, tz=None, owner_id: int | None = None) -> dict:
     paused = db.get_setting(conn, "li_bot_paused")
     if paused and db.get_setting(conn, "li_mode", "assisted") == "bot":
         alerts.append(f"The LinkedIn bot is paused: {paused.get('reason', 'needs you')}. Resume it in Settings.")
+    wa_paused = db.get_setting(conn, "wa_bot_paused")
+    if wa_paused and db.get_setting(conn, "wa_mode", "assisted") == "bot":
+        alerts.append(f"The WhatsApp bot is paused: {wa_paused.get('reason', 'needs you')}. Resume it in Settings.")
     return {"reminders": rem, "drafts": drafts, "linkedin": li, "whatsapp": wa, "comments": comments, "alerts": alerts,
             "total": len(rem) + len(drafts) + li + wa + comments}
 
@@ -435,6 +672,9 @@ def _scope(alias: str, lead_id: int | None, campaign_id: int | None) -> tuple[st
     return "1", []
 
 
+AUTO_LABEL = {"ooo": "out of office reply", "left": "no longer with the company (auto-reply)", "auto": "automatic reply"}
+
+
 def communications(conn, *, lead_id: int | None = None, campaign_id: int | None = None) -> list[dict]:
     """Every email, LinkedIn touch, WhatsApp message, call, meeting and note, newest first. campaign_id: every
     communication with the leads in that campaign (from any campaign, labelled)."""
@@ -447,13 +687,18 @@ def communications(conn, *, lead_id: int | None = None, campaign_id: int | None 
                     "by": by or "", "outcome": outcome, "extra": extra, "source": source, "activity_id": activity_id})
 
     w, a = _scope("ev", lead_id, campaign_id)
+    # Automatic replies, by the email they answered: that email's entry says "out of office".
+    autos = {}
+    for r in rows(conn, f"SELECT ev.enrollment_id, ev.step_pos, ev.detail, ev.content, ev.at FROM events ev "
+                        f"WHERE {w} AND ev.type = 'auto_reply' ORDER BY ev.at", *a):
+        autos[(r["enrollment_id"], r["step_pos"])] = auto_reply_info(r["detail"], r["content"], r["at"])
     for r in rows(conn, f"""
         SELECT ev.*, c.name campaign, s.body, s.sender, s.opens, s.clicks, s.tracked, s.machine_events
         FROM events ev LEFT JOIN campaigns c ON c.id = ev.campaign_id
         LEFT JOIN sends s ON s.id = (SELECT id FROM sends WHERE enrollment_id = ev.enrollment_id
                                      AND step_pos = ev.step_pos ORDER BY sent_at DESC LIMIT 1)
         WHERE {w} AND ev.type IN ('sent', 'reply', 'auto_reply', 'bounce', 'unsubscribe', 'connected',
-                                  'email_in', 'email_out', 'li_withdrawn')""", *a):
+                                  'email_in', 'email_out', 'li_withdrawn', 'wa_in', 'wa_out')""", *a):
         t, ch = r["type"], r["channel"]
         if t == "reply" and (r["detail"] or "").startswith(LOGGED):
             continue
@@ -464,6 +709,9 @@ def communications(conn, *, lead_id: int | None = None, campaign_id: int | None 
                 seen.append(f"opened {r['opens']}×")
             if r["tracked"] and r["clicks"]:
                 seen.append(f"clicked {r['clicks']}×")
+            auto = autos.get((r["enrollment_id"], r["step_pos"]))
+            if auto:
+                seen.append(AUTO_LABEL[auto["kind"]] + (f", back {auto['back'].strftime('%d %b')}" if auto["back"] else ""))
             add(r, "email", "out", f"Email · step {r['step_pos'] + 1}" if r["step_pos"] is not None else "Email",
                 subject=r["detail"], content=r["body"] or r["content"] or "", by=r["sender"] or "", extra=", ".join(seen))
         elif t == "email_out":
@@ -477,7 +725,13 @@ def communications(conn, *, lead_id: int | None = None, campaign_id: int | None 
             add(r, ch, "in", "LinkedIn reply" if ch == "linkedin" else "WhatsApp reply",
                 content=r["content"] or ("Marked as replied by hand" if manual else r["detail"] or ""))
         elif t == "auto_reply":
-            add(r, "email", "in", "Automatic reply", subject=r["detail"], content=r["content"] or "")
+            info = auto_reply_info(r["detail"], r["content"], r["at"])
+            add(r, "email", "in", AUTO_LABEL[info["kind"]].capitalize(), subject=r["detail"], content=r["content"] or "",
+                extra=f"back {info['back'].strftime('%d %b %Y')}" if info["back"] else "")
+        elif t == "wa_out":
+            add(r, "whatsapp", "out", "WhatsApp message", content=r["content"] or "", by="bot")
+        elif t == "wa_in":
+            add(r, "whatsapp", "in", "WhatsApp received", content=r["content"] or "")
         elif t == "bounce":
             add(r, "email", "in", "Bounced", subject=r["detail"], content=r["content"] or "")
         elif t == "unsubscribe":
@@ -491,7 +745,8 @@ def communications(conn, *, lead_id: int | None = None, campaign_id: int | None 
     labels = {"li_connect": "LinkedIn invite", "li_message": "LinkedIn message", "whatsapp": "WhatsApp message"}
     for r in rows(conn, f"""
         SELECT t.id, t.channel, t.body, t.done_at at, e.lead_id, c.name campaign,
-          EXISTS (SELECT 1 FROM bot_actions b WHERE b.task_id = t.id AND b.ok = 1) by_bot
+          (EXISTS (SELECT 1 FROM bot_actions b WHERE b.task_id = t.id AND b.ok = 1)
+           OR EXISTS (SELECT 1 FROM wa_actions w WHERE w.task_id = t.id AND w.ok = 1)) by_bot
         FROM tasks t JOIN enrollments e ON e.id = t.enrollment_id JOIN campaigns c ON c.id = e.campaign_id
         WHERE {w} AND t.status = 'done' AND t.channel IN ('li_connect', 'li_message', 'whatsapp')
           AND t.done_at IS NOT NULL""", *a):

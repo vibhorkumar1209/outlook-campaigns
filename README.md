@@ -8,9 +8,10 @@ Email + LinkedIn outreach sequences, run from your own M365 Outlook, with a loca
 - **Deliverability:** per-mailbox sent, delivered, bounce, open, click, reply and unsubscribe rates, plus SPF/DKIM/DMARC/MX checks for each sending domain.
 - **LinkedIn runs as an assisted queue.** When a sequence reaches a LinkedIn step, a task shows up with the text already personalized. You click *Copy & open profile*, paste, send, then *Done*. Nothing touches LinkedIn automatically, so there's no ban risk.
 - **Weekly LinkedIn engagement:** while a lead is in a live sequence (invite sent or emailed), the queue gets one *Like + comment* task per person per week for a post from the last 6 months. Claude drafts a specific comment from the post text you paste; you edit and post it yourself. It stops as soon as they reply.
-- **Detection:** email replies, bounces and out-of-office replies come from your mailbox. LinkedIn accepts and replies come from LinkedIn's notification emails in the same mailbox. A reply on any channel stops that lead in every campaign.
+- **Detection:** email replies, bounces and out-of-office replies come from your mailbox. An out-of-office shows on the lead, their Campaign Status row, the email it answered and any draft waiting for them, with the return date when the reply gives one ("back 24 Nov"); a "no longer with the company" auto-reply is flagged too. The sequence carries on. LinkedIn accepts and replies come from LinkedIn's notification emails in the same mailbox. A reply on any channel stops that lead in every campaign.
 - **Emails wait for your approval (default):** a sequence email is saved in your Outlook Drafts folder and listed on **Email drafts**; it goes out only when you approve it, inside the campaign's send window. Edit it in Outlook first if you like. A campaign can switch to sending automatically in its Settings tab.
-- **WhatsApp steps:** a sequence step that queues a task opening WhatsApp with the text ready; you press send. Leads need a phone number with a country code.
+- **WhatsApp, only with people who know you:** WhatsApp steps and messages go only to Warm or Converted leads and people you've marked as **old contacts**; for anyone else the step is skipped. You send from the Task queue (WhatsApp opens with the text ready), or turn on the **WhatsApp bot**, which sends approved messages through WhatsApp Web, sends one-offs you write on a lead's page, and reads replies. Leads need a phone number with a country code. A **follow-up campaign** (campaign Settings → *Who it's for*) also takes people already in Leads, so you can sequence warm leads.
+- **Tags:** up to 6 per lead (industry, priority, year, anything), added on the lead's page, in bulk on the Leads / Prospects lists, or from a *Tags* column on import. Filter the lists by one or more tags, then tag, mark as old contacts or add the people shown to a campaign in one go. Campaign Status and its export have a Tags column.
 - **Lead status and follow-ups:** every lead is New, Warm, Cold, Converted or Closed/Lost. Last Contacted updates with every email, LinkedIn message, WhatsApp, call or meeting; Warm leads come due every 3 days and Cold every 90 (both editable), until the status changes. **Today** lists everything waiting on you, and a reminder email goes out at 8:00 with each follow-up's lead, status, last contact, a link to the lead and a *Send email / message* button.
 - **CRM:** a team list (BDRs, AEs) with an owner per lead, set by hand, per campaign, or from an Owner column on import. Every lead has one communications history: emails (with the text sent, opens, clicks, replies, bounces, out-of-office) and LinkedIn (invites, messages, likes, comments, replies, accepts) log themselves; calls, meetings and notes are logged by the owner with an outcome, notes and a next step. Campaign Status shows Owner, Calls, Last Call, Next Step, Last Touch and an expandable History per row, and its Excel export adds a Communications sheet. Overview lists follow-ups due.
 - **Dashboard:** overview funnel and 14-day activity, per-campaign and per-step email metrics, sequence editor with live preview per lead, lead timeline, CSV/Excel import with column mapping.
@@ -28,7 +29,7 @@ The app signs in through Microsoft's own public app, "Microsoft Graph Command Li
 
 ### 2. Install and run
 
-You need Python 3.11+, Git, and Google Chrome (only for the LinkedIn bot).
+You need Python 3.11+, Git, and Google Chrome (only for the LinkedIn and WhatsApp bots).
 
 **macOS**
 
@@ -126,6 +127,22 @@ Guardrails:
 
 **Read this first:** this automates your LinkedIn account, which LinkedIn's User Agreement prohibits. Accounts it catches automating can be restricted or banned. LinkedIn also changes its pages often; when it does, actions fail into the manual queue until the selectors in `campaigner/linkedin_bot.py` (`ChromeDriver`) are updated. `./oc linkedin-check` shows what still matches. The Mac must be awake, and a Chrome window appears while the bot works.
 
+### 7. WhatsApp bot (optional)
+
+By default you send WhatsApp steps yourself from the queue. In **bot** mode, a second dedicated Chrome window runs WhatsApp Web, linked to your phone:
+- sequence WhatsApp steps, once you approve them in the Task queue (*Approve & send via bot*; edit first if you like). Approval can be turned off in Settings;
+- one-off messages you write on a lead's page (*Send email / message → WhatsApp → Send via bot*, or *Save draft*);
+- replies: chats the app wrote to in the last 30 days are read every 20 minutes. A reply stops that person's sequences, like any other, and both sides show in their history.
+
+Turning it on:
+1. **Settings → WhatsApp automation → Link WhatsApp**, or run `./oc whatsapp-login`. A Chrome window shows WhatsApp Web's QR code; on your phone open WhatsApp → *Linked devices* → *Link a device* and scan it. The app never sees a password or code.
+2. Optionally check one chat read-only (it types nothing): `./oc whatsapp-check +44 7700 900123`
+3. Choose **Bot sends them**, check the cap and hours, then save.
+
+Guardrails: only Warm and Converted leads and old contacts, checked again just before each message; 15 messages a day by default (30 at most), no more than 6 in an hour, minutes apart, typed at a person's pace, 1–4 a session then 10–40 minutes off, only in its hours. If WhatsApp Web is signed out or shows anything unexpected, the bot pauses and messages go back to the queue. A message it can't confirm was sent is never retried: it's left for you to check.
+
+**Read this first:** WhatsApp's terms don't allow automated or bulk messaging, and it bans numbers it catches, especially ones messaging people who don't know them. Keep this to people who know you. WhatsApp Web changes too; when it does, sends fail into the queue until `WhatsAppDriver` in `campaigner/whatsapp_bot.py` is updated (`./oc whatsapp-check` shows what still matches).
+
 ## Workflow
 
 1. **Campaigns → Create.** You get a five-step starter: Connect → Email → LinkedIn message → Email bump → Email break-up.
@@ -177,6 +194,8 @@ On Windows, `.\oc` instead of `./oc`.
 ./oc tracker-setup [--domain links.you.com]           tracking secrets + Cloudflare deploy steps
 ./oc linkedin-login                                   sign the LinkedIn bot's Chrome profile in
 ./oc linkedin-check <profile-url>                     read-only test of the bot on one profile
+./oc whatsapp-login                                   link the WhatsApp bot (scan the QR code)
+./oc whatsapp-check <phone>                           read-only test of the WhatsApp bot on one chat
 ./oc tick [--dry-run]                                 one run now
 ./oc demo                                             seed a draft demo campaign
 ```

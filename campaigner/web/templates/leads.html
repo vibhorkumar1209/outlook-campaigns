@@ -13,7 +13,8 @@
     {% endif %}
   </div>
   <div class="actions">
-    <form method="get" class="actions"><input name="q" value="{{ q }}" placeholder="Search name, email, company" style="width:260px">
+    <form method="get" class="actions" id="lead-filter">{% for t in tags %}<input type="hidden" name="tag" value="{{ t }}">{% endfor %}{% if old %}<input type="hidden" name="old" value="1">{% endif %}
+      <input name="q" value="{{ q }}" placeholder="Search name, email, company" style="width:260px">
       <select name="owner" onchange="this.form.submit()" aria-label="Owner">
         <option value="">All owners</option><option value="none" {{ 'selected' if owner == 'none' }}>Unassigned</option>
         {% for m in team %}<option value="{{ m.id }}" {{ 'selected' if owner == m.id | string }}>{{ m.name }}</option>{% endfor %}
@@ -25,16 +26,49 @@
     {% if stage != "lead" %}<a class="btn primary" href="/import">Import</a>{% endif %}
   </div>
 </header>
+{% set base_q = {"q": q, "owner": owner, "status": status} %}
+{% macro tag_url(add=None, drop=None, old_flag=old) -%}
+?{% for k, v in {"q": q, "owner": owner, "status": status}.items() if v %}{{ k }}={{ v | urlencode }}&amp;{% endfor %}{% for t in tags if t != drop %}tag={{ t | urlencode }}&amp;{% endfor %}{% if add and add not in tags %}tag={{ add | urlencode }}&amp;{% endif %}{% if old_flag %}old=1{% endif %}
+{%- endmacro %}
+<div class="filters">
+  <span class="meta">Tags:</span>
+  {% for t in tags %}<span class="tag">{{ t }} <a href="{{ tag_url(drop=t) }}" aria-label="Remove filter {{ t }}" style="color:inherit;text-decoration:none">✕</a></span>{% endfor %}
+  {% if old %}<span class="tag">old contacts <a href="{{ tag_url(old_flag=False) }}" aria-label="Remove filter old contacts" style="color:inherit;text-decoration:none">✕</a></span>{% endif %}
+  <form method="get" id="tag-add" class="actions" style="gap:6px">
+    {% for k, v in base_q.items() if v %}<input type="hidden" name="{{ k }}" value="{{ v }}">{% endfor %}
+    {% for t in tags %}<input type="hidden" name="tag" value="{{ t }}">{% endfor %}{% if old %}<input type="hidden" name="old" value="1">{% endif %}
+    <input name="tag" list="all-tags" placeholder="Filter by tag" aria-label="Filter by tag" style="width:170px">
+  </form>
+  {% if not old %}<a class="btn sm ghost" href="{{ tag_url(old_flag=True) }}">Old contacts only</a>{% endif %}
+  {% if tags or old %}<a class="btn sm ghost" href="?{% for k, v in base_q.items() if v %}{{ k }}={{ v | urlencode }}&amp;{% endfor %}">Clear</a>{% endif %}
+  <datalist id="all-tags">{% for t in all_tags %}<option value="{{ t.tag }}">{{ t.n }}</option>{% endfor %}</datalist>
+</div>
 {% if leads %}
-<section class="card"><div class="tbl-wrap"><table class="t">
+<div class="bulk" id="bulk" hidden>
+  <b><span id="bulk-n">0</span> selected</b>
+  <input id="bulk-tag" list="all-tags" placeholder="Tag" aria-label="Tag" style="width:150px">
+  <button class="btn sm" data-bulk="tag">Add tag</button>
+  <button class="btn sm ghost" data-bulk="untag">Remove tag</button>
+  <button class="btn sm" data-bulk="old_contact" data-value="1" title="WhatsApp is allowed with old contacts">Mark old contacts</button>
+  <button class="btn sm ghost" data-bulk="old_contact" data-value="">Unmark</button>
+  <select id="bulk-campaign" aria-label="Campaign">
+    <option value="">Add to campaign…</option>
+    {% for c in campaigns_all %}<option value="{{ c.id }}">{{ c.name }}{% if c.audience == "warm" %} (warm leads){% endif %}{% if c.status != "active" %} · {{ c.status }}{% endif %}</option>{% endfor %}
+  </select>
+  <button class="btn sm primary" data-bulk="enroll">Add</button>
+  <span class="meta">Up to {{ max_tags }} tags each.</span>
+</div>
+<section class="card"><div class="tbl-wrap"><table class="t" id="lead-table">
   {% if stage == "lead" %}
-  <thead><tr><th>Name</th><th>Company</th><th>Status</th><th>Owner</th><th>Replied</th><th>Via</th><th>Campaign</th><th>Last contacted</th><th>Next follow-up</th><th>Email</th></tr></thead>
+  <thead><tr><th class="pick"><input type="checkbox" data-pick-all aria-label="Select all"></th><th>Name</th><th>Company</th><th>Status</th><th>Owner</th><th>Replied</th><th>Via</th><th>Campaign</th><th>Last contacted</th><th>Next follow-up</th><th>Email</th></tr></thead>
   <tbody>
   {% for l in leads %}
     <tr>
-      <td><a href="/leads/{{ l.id }}">{{ lead_name(l) }}</a><div class="meta">{{ l.title }}</div></td>
+      <td class="pick"><input type="checkbox" data-pick="{{ l.id }}" aria-label="Select {{ lead_name(l) }}"></td>
+      <td><a href="/leads/{{ l.id }}">{{ lead_name(l) }}</a><div class="meta">{{ l.title }}</div>
+        {% if l.tags or l.old_contact %}<div class="tags">{% if l.old_contact %}<span class="tag" title="Old contact: WhatsApp allowed">old contact</span>{% endif %}{% for t in l.tags %}<a class="tag" href="{{ tag_url(add=t) }}" title="Filter by {{ t }}">{{ t }}</a>{% endfor %}</div>{% endif %}</td>
       <td>{{ l.company }}</td>
-      <td><span class="pill {{ LEAD_TONE[l.status] }}">{{ l.status }}</span></td>
+      <td><span class="pill {{ LEAD_TONE[l.status] }}">{{ l.status }}</span>{% if l.ooo %}<div style="margin-top:3px"><span class="pill {{ 'critical' if l.ooo.kind == 'left' else 'warning' }}" title="Automatic reply {{ l.ooo.at | ago }}">{{ l.ooo.label }}</span></div>{% endif %}</td>
       <td class="meta">{{ l.owner or "–" }}</td>
       <td class="meta">{{ (l.reply_at or l.became_lead_at) | ago if (l.reply_at or l.became_lead_at) else "–" }}</td>
       <td>{% if l.reply_channel in ("email", "linkedin") %}<span class="chip {{ l.reply_channel }}">{{ "Email" if l.reply_channel == "email" else "LinkedIn" }}</span>{% elif l.reply_channel %}<span class="chip">{{ l.reply_channel | capitalize }}</span>{% else %}<span class="meta">moved by you</span>{% endif %}</td>
@@ -46,13 +80,15 @@
   {% endfor %}
   </tbody>
   {% else %}
-  <thead><tr><th>Name</th><th>Company</th><th>Status</th><th>Owner</th><th>Email</th><th>LinkedIn</th><th class="num">Campaigns</th><th>Latest status</th><th>Last touch</th></tr></thead>
+  <thead><tr><th class="pick"><input type="checkbox" data-pick-all aria-label="Select all"></th><th>Name</th><th>Company</th><th>Status</th><th>Owner</th><th>Email</th><th>LinkedIn</th><th class="num">Campaigns</th><th>Latest status</th><th>Last touch</th></tr></thead>
   <tbody>
   {% for l in leads %}
     <tr>
-      <td><a href="/leads/{{ l.id }}">{{ lead_name(l) }}</a><div class="meta">{{ l.title }}</div></td>
+      <td class="pick"><input type="checkbox" data-pick="{{ l.id }}" aria-label="Select {{ lead_name(l) }}"></td>
+      <td><a href="/leads/{{ l.id }}">{{ lead_name(l) }}</a><div class="meta">{{ l.title }}</div>
+        {% if l.tags or l.old_contact %}<div class="tags">{% if l.old_contact %}<span class="tag" title="Old contact: WhatsApp allowed">old contact</span>{% endif %}{% for t in l.tags %}<a class="tag" href="{{ tag_url(add=t) }}" title="Filter by {{ t }}">{{ t }}</a>{% endfor %}</div>{% endif %}</td>
       <td>{{ l.company }}</td>
-      <td><span class="pill {{ LEAD_TONE[l.status] }}">{{ l.status }}</span></td>
+      <td><span class="pill {{ LEAD_TONE[l.status] }}">{{ l.status }}</span>{% if l.ooo %}<div style="margin-top:3px"><span class="pill {{ 'critical' if l.ooo.kind == 'left' else 'warning' }}" title="Automatic reply {{ l.ooo.at | ago }}">{{ l.ooo.label }}</span></div>{% endif %}</td>
       <td class="meta">{{ l.owner or "–" }}</td>
       <td class="meta">{{ l.email or "–" }}</td>
       <td>{% if l.linkedin_url %}<a href="{{ l.linkedin_url }}" target="_blank" rel="noopener">profile</a> {{ pill(l.li_state) if l.li_state != "none" }}{% else %}<span class="meta">–</span>{% endif %}</td>
@@ -66,7 +102,7 @@
 </table></div></section>
 {% else %}
   <div class="empty">
-    {% if q %}No {{ "leads" if stage == "lead" else "prospects" }} match "{{ q }}".
+    {% if q or tags or old %}No {{ "leads" if stage == "lead" else "prospects" }} match these filters.
     {% elif stage == "lead" %}No leads yet. When someone replies to a sequence, they move here.
     {% else %}No prospects yet. <a href="/import">Import a CSV or Excel file</a>.{% endif %}
   </div>

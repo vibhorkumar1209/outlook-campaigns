@@ -11,7 +11,7 @@
       <td class="meta">{{ r.owner or "Unassigned" }}</td>
       <td><div class="row-act">
         <button class="btn sm primary" data-compose data-lead="{{ r.lead_id }}" data-name="{{ r.name }}" data-company="{{ r.company }}"
-                data-email="{{ r.email or '' }}" data-wa="{{ r.wa }}" data-linkedin="{{ r.linkedin_url or '' }}" data-first="{{ r.first_name }}">Send email / message</button>
+                data-email="{{ r.email or '' }}" data-wa="{{ r.wa }}" data-wa-block="{{ r.wa_block or '' }}" data-wa-bot="{{ '1' if wa_bot_on and not r.wa_block else '' }}" data-linkedin="{{ r.linkedin_url or '' }}" data-first="{{ r.first_name }}">Send email / message</button>
         <button class="btn sm" data-log data-lead="{{ r.lead_id }}" data-name="{{ r.name }}" data-company="{{ r.company }}" data-phone="{{ r.phone }}"
                 data-owner="{{ r.owner_id or '' }}" data-status="{{ r.status }}">Log</button>
         <button class="btn sm ghost" data-snooze="{{ r.lead_id }}" title="Remind me again after {{ cadence.get(r.status, 1) }} day{{ 's' if cadence.get(r.status, 1) != 1 }}">Snooze</button>

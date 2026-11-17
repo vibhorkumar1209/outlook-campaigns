@@ -19,7 +19,7 @@ from zoneinfo import ZoneInfo
 
 from jinja2 import TemplateError
 
-from . import attachments, db
+from . import attachments, crm, db
 from .db import event, iso, one, parse, rows, scalar, utcnow
 from .graph import AuthError, GraphError, NetworkError
 from .render import email_html, lead_context, lead_phone, linkedin_text, plain_text, render_text, wa_digits, whatsapp_text
@@ -28,7 +28,8 @@ from .tracking import BOT_UA, MACHINE_WINDOW_S
 CHANNELS = {"email": "Email", "li_view": "View profile", "li_connect": "Connect", "li_message": "LinkedIn message",
             "whatsapp": "WhatsApp message"}
 LI = ("li_view", "li_connect", "li_message")
-# WhatsApp is an assisted step: the queue opens WhatsApp with the text ready, you press send. No bot, no API.
+# WhatsApp: in the queue for you to send (WhatsApp opens with the text ready), or sent by the WhatsApp bot through
+# WhatsApp Web once approved (whatsapp_bot.py). Only ever to Warm leads and old contacts: others skip the step.
 WHATSAPP = "whatsapp"
 # Task-only channel: recurring "like + comment on a recent post" alongside the sequence. Not a sequence step.
 ENGAGE = "li_engage"
@@ -704,6 +705,9 @@ def gate(st: dict, e: dict, now: datetime, due: datetime,
         return "no LinkedIn URL", False
     if ch == WHATSAPP and not wa_digits(lead_phone(e)):
         return "no phone number with country code", False
+    if ch == WHATSAPP and (why := crm.wa_blocked({"dnc": e.get("dnc"), "status": e.get("lead_status_now"),
+                                                  "old_contact": e.get("old_contact")})):
+        return why, False
     if st["condition"] == "if_was_connected" and not e.get("was_connected"):
         return "needed an invite (other branch)", False
     if st["condition"] == "if_was_invited" and e.get("was_connected"):
@@ -750,7 +754,7 @@ def _fail(conn, e: dict, k: int, msg: str, log, permanent: bool) -> None:
 
 ENROLLED_SQL = """
     SELECT e.*, l.email, l.linkedin_url, l.first_name, l.last_name, l.company, l.title, l.data, l.li_state, l.dnc,
-           l.email_bounced
+           l.email_bounced, l.status AS lead_status_now, l.old_contact
     FROM enrollments e JOIN leads l ON l.id = e.lead_id
     WHERE e.campaign_id = ? AND e.status IN ('pending', 'active')
       AND NOT EXISTS (SELECT 1 FROM tasks t WHERE t.enrollment_id = e.id AND t.status = 'open'

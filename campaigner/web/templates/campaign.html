@@ -183,6 +183,13 @@
         </select>
         <span class="meta">Drafts wait in <a href="/drafts">Email drafts</a> and in Outlook's Drafts folder until you approve them.</span>
       </label>
+      <label class="f">Who it's for
+        <select name="audience">
+          <option value="new" {{ 'selected' if c.audience != 'warm' }}>New prospects (cold outreach)</option>
+          <option value="warm" {{ 'selected' if c.audience == 'warm' }}>Warm leads &amp; old contacts (follow-up)</option>
+        </select>
+        <span class="meta">A follow-up campaign also takes people already in Leads (they replied before). WhatsApp steps only ever go to Warm or Converted leads and old contacts; for anyone else they're skipped.</span>
+      </label>
       <label class="f">Default owner (BDR)
         <select name="owner_id">
           <option value="">None</option>

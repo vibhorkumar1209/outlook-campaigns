@@ -12,11 +12,16 @@
     <label class="f" data-via="email">Subject<input name="subject" placeholder="Leave blank to reply in your existing thread with them"></label>
     <label class="f">Message<textarea name="body" rows="7" placeholder="Hi {{ '{{ first_name }}' }}, …"></textarea></label>
     <p class="meta" data-via="email">The email is saved in your Outlook Drafts folder, on top of your last email to them when there is one. <b>Save draft</b> leaves it there for you to finish; <b>Send now</b> sends it straight away. Either way it's added to their history.</p>
-    <p class="meta" data-via="whatsapp" hidden>Opens WhatsApp with this message ready; you press send there. Then <b>Log as sent</b> so it's in their history. <span id="compose-wa-missing" hidden>No phone number with a country code is saved for this lead: add one on their page.</span></p>
+    <p class="meta" data-via="whatsapp" hidden><span id="compose-wa-how">Opens WhatsApp with this message ready; you press send there. Then <b>Log as sent</b> so it's in their history.</span>
+      <span id="compose-wa-bot-how" hidden><b>Send via bot</b>: the WhatsApp bot types and sends it through WhatsApp Web within its hours, usually within minutes, and it's added to their history. <b>Save draft</b> keeps it on their page to send later.</span>
+      <span id="compose-wa-missing" hidden>No phone number with a country code is saved for this lead: add one on their page.</span></p>
+    <p class="flash err" id="compose-wa-blocked" hidden></p>
     <p class="meta" data-via="linkedin" hidden>Copies the message and opens their profile; paste and send it there. Then <b>Log as sent</b> so it's in their history.</p>
     <div class="actions">
       <button class="btn primary" value="draft" data-via="email">Save draft</button>
       <button class="btn" value="send" data-via="email">Send now</button>
+      <button class="btn primary" type="button" id="compose-wa-send" data-via="whatsapp" hidden>Send via bot</button>
+      <button class="btn" type="button" id="compose-wa-draft" data-via="whatsapp" hidden>Save draft</button>
       <button class="btn primary" type="button" id="compose-open-wa" data-via="whatsapp" hidden>Open WhatsApp</button>
       <button class="btn primary" type="button" id="compose-open-li" data-via="linkedin" hidden>Copy &amp; open profile</button>
       <button class="btn" type="button" id="compose-logged" data-via="whatsapp linkedin" hidden>Log as sent</button>
