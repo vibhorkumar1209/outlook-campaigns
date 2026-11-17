@@ -1,0 +1,114 @@
+{% extends "base.html" %}
+{% from "_macros.html" import lead_name %}
+{% block title %}WhatsApp queue{% endblock %}
+{% block main %}
+<header class="head">
+  <div>
+    <h1>WhatsApp queue <span class="meta">· <span id="tasks-left">{{ waiting }}</span> waiting · {{ bot.sent_today }} sent today</span></h1>
+    <p class="sub">Sequence messages and one-offs waiting to go out on WhatsApp, and the last two weeks of messages and replies. Only Warm leads, Converted leads and old contacts get WhatsApp.</p>
+  </div>
+  {% if campaigns %}
+  <form class="actions" method="get">
+    <select name="campaign" onchange="this.form.submit()" aria-label="Campaign">
+      <option value="">All live campaigns</option>
+      {% for c in campaigns %}<option value="{{ c.id }}" {{ 'selected' if campaign == c.id }}>{{ c.name }}</option>{% endfor %}
+    </select>
+  </form>
+  {% endif %}
+</header>
+
+{# Where the bot stands, so it's clear why something isn't moving. #}
+<section class="card">
+  <div class="meta">
+    {% if bot.paused %}
+      <span class="pill critical">bot paused</span> {{ bot.paused.reason }}. <a href="/settings#whatsapp-bot">Resolve and resume →</a>
+    {% elif not bot.signed_in %}
+      <span class="pill warning">not linked</span> WhatsApp Web isn't linked yet. <a href="/settings#whatsapp-bot">Link WhatsApp →</a>
+    {% elif bot.cfg.wa_mode != "bot" %}
+      <span class="pill muted">assisted</span> You send each message: <i>Open WhatsApp</i>, press send there, then <i>Done</i>. Turn on the bot in <a href="/settings#whatsapp-bot">Settings</a>.
+    {% else %}
+      <span class="pill good">bot on</span>
+      {{ bot.sent_today }} of {{ bot.cfg.wa_daily_cap }} sent today ·
+      {% if not bot.in_hours %}outside its hours ({{ bot.cfg.wa_hours[0] }}–{{ bot.cfg.wa_hours[1] }}, {{ bot.cfg.wa_days | replace(",", " ") }}): sends when they start
+      {% elif bot.resting %}resting until {{ bot.rest_until | local("%H:%M") }}
+      {% else %}sending now, a few minutes apart{% endif %}
+      {% if bot.cfg.wa_approve %} · sequence messages need your OK{% endif %}
+      {% if bot.cfg.wa_read %} · replies last read {{ bot.read_at | ago if bot.read_at else "not yet" }}{% endif %}
+    {% endif %}
+  </div>
+</section>
+
+<h2 class="sec">Sequence messages <span class="meta">· {{ tasks | length }}</span></h2>
+{% if not tasks %}
+  <div class="empty">None waiting. They show up here when a live sequence reaches a WhatsApp step.</div>
+{% endif %}
+<div class="tasks" data-nav="nav-wa" data-open="wa_open">
+{% for t in tasks %}
+  {% include "_task_card.html" %}
+{% endfor %}
+</div>
+
+<h2 class="sec">One-off messages <span class="meta">· {{ outbox | length }}</span></h2>
+{% if not outbox %}
+  <div class="empty">None waiting. Write one from a lead's page: <i>Send email / message</i> → WhatsApp.</div>
+{% else %}
+<section class="card">
+  <div class="tbl-wrap"><table class="t wa-q">
+    <thead><tr><th>To</th><th>Message</th><th>Written</th><th>State</th><th></th></tr></thead>
+    <tbody>
+    {% for o in outbox %}
+      <tr>
+        <td><a href="/leads/{{ o.lead_id }}">{{ lead_name(o) }}</a><div class="meta">{{ o.company }}{% if o.phone %} · {{ o.phone }}{% endif %}</div></td>
+        <td><div class="wa-out">{{ o.body }}</div></td>
+        <td class="meta">{{ o.created_at | ago }}</td>
+        <td>
+          {% if o.wa_block %}<span class="pill warning">not allowed</span><div class="meta">{{ o.wa_block }}</div>
+          {% elif o.status == "queued" %}<span class="pill info">bot will send</span>
+          {% elif o.status == "failed" %}<span class="pill critical">bot couldn't</span><div class="meta">{{ o.note }}</div>
+          {% else %}<span class="pill warning">draft</span>{% endif %}
+        </td>
+        <td><div class="row-act">
+          {% if o.status in ("draft", "failed") and not o.wa_block %}
+            {% if wa_bot_on %}<button class="btn sm primary" data-wa-outbox="{{ o.id }}" data-act="send">Send via bot</button>{% endif %}
+            {% if o.wa %}<a class="btn sm" href="https://wa.me/{{ o.wa }}?text={{ o.body | urlencode }}" target="_blank" rel="noopener">Open WhatsApp</a>
+            <button class="btn sm" data-wa-outbox="{{ o.id }}" data-act="sent" data-ask="Mark this message as sent by you?">I sent it</button>{% endif %}
+          {% endif %}
+          <button class="btn sm ghost" data-wa-outbox="{{ o.id }}" data-act="cancel" data-ask="Drop this WhatsApp message?">{{ "Cancel" if o.status == "queued" else "Discard" }}</button>
+        </div></td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+</section>
+{% endif %}
+
+<h2 class="sec">Last 14 days <span class="meta">· {{ recent | length }}</span></h2>
+{% if not recent %}
+  <div class="empty">No WhatsApp messages or replies yet.</div>
+{% else %}
+<section class="card">
+  <div class="tbl-wrap"><table class="t wa-q">
+    <thead><tr><th>When</th><th>Who</th><th>What</th><th>Message</th></tr></thead>
+    <tbody>
+    {% for r in recent %}
+      <tr>
+        <td class="meta" title="{{ r.at | local('%d %b %Y %H:%M') }}">{{ r.at | ago }}</td>
+        <td><a href="/leads/{{ r.lead_id }}">{{ lead_name(r) }}</a>{% if r.company %}<div class="meta">{{ r.company }}</div>{% endif %}</td>
+        <td>
+          {% if r.kind in ("reply", "wa_in") %}<span class="pill good">{{ "replied" if r.kind == "reply" else "received" }}</span>
+          {% elif r.kind == "failed" %}<span class="pill critical">bot couldn't send</span>
+          {% elif r.kind == "task_skipped" %}<span class="pill muted">skipped</span>
+          {% elif r.kind == "logged" %}<span class="pill info">logged</span>
+          {% else %}<span class="pill info">sent</span>{% endif %}
+          <div class="meta">{% if r.kind in ("task_done", "wa_out") %}by {{ "bot" if r.by_bot else "you" }}{% if r.campaign %} · {{ r.campaign }}{% endif %}
+            {% elif r.kind == "failed" %}{{ r.detail }}{% elif r.kind == "task_skipped" %}{{ r.detail or "" }}{% if r.campaign %} · {{ r.campaign }}{% endif %}
+            {% elif r.kind == "logged" %}{{ r.detail }}{% endif %}</div>
+        </td>
+        <td>{% if r.content %}<div class="wa-out">{{ r.content[:400] }}{% if r.content | length > 400 %}…{% endif %}</div>{% endif %}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+</section>
+{% endif %}
+{% endblock %}

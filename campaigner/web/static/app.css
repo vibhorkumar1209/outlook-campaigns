@@ -412,3 +412,7 @@ a.tag:hover { border-color: var(--brand); }
 .bulk[hidden] { display: none; }
 .t td.pick, .t th.pick { width: 28px; padding-right: 0; }
 .wa-out { border-left: 3px solid var(--whatsapp); padding: 6px 10px; margin: 6px 0; background: var(--panel); white-space: pre-wrap; }
+h2.sec { margin: 22px 0 10px; }
+.wa-q .wa-out { min-width: 180px; margin: 0; }
+.wa-q .row-act { flex-direction: column; align-items: stretch; }
+.wa-q .row-act .btn { white-space: nowrap; text-align: center; }

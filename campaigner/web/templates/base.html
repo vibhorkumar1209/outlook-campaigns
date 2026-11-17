@@ -14,7 +14,7 @@
     <a class="brand" href="/today"><img src="{{ asset('favicon-32.png') }}" alt="" width="22" height="22">Outreach</a>
     <nav class="nav">
       {% set nav = [
-        ("Do", [("/today", "Today"), ("/drafts", "Email drafts"), ("/tasks", "Task queue")]),
+        ("Do", [("/today", "Today"), ("/drafts", "Email drafts"), ("/tasks", "LinkedIn queue"), ("/whatsapp", "WhatsApp queue")]),
         ("Outreach", [("/", "Overview"), ("/campaigns", "Campaigns"), ("/status", "Campaign Status")]),
         ("People", [("/leads", "Leads"), ("/prospects", "Prospects"), ("/import", "Import")]),
         ("Setup", [("/senders", "Senders"), ("/settings", "Settings")])] %}
@@ -23,9 +23,10 @@
         <div class="nav-group">{{ group }}</div>
         {% for href, label in links %}
           {% set on = here == href or (href != "/" and here.startswith(href)) %}
-          <a href="{{ href }}" class="{{ 'on' if on }}" {% if href == '/tasks' %}id="nav-tasks"{% elif href == '/drafts' %}id="nav-drafts"{% endif %} {% if on %}aria-current="page"{% endif %}>
+          <a href="{{ href }}" class="{{ 'on' if on }}" {% if href == '/tasks' %}id="nav-tasks"{% elif href == '/whatsapp' %}id="nav-wa"{% elif href == '/drafts' %}id="nav-drafts"{% endif %} {% if on %}aria-current="page"{% endif %}>
             <span>{{ label }}</span>
             {% if href == "/tasks" and open_tasks %}<span class="badge">{{ open_tasks }}</span>{% endif %}
+            {% if href == "/whatsapp" and wa_open %}<span class="badge">{{ wa_open }}</span>{% endif %}
             {% if href == "/drafts" and drafts_pending %}<span class="badge warn" title="Emails waiting for your approval">{{ drafts_pending }}</span>{% endif %}
             {% if href == "/today" and today_count %}<span class="badge" title="Things waiting on you">{{ today_count }}</span>{% endif %}
           </a>

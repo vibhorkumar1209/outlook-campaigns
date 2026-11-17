@@ -2288,7 +2288,22 @@ class WhatsAppBotTest(Base):
             self.assertEqual(c.post(f"/api/wa-outbox/{o['id']}", json={"action": "send"}, headers=origin).status_code, 200)
             self.assertEqual(one(self.conn, "SELECT status FROM wa_outbox WHERE id = ?", o["id"])["status"], "queued")
             t = self.wtask("sam@x.com")
-            self.assertIn("Approve &amp; send via bot", c.get("/tasks").text)
+            self.assertNotIn("Approve &amp; send via bot", c.get("/tasks").text)   # LinkedIn queue only
+            page = c.get("/whatsapp").text
+            self.assertIn("Approve &amp; send via bot", page)                     # sequence message
+            self.assertIn("Hi Pat", page)                                          # queued one-off
+            self.assertIn("bot will send", page)
+            d = c.post(f"/api/leads/{pat}/whatsapp", json={"body": "Draft two", "send": False}, headers=origin)
+            self.assertEqual(d.status_code, 200)
+            d = one(self.conn, "SELECT id FROM wa_outbox WHERE body = 'Draft two'")
+            r = c.post(f"/api/wa-outbox/{d['id']}", json={"action": "sent"}, headers=origin)
+            self.assertEqual(r.status_code, 200)
+            self.assertIn("wa_open", r.json())
+            self.assertEqual(one(self.conn, "SELECT status FROM wa_outbox WHERE id = ?", d["id"])["status"], "sent")
+            self.assertEqual(c.post(f"/api/wa-outbox/{o['id']}", json={"action": "sent"}, headers=origin).status_code, 409)
+            page = c.get("/whatsapp").text
+            self.assertIn("Last 14 days", page)
+            self.assertIn("by you", page)                                          # the one you sent yourself
             r = c.post(f"/api/tasks/{t['id']}/wa-approve", json={"body": "Hi Sam, edited"}, headers=origin)
             self.assertEqual(r.status_code, 200)
             self.assertEqual(self.wtask("sam@x.com")["comment_status"], "approved")

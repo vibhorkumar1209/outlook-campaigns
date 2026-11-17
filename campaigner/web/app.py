@@ -104,7 +104,16 @@ templates.env.globals.update(
 )
 
 OPEN_TASKS_SQL = """SELECT COUNT(*) FROM tasks t JOIN enrollments e ON e.id = t.enrollment_id
-                    JOIN campaigns c ON c.id = e.campaign_id WHERE t.status = 'open' AND c.status = 'active'"""
+                    JOIN campaigns c ON c.id = e.campaign_id WHERE t.status = 'open' AND c.status = 'active'
+                    AND t.channel != 'whatsapp'"""
+WA_OPEN_SQL = """SELECT (SELECT COUNT(*) FROM tasks t JOIN enrollments e ON e.id = t.enrollment_id
+                         JOIN campaigns c ON c.id = e.campaign_id WHERE t.status = 'open' AND c.status = 'active'
+                         AND t.channel = 'whatsapp')
+                      + (SELECT COUNT(*) FROM wa_outbox WHERE status IN ('draft', 'queued', 'failed'))"""
+
+
+def open_counts(conn) -> dict:
+    return {"ok": True, "open": scalar(conn, OPEN_TASKS_SQL), "wa_open": scalar(conn, WA_OPEN_SQL)}
 
 
 @app.middleware("http")
@@ -142,6 +151,7 @@ def page(request: Request, name: str, conn, **ctx):
         "wa_bot_on": whatsapp_bot.settings(conn)["wa_mode"] == "bot",
         "last_tick": db.get_setting(conn, "last_tick"),
         "open_tasks": scalar(conn, OPEN_TASKS_SQL),
+        "wa_open": scalar(conn, WA_OPEN_SQL),
         "updates_behind": (runner.update_info or {}).get("behind", 0),
         "team": crm.team(conn, active_only=True),
         "me": crm.me(conn),
@@ -366,6 +376,12 @@ async def wa_outbox_action(oid: int, request: Request):
     act = p.get("action")
     if act == "cancel":
         conn.execute("UPDATE wa_outbox SET status = 'cancelled' WHERE id = ?", (oid,))
+    elif act == "sent":  # you sent it yourself from WhatsApp
+        if o["status"] == "queued":
+            raise HTTPException(409, "The bot is about to send this one; cancel it first")
+        conn.execute("UPDATE wa_outbox SET status = 'sent', sent_at = ?, note = NULL WHERE id = ?", (iso(utcnow()), oid))
+        db.event(conn, o["lead_id"], "wa_out", channel="whatsapp", detail="sent by you", content=o["body"])
+        crm.refresh_followups(conn, lead_id=o["lead_id"])
     elif act == "send":
         why = crm.wa_blocked({"dnc": o["dnc"], "status": o["lead_status"], "old_contact": o["old_contact"]})
         if why:
@@ -378,51 +394,109 @@ async def wa_outbox_action(oid: int, request: Request):
         threading.Thread(target=runner.run_wa, daemon=True).start()
     else:
         raise HTTPException(400, "bad action")
-    return {"ok": True}
+    return open_counts(conn)
 
 
-# ---------- task queue: LinkedIn and WhatsApp ----------
+# ---------- task queues: LinkedIn (/tasks) and WhatsApp (/whatsapp) ----------
 
-@app.get("/tasks")
-def tasks(request: Request, campaign: int | None = None):
-    conn = db.connect()
-    sql = """SELECT t.*, c.id campaign_id, c.name campaign, l.id lead_id, l.first_name, l.last_name, l.company,
+TASK_ROWS_SQL = """SELECT t.*, c.id campaign_id, c.name campaign, l.id lead_id, l.first_name, l.last_name, l.company,
                     l.title, l.linkedin_url, l.li_state, l.data,
                     (SELECT COUNT(*) FROM steps s WHERE s.campaign_id = c.id) n_steps
              FROM tasks t JOIN enrollments e ON e.id = t.enrollment_id
              JOIN campaigns c ON c.id = e.campaign_id JOIN leads l ON l.id = e.lead_id
              WHERE t.status = 'open' AND c.status = 'active'"""
+
+
+def open_tasks(conn, whatsapp: bool, campaign: int | None) -> list[dict]:
+    sql = TASK_ROWS_SQL + (" AND t.channel = 'whatsapp'" if whatsapp else " AND t.channel != 'whatsapp'")
     args = ()
     if campaign:
         sql += " AND c.id = ?"
         args = (campaign,)
     items = rows(conn, sql + " ORDER BY t.created_at, t.id", *args)
-    eng = engine.engage_settings(conn)
-    since = (utcnow() - timedelta(days=round(30.4 * eng["engage_lookback_months"]))).astimezone(local_tz())
     for t in items:
         t["phone"] = lead_phone(t)
         t["wa"] = wa_digits(t["phone"])
+    return items
+
+
+def prep_wa_tasks(conn, items: list[dict]) -> None:
+    """Flag each WhatsApp task: not eligible, waiting for your OK, or the bot will send it."""
+    wa = whatsapp_bot.settings(conn)
+    wa_on = wa["wa_mode"] == "bot" and not db.get_setting(conn, "wa_bot_paused")
+    ids = [t["lead_id"] for t in items]
+    wa_leads = {r["id"]: r for r in rows(conn, f"SELECT id, status, dnc, old_contact FROM leads WHERE id IN ({','.join('?' * len(ids))})", *ids)} if ids else {}
+    for t in items:
+        t["wa_block"] = crm.wa_blocked(wa_leads.get(t["lead_id"]) or {})
+        t["wa_needs_ok"] = wa_on and wa["wa_approve"] and t["comment_status"] != "approved" and not t["wa_block"]
+        t["bot_will"] = (wa_on and t["bot_attempts"] < whatsapp_bot.MAX_ATTEMPTS and bool(t["wa"])
+                         and not t["wa_needs_ok"] and not t["wa_block"])
+
+
+@app.get("/tasks")
+def tasks(request: Request, campaign: int | None = None):
+    conn = db.connect()
+    items = open_tasks(conn, False, campaign)
+    eng = engine.engage_settings(conn)
+    since = (utcnow() - timedelta(days=round(30.4 * eng["engage_lookback_months"]))).astimezone(local_tz())
+    for t in items:
         if t["channel"] == engine.ENGAGE:
             t["posts_url"] = t["linkedin_url"].rstrip("/") + "/recent-activity/all/"
             t["engaged"] = rows(conn, "SELECT * FROM engagements WHERE lead_id = ? ORDER BY at DESC LIMIT 10", t["lead_id"])
     done_today = scalar(conn, "SELECT COUNT(*) FROM events WHERE type = 'task_done' AND at >= ?",
                         iso(utcnow().astimezone(local_tz()).replace(hour=0, minute=0, second=0)))
     camps = rows(conn, "SELECT id, name FROM campaigns WHERE status = 'active' ORDER BY name")
-    bot, wa = linkedin_bot.settings(conn), whatsapp_bot.settings(conn)
-    wa_on = wa["wa_mode"] == "bot" and not db.get_setting(conn, "wa_bot_paused")
-    ids = [t["lead_id"] for t in items if t["channel"] == engine.WHATSAPP]
-    wa_leads = {r["id"]: r for r in rows(conn, f"SELECT id, status, dnc, old_contact FROM leads WHERE id IN ({','.join('?' * len(ids))})", *ids)} if ids else {}
+    bot = linkedin_bot.settings(conn)
     for t in items:
-        if t["channel"] == engine.WHATSAPP:
-            t["wa_block"] = crm.wa_blocked(wa_leads.get(t["lead_id"]) or {})
-            t["wa_needs_ok"] = wa_on and wa["wa_approve"] and t["comment_status"] != "approved" and not t["wa_block"]
-            t["bot_will"] = (wa_on and t["bot_attempts"] < whatsapp_bot.MAX_ATTEMPTS and bool(t["wa"])
-                             and not t["wa_needs_ok"] and not t["wa_block"])
-        else:
-            t["bot_will"] = (bot["li_mode"] == "bot" and t["bot_attempts"] < linkedin_bot.MAX_ATTEMPTS
-                             and t["comment_status"] != "needs_approval")
+        t["bot_will"] = (bot["li_mode"] == "bot" and t["bot_attempts"] < linkedin_bot.MAX_ATTEMPTS
+                         and t["comment_status"] != "needs_approval")
     return page(request, "tasks.html", conn, tasks=items, campaigns=camps, campaign=campaign, done_today=done_today,
                 since=since, ai_ready=bool(os.environ.get("ANTHROPIC_API_KEY")))
+
+
+WA_RECENT_SQL = """
+    SELECT * FROM (
+      SELECT ev.lead_id, ev.at, ev.type kind, ev.detail, ev.content, c.name campaign FROM events ev
+      LEFT JOIN campaigns c ON c.id = ev.campaign_id
+      WHERE ev.channel = 'whatsapp' AND ev.type IN ('task_done', 'task_skipped', 'wa_out', 'wa_in', 'reply') AND ev.at >= ?
+      UNION ALL
+      SELECT a.lead_id, a.at, 'failed', a.detail, NULL, NULL FROM wa_actions a WHERE a.ok = 0 AND a.at >= ?
+      UNION ALL
+      SELECT a.lead_id, a.at, 'logged', a.outcome, a.notes, NULL FROM activities a WHERE a.kind = 'whatsapp' AND a.at >= ?)
+    ORDER BY at DESC LIMIT 60"""
+
+
+@app.get("/whatsapp")
+def whatsapp_queue(request: Request, campaign: int | None = None):
+    """Everything waiting to go out on WhatsApp (sequence steps and one-offs), plus the last two weeks' traffic."""
+    conn = db.connect()
+    items = open_tasks(conn, True, campaign)
+    prep_wa_tasks(conn, items)
+    outbox = rows(conn, """SELECT o.*, l.first_name, l.last_name, l.company, l.title, l.data, l.status lead_status,
+                                  l.dnc, l.old_contact FROM wa_outbox o JOIN leads l ON l.id = o.lead_id
+                           WHERE o.status IN ('draft', 'queued', 'failed') ORDER BY o.created_at, o.id""")
+    for o in outbox:
+        o["phone"] = lead_phone(o)
+        o["wa"] = wa_digits(o["phone"])
+        o["wa_block"] = crm.wa_blocked({"dnc": o["dnc"], "status": o["lead_status"], "old_contact": o["old_contact"]})
+    since = iso(utcnow() - timedelta(days=14))
+    recent = rows(conn, WA_RECENT_SQL, since, since, since)
+    names = {r["id"]: r for r in rows(conn, f"SELECT id, first_name, last_name, company FROM leads WHERE id IN "
+                                            f"({','.join('?' * len(recent)) or 'NULL'})", *[r["lead_id"] for r in recent])}
+    for r in recent:
+        r.update({k: (names.get(r["lead_id"]) or {}).get(k) for k in ("first_name", "last_name", "company")})
+        r["by_bot"] = (r["detail"] or "").startswith("by bot") or r["detail"] == "sent by the WhatsApp bot"
+        if r["kind"] == "task_done" and r["detail"]:
+            r["content"] = r["detail"].removeprefix("by bot · ")
+    cfg = whatsapp_bot.settings(conn)
+    now = utcnow()
+    bot = {**whatsapp_bot.status(conn), "cfg": cfg, "sent_today": whatsapp_bot.sent_today(conn, now),
+           "in_hours": whatsapp_bot.in_hours(cfg, now), "resting": whatsapp_bot.resting(conn, now),
+           "rest_until": db.get_setting(conn, "wa_bot_rest_until"), "read_at": db.get_setting(conn, "wa_read_at")}
+    camps = rows(conn, """SELECT DISTINCT c.id, c.name FROM campaigns c JOIN steps s ON s.campaign_id = c.id
+                          WHERE c.status = 'active' AND s.channel = 'whatsapp' ORDER BY c.name""")
+    return page(request, "whatsapp.html", conn, tasks=items, outbox=outbox, recent=recent, bot=bot,
+                campaigns=camps, campaign=campaign, waiting=len(items) + len(outbox))
 
 
 @app.post("/api/tasks/{task_id}")
@@ -435,7 +509,7 @@ async def task_action(task_id: int, request: Request):
         engine.complete_task(conn, task_id, body["action"], body.get("body"), engage=body.get("engage"))
     except ValueError as e:
         raise HTTPException(409, str(e))
-    return {"ok": True, "open": scalar(conn, OPEN_TASKS_SQL)}
+    return open_counts(conn)
 
 
 @app.post("/api/tasks/{task_id}/approve")
@@ -449,7 +523,7 @@ async def task_approve(task_id: int, request: Request):
                        "AND comment_status = 'needs_approval'", (comment, task_id))
     if not cur.rowcount:
         raise HTTPException(409, "task already handled")
-    return {"ok": True, "open": scalar(conn, OPEN_TASKS_SQL)}
+    return open_counts(conn)
 
 
 @app.post("/api/tasks/{task_id}/wa-approve")
@@ -465,7 +539,7 @@ async def task_wa_approve(task_id: int, request: Request):
         raise HTTPException(409, "task already handled")
     import threading
     threading.Thread(target=runner.run_wa, daemon=True).start()
-    return {"ok": True, "open": scalar(conn, OPEN_TASKS_SQL)}
+    return open_counts(conn)
 
 
 @app.post("/api/tasks/{task_id}/draft")
