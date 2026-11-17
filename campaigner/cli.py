@@ -65,6 +65,45 @@ def cmd_linkedin_check(a):
             d.close()
 
 
+def cmd_whatsapp_login(a):
+    from . import db, whatsapp_bot
+
+    with whatsapp_bot.PROFILE_LOCK:
+        d = whatsapp_bot.WhatsAppDriver(headless=False)
+        d.open()
+        try:
+            print("A Chrome window opened on WhatsApp Web. On your phone: WhatsApp → Linked devices → Link a device, "
+                  "then scan the QR code (waiting up to 10 minutes)...", flush=True)
+            ok = d.login_interactive()
+        finally:
+            d.close()
+    conn = db.connect()
+    db.set_setting(conn, "wa_bot_signed_in", ok)
+    if ok:
+        whatsapp_bot.resume(conn)
+    print("Linked. Turn the bot on in Settings → WhatsApp automation." if ok else "Not linked (timed out).")
+
+
+def cmd_whatsapp_check(a):
+    """Read-only: open one chat in the bot's window and report what it finds. Types and sends nothing."""
+    import json
+    from . import whatsapp_bot
+    from .render import wa_digits
+
+    digits = wa_digits(a.phone)
+    if not digits:
+        sys.exit("give the number with its country code, e.g. +44 7700 900123")
+    with whatsapp_bot.PROFILE_LOCK:
+        d = whatsapp_bot.WhatsAppDriver(headless=False)
+        d.open()
+        try:
+            print(json.dumps(d.check(digits), indent=2, ensure_ascii=False))
+        except whatsapp_bot.BlockedError as e:
+            sys.exit(f"blocked: {e}. Run {OC} whatsapp-login")
+        finally:
+            d.close()
+
+
 def cmd_tracker_setup(a):
     """Generate the shared tracking secrets into .env (once) and print the Cloudflare deploy steps."""
     import secrets
@@ -310,6 +349,13 @@ def main() -> None:
     s = sub.add_parser("linkedin-check", help="read-only test of the bot on one profile (clicks nothing)")
     s.add_argument("profile_url")
     s.set_defaults(fn=cmd_linkedin_check)
+
+    s = sub.add_parser("whatsapp-login", help="link the WhatsApp bot's Chrome profile (you scan the QR code)")
+    s.set_defaults(fn=cmd_whatsapp_login)
+
+    s = sub.add_parser("whatsapp-check", help="read-only test of the WhatsApp bot on one chat (sends nothing)")
+    s.add_argument("phone")
+    s.set_defaults(fn=cmd_whatsapp_check)
 
     s = sub.add_parser("tracker-setup", help="generate tracking secrets into .env and print Cloudflare deploy steps")
     s.add_argument("--domain", help="tracking subdomain, e.g. links.yourcompany.com")

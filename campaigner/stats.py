@@ -209,7 +209,7 @@ def campaign_status(conn, campaign_id: int | None, tz) -> tuple[list[str], list[
     for t in rows(conn, f"""SELECT enrollment_id, done_at FROM tasks WHERE enrollment_id IN ({marks})
                             AND channel = 'li_message' AND status = 'done' ORDER BY done_at""", *ids):
         msgs.setdefault(t["enrollment_id"], []).append(day(t["done_at"]))
-    evs = rows(conn, f"""SELECT enrollment_id, type, step_pos, at FROM events WHERE enrollment_id IN ({marks})
+    evs = rows(conn, f"""SELECT enrollment_id, type, step_pos, at, detail, content FROM events WHERE enrollment_id IN ({marks})
                          AND channel = 'email' AND type IN ('sent', 'bounce', 'auto_reply') ORDER BY at, id""", *ids)
     for ev in evs:
         out = mails.setdefault(ev["enrollment_id"], [])
@@ -218,19 +218,25 @@ def campaign_status(conn, campaign_id: int | None, tz) -> tuple[list[str], list[
         elif out and ev["type"] == "bounce":
             match = [m for m in out if m["step"] == ev["step_pos"]] or out[-1:]
             match[-1]["text"] = "Undelivered"
-        elif out and ev["type"] == "auto_reply" and "OOO" not in out[-1]["text"]:
-            out[-1]["text"] += " (OOO)"
+        elif out and ev["type"] == "auto_reply":
+            match = [m for m in out if m["step"] == ev["step_pos"]] or out[-1:]
+            if "(" in match[-1]["text"] or match[-1]["text"] == "Undelivered":
+                continue
+            info = crm.auto_reply_info(ev["detail"], ev["content"], ev["at"])
+            match[-1]["text"] += (" (left company?)" if info["kind"] == "left" else
+                                  f" (OOO, back {info['back'].strftime('%d-%b')})" if info["back"] else " (OOO)")
     likes, comments, engage_state = _engagement(conn, ids, marks, day)
     summ = crm.summaries(conn, campaign_id=campaign_id)
     today = datetime.now(tz).date().isoformat()
     n_li = max([2] + [len(v) for v in msgs.values()])
     n_em = max([2] + [len(v) for v in mails.values()])
     cols = ["#", *([] if campaign_id else ["Campaign"]), "Name", "First Name", "Last Name", "Designation", "Department", "Company", "Email", "Phone",
-            "Country", "LinkedIn", "Owner", "Lead Status", "Status Note", "LI Status",
+            "Country", "LinkedIn", "Owner", "Tags", "Lead Status", "Status Note", "LI Status",
             *[f"LI {_nth(i + 1)} Msg" for i in range(n_li)], "LI Likes", "LI Comments",
             *[f"EM{i + 1}" for i in range(n_em)],
             "WhatsApp", *[f"VM{i + 1}" for i in range(N_VOICEMAILS)], "Calls", "Last Call", "Last Contacted",
             "Next Follow-up", "Next Step", "Last Touch", "Touches"]
+    tag_map = crm.tags_of(conn, {e["id"] for e in ens})
     out = []
     for n, e in enumerate(ens, start=1):
         extra = json.loads(e["data"] or "{}")
@@ -250,7 +256,8 @@ def campaign_status(conn, campaign_id: int | None, tz) -> tuple[list[str], list[
             ("in", sm.get("email_in", 0) + sm.get("li_in", 0) + sm.get("wa_in", 0))) if n)
         values = [n, *([] if campaign_id else [e["campaign"]]), f"{e['first_name']} {e['last_name']}".strip(), e["first_name"], e["last_name"], e["title"],
                   extra.get("department", ""), e["company"], e["email"] or "", lead_phone(e),
-                  extra.get("country", ""), e["linkedin_url"] or "", e["owner"] or "", e["status"], status, li,
+                  extra.get("country", ""), e["linkedin_url"] or "", e["owner"] or "", ", ".join(tag_map.get(e["id"], [])),
+                  e["status"], status, li,
                   *li_cells, _dates(likes.get(e["eid"], [])) or engage_state.get(e["eid"], {}).get("likes", ""),
                   _dates(comments.get(e["eid"], [])) or engage_state.get(e["eid"], {}).get("comments", ""),
                   *(em + [""] * n_em)[:n_em], _dates([day(x) for x in sm.get("wa_dates", [])]), *vms,
@@ -265,6 +272,7 @@ def campaign_status(conn, campaign_id: int | None, tz) -> tuple[list[str], list[
                     "next_due": bool(nx and nx["date"] and nx["date"] <= today),
                     "followup_due": bool(e["next_followup_at"] and e["next_followup_at"] <= today and not e["dnc"]),
                     "status": e["status"], "email": e["email"] or "", "wa": wa_digits(lead_phone(e)),
+                    "wa_block": crm.wa_blocked({"dnc": e["dnc"], "status": e["status"], "old_contact": e.get("old_contact")}) or "",
                     "cells": dict(zip(cols, values))})
     return cols, out
 

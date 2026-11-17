@@ -122,6 +122,46 @@
       </form>
     </section>
 
+    <section class="card" id="whatsapp-bot">
+      <div class="card-head"><h2>WhatsApp automation</h2>
+        {% if wa.wa_mode == "bot" %}{% if wa_status.paused %}<span class="pill critical">paused</span>{% else %}<span class="pill good">bot on</span>{% endif %}{% else %}<span class="pill muted">assisted</span>{% endif %}
+      </div>
+      {% if wa_status.paused %}
+        <div class="flash err">Paused: {{ wa_status.paused.reason }} ({{ wa_status.paused.at | ago }}). Open the bot's window with <b>Link WhatsApp</b>, fix what it shows (scan the code again if it's signed out), then resume.
+          <div style="margin-top:8px"><button class="btn sm primary" id="wa-resume">Resume bot</button></div></div>
+      {% endif %}
+      <p class="meta">In <b>bot</b> mode a dedicated Chrome window runs WhatsApp Web, linked to your phone like any other computer. It sends the WhatsApp messages from your sequences once you approve them in the Task queue, sends the one-offs you write on a lead's page, and reads replies (a reply stops their sequences like any other). <b>Only Warm and Converted leads and people marked as old contacts are ever messaged</b>; everyone else's WhatsApp steps are skipped. WhatsApp bans numbers it sees messaging strangers in bulk or running automation, so keep this to people who know you and keep the cap low.</p>
+      <p>
+        <button class="btn" id="wa-login">{{ "Re-open WhatsApp Web" if wa_status.signed_in else "Link WhatsApp" }}</button>
+        <span class="meta" id="wa-login-state">{% if wa_status.signed_in %}Bot profile linked.{% else %}Opens a Chrome window with a QR code: scan it with your phone (one time).{% endif %}
+          {% if wa_login_state.state == "failed" %} Last attempt failed: {{ wa_login_state.error }}{% endif %}</span>
+      </p>
+      <form method="post" action="/settings/whatsapp-bot">
+        <div class="days" style="margin-bottom:12px">
+          <label><input type="radio" name="wa_mode" value="assisted" {{ 'checked' if wa.wa_mode != 'bot' }}> Assisted (you send from the queue)</label>
+          <label><input type="radio" name="wa_mode" value="bot" {{ 'checked' if wa.wa_mode == 'bot' }}> Bot sends them</label>
+        </div>
+        <div class="days" style="margin-bottom:12px">
+          <label><input type="checkbox" name="wa_approve" value="1" {{ 'checked' if wa.wa_approve }}> Sequence messages wait for my approval (recommended)</label>
+          <label><input type="checkbox" name="wa_read" value="1" {{ 'checked' if wa.wa_read }}> Read replies</label>
+        </div>
+        <div class="form-grid">
+          <label class="f">Messages per day (max {{ wa_ceiling }}) · sent today {{ wa_used }}<input type="number" min="0" max="{{ wa_ceiling }}" name="wa_daily_cap" value="{{ wa.wa_daily_cap }}"></label>
+          <label class="f">Gap between messages, min s<input type="number" min="30" name="gap_min" value="{{ wa.wa_gap[0] }}"></label>
+          <label class="f">Gap between messages, max s<input type="number" min="30" name="gap_max" value="{{ wa.wa_gap[1] }}"></label>
+          <label class="f">Hours start<input type="time" name="hours_start" value="{{ wa.wa_hours[0] }}"></label>
+          <label class="f">Hours end<input type="time" name="hours_end" value="{{ wa.wa_hours[1] }}"></label>
+        </div>
+        <div class="days" style="margin:12px 0">
+          {% for d in ["mon", "tue", "wed", "thu", "fri", "sat", "sun"] %}
+            <label><input type="checkbox" name="days" value="{{ d }}" {{ 'checked' if d in wa.wa_days }}> {{ d }}</label>
+          {% endfor %}
+        </div>
+        <p class="meta">Paced like a person: 1–4 messages a session, typed at reading pace, minutes apart, then 10–40 minutes off; never more than {{ wa_hour_cap }} in an hour. Each message is checked just before it goes: anyone no longer Warm, Converted or an old contact is skipped. Replies are read every 20 minutes from chats the app wrote to in the last 30 days.</p>
+        <button class="btn">Save</button>
+      </form>
+    </section>
+
     <section class="card">
       <div class="card-head"><h2>LinkedIn engagement</h2></div>
       <p class="meta">For leads whose invite or first email has gone out, the queue gets a <i>Like + comment</i> task for one of their recent posts. It stops when they reply on any channel, and campaigns can turn it off in their Settings tab.</p>
@@ -200,6 +240,22 @@
       pollLi();
     } catch (e) { toast(e.message, true); }
   });
+  $("#wa-resume")?.addEventListener("click", async () => {
+    try { await api("/api/whatsapp/resume"); location.reload(); } catch (e) { toast(e.message, true); }
+  });
+  $("#wa-login")?.addEventListener("click", async () => {
+    try {
+      await api("/api/whatsapp/login");
+      $("#wa-login-state").textContent = "A Chrome window opened on WhatsApp Web. On your phone: WhatsApp → Linked devices → Link a device, and scan the code. This page updates when it's linked.";
+      pollWa();
+    } catch (e) { toast(e.message, true); }
+  });
+  async function pollWa() {
+    const s = await (await fetch("/api/state")).json();
+    if (s.wa_login.state === "waiting") return setTimeout(pollWa, 2000);
+    if (s.wa_login.state === "done") location.reload();
+    if (s.wa_login.state === "failed") $("#wa-login-state").textContent = "Linking failed: " + s.wa_login.error;
+  }
   async function pollLi() {
     const s = await (await fetch("/api/state")).json();
     if (s.li_login.state === "waiting") return setTimeout(pollLi, 2000);

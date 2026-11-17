@@ -29,7 +29,8 @@
     <tbody>
     {% for d in drafts %}
       <tr data-draft="{{ d.id }}">
-        <td><a href="/leads/{{ d.lead_id }}">{{ d.first_name }} {{ d.last_name }}</a><div class="meta">{{ d.company }} · {{ d.to_email }}</div></td>
+        <td><a href="/leads/{{ d.lead_id }}">{{ d.first_name }} {{ d.last_name }}</a><div class="meta">{{ d.company }} · {{ d.to_email }}</div>
+          {% if d.ooo %}<span class="pill {{ 'critical' if d.ooo.kind == 'left' else 'warning' }}" title="Automatic reply received {{ d.ooo.at | ago }}">{{ d.ooo.label }}</span>{% endif %}</td>
         <td>{{ "Re: " if d.threaded and not d.subject.lower().startswith("re:") }}{{ d.subject }}<div class="meta">from {{ d.sender }}{% if d.threaded %} · reply in their thread{% endif %}</div></td>
         <td class="meta">{{ d.campaign or "one-off" }}{% if d.step_pos is not none %} · step {{ d.step_pos + 1 }}/{{ d.n_steps }}{% endif %}</td>
         <td class="meta">{{ d.created_at | ago }}</td>

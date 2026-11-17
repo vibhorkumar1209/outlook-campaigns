@@ -8,7 +8,7 @@ from collections import deque
 from contextlib import contextmanager
 from datetime import datetime
 
-from . import ai, db, engine, linkedin_bot, updater
+from . import ai, db, engine, linkedin_bot, updater, whatsapp_bot
 from .db import iso, utcnow
 from .graph import Graph, accounts, login, logout
 from .osutil import KeepAwake, open_lock, try_lock, unlock
@@ -44,6 +44,7 @@ class Runner:
         self.busy = False
         self.login_state = {"state": "idle", "error": None}
         self.li_login_state = {"state": "idle", "error": None}
+        self.wa_login_state = {"state": "idle", "error": None}
         self._lock = threading.Lock()
 
     def request_restart(self) -> None:
@@ -90,9 +91,21 @@ class Runner:
         except Exception as e:
             self.log(f"LinkedIn bot run crashed: {e!r}")
 
+    def run_wa(self) -> None:
+        """One WhatsApp bot pass: reads replies when due and sends a few approved messages."""
+        try:
+            conn = db.connect()
+            try:
+                whatsapp_bot.run(conn, whatsapp_bot.WhatsAppDriver, log=self.log)
+            finally:
+                conn.close()
+        except Exception as e:
+            self.log(f"WhatsApp bot run crashed: {e!r}")
+
     def run_async(self) -> None:
         threading.Thread(target=self.run_once, daemon=True).start()
         threading.Thread(target=self.run_bot, daemon=True).start()
+        threading.Thread(target=self.run_wa, daemon=True).start()
 
     def start_loop(self, minutes: int) -> None:
         """Email: a quick pass every minute (send what's due); the inbox-wide checks every `minutes`.
@@ -126,8 +139,15 @@ class Runner:
                 self.run_bot()
                 time.sleep(180)
 
+        def wa_loop():
+            time.sleep(60)
+            while True:
+                self.run_wa()
+                time.sleep(240)
+
         threading.Thread(target=email_loop, daemon=True, name="email").start()
         threading.Thread(target=bot_loop, daemon=True, name="linkedin-bot").start()
+        threading.Thread(target=wa_loop, daemon=True, name="whatsapp-bot").start()
 
     def start_login(self) -> None:
         def go():
@@ -167,6 +187,35 @@ class Runner:
                     d.close()
                 finally:
                     linkedin_bot.PROFILE_LOCK.release()
+
+        threading.Thread(target=go, daemon=True).start()
+
+    def start_wa_login(self) -> None:
+        """Open the WhatsApp bot's Chrome window on WhatsApp Web; you scan the QR code with your phone."""
+        def go():
+            if not whatsapp_bot.PROFILE_LOCK.acquire(blocking=False):
+                self.wa_login_state = {"state": "failed", "error": "the bot is using its browser right now; try again shortly"}
+                return
+            self.wa_login_state = {"state": "waiting", "error": None}
+            d = whatsapp_bot.WhatsAppDriver(headless=False)
+            try:
+                d.open()
+                ok = d.login_interactive()
+                conn = db.connect()
+                db.set_setting(conn, "wa_bot_signed_in", ok)
+                if ok:
+                    whatsapp_bot.resume(conn)
+                conn.close()
+                self.wa_login_state = {"state": "done" if ok else "failed",
+                                       "error": None if ok else "not linked within 10 minutes"}
+                self.log("WhatsApp bot linked" if ok else "WhatsApp linking timed out")
+            except Exception as e:
+                self.wa_login_state = {"state": "failed", "error": str(e)}
+            finally:
+                try:
+                    d.close()
+                finally:
+                    whatsapp_bot.PROFILE_LOCK.release()
 
         threading.Thread(target=go, daemon=True).start()
 

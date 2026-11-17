@@ -55,10 +55,10 @@ def apply() -> str:
 
 
 def exit_when_idle(runner, wait: float = 5) -> None:
-    """Exit once no run is in progress and the LinkedIn bot's Chrome is closed, holding both locks so nothing new
+    """Exit once no run is in progress and the LinkedIn and WhatsApp bots' Chrome windows are closed, holding both locks so nothing new
     starts. launchd (macOS) or the supervisor (Windows) starts the dashboard again on the new code. Never mid-send:
     exiting during a send could send that email twice."""
-    from . import linkedin_bot
+    from . import linkedin_bot, whatsapp_bot
     from .runner import tick_lock
 
     def go():
@@ -66,11 +66,13 @@ def exit_when_idle(runner, wait: float = 5) -> None:
         while True:
             if runner._lock.acquire(blocking=False):
                 if linkedin_bot.PROFILE_LOCK.acquire(blocking=False):
-                    with tick_lock() as ok:
-                        if ok:
-                            runner.log("restarting now")
-                            time.sleep(0.5)
-                            os._exit(0)
+                    if whatsapp_bot.PROFILE_LOCK.acquire(blocking=False):
+                        with tick_lock() as ok:
+                            if ok:
+                                runner.log("restarting now")
+                                time.sleep(0.5)
+                                os._exit(0)
+                        whatsapp_bot.PROFILE_LOCK.release()
                     linkedin_bot.PROFILE_LOCK.release()
                 runner._lock.release()
             time.sleep(wait)

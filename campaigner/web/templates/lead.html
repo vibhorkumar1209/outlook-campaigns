@@ -9,16 +9,18 @@
   "open": "Opened email", "click": "Clicked link", "unsubscribe": "Unsubscribed", "resumed": "Sequence resumed",
   "auto_reply": "Automatic reply (sequence continues)", "reply_ignored": "Not a reply (ignored)",
   "draft_created": "Email drafted (waiting for approval)", "status": "Status changed",
-  "email_in": "Email received", "email_out": "Email written in Outlook"} %}
+  "email_in": "Email received", "email_out": "Email written in Outlook",
+  "wa_in": "WhatsApp received", "wa_out": "WhatsApp sent (bot)"} %}
 <header class="head">
   <div>
-    <h1>{{ lead_name(l) }} <span class="pill {{ LEAD_TONE[l.status] }}">{{ l.status }}</span> {% if l.li_state != "none" %}{{ pill(l.li_state) }}{% endif %}{% if l.dnc %} <span class="pill critical">do not contact</span>{% endif %} {% if l.stage == "lead" %}<span class="pill good">lead</span>{% else %}<span class="pill muted">prospect</span>{% endif %}</h1>
+    <h1>{{ lead_name(l) }} <span class="pill {{ LEAD_TONE[l.status] }}">{{ l.status }}</span> {% if l.li_state != "none" %}{{ pill(l.li_state) }}{% endif %}{% if l.dnc %} <span class="pill critical">do not contact</span>{% endif %}{% if ooo %} <span class="pill {{ 'critical' if ooo.kind == 'left' else 'warning' }}">{{ ooo.label }}</span>{% endif %}{% if l.old_contact %} <span class="tag" title="Old contact: WhatsApp allowed">old contact</span>{% endif %} {% if l.stage == "lead" %}<span class="pill good">lead</span>{% else %}<span class="pill muted">prospect</span>{% endif %}</h1>
     <p class="sub">{{ l.title }}{% if l.title and l.company %} · {% endif %}{{ l.company }}</p>
   </div>
   <div class="actions">
     {% if not l.dnc %}<button class="btn primary" data-compose data-lead="{{ l.id }}" data-name="{{ lead_name(l) }}" data-company="{{ l.company }}"
             data-email="{{ l.email or '' }}" data-wa="{{ wa }}" data-linkedin="{{ l.linkedin_url or '' }}" data-first="{{ l.first_name }}"
-            data-thread="{{ '1' if has_thread }}">Send email / message</button>{% endif %}
+            data-thread="{{ '1' if has_thread }}" data-wa-bot="{{ '1' if wa_bot_on and not wa_block else '' }}"
+            data-wa-block="{{ wa_block or '' }}">Send email / message</button>{% endif %}
     <button class="btn" data-log data-lead="{{ l.id }}" data-name="{{ lead_name(l) }}" data-company="{{ l.company }}"
             data-phone="{{ phone }}" data-owner="{{ l.owner_id or '' }}" data-status="{{ l.status }}">Log call / note</button>
     {% if l.linkedin_url %}<a class="btn" href="{{ l.linkedin_url }}" target="_blank" rel="noopener">LinkedIn ↗</a>{% endif %}
@@ -43,6 +45,13 @@
 </header>
 
 {% if lead_drafts %}<div class="flash">{{ lead_drafts | length }} email draft{{ "s" if lead_drafts | length != 1 }} to {{ l.first_name or "this lead" }} {{ "is" if lead_drafts | length == 1 else "are" }} waiting: <a href="/drafts">review and send →</a></div>{% endif %}
+{% if ooo %}<div class="flash">{% if ooo.kind == "left" %}{{ l.first_name or "They" }}'s mailbox replied automatically {{ ooo.at | ago }} that they may no longer be with {{ l.company or "the company" }}. Check before the next email.{% else %}{{ l.first_name or "They" }} sent an out-of-office reply {{ ooo.at | ago }}{% if ooo.back %}: back {{ ooo.back.strftime("%a %d %b") }}{% endif %}. Their sequence carries on; hold or skip a draft in <a href="/drafts">Email drafts</a> if it would land while they're away.{% endif %}</div>{% endif %}
+{% if wa_outbox %}<div class="flash">WhatsApp {{ "message" if wa_outbox | length == 1 else "messages" }} to {{ l.first_name or "this lead" }}:
+  {% for o in wa_outbox %}<div class="wa-out">{{ o.body }}
+    <div class="meta" style="white-space:normal">{% if o.status == "queued" %}Queued for the WhatsApp bot{% if wa_status.paused %} (paused){% endif %}{% elif o.status == "draft" %}Draft{% else %}Couldn't send: {{ o.note }}{% endif %} · {{ o.created_at | ago }}
+      {% if o.status in ("draft", "failed") and wa_bot_on and not wa_block %}<button class="btn sm primary" data-wa-outbox="{{ o.id }}" data-act="send">Send via bot</button>{% endif %}
+      <button class="btn sm ghost" data-wa-outbox="{{ o.id }}" data-act="cancel" data-ask="Drop this WhatsApp message?">{{ "Cancel" if o.status == "queued" else "Discard" }}</button></div></div>{% endfor %}
+</div>{% endif %}
 {% if l.email_bounced %}<div class="flash err">Email to <b>{{ l.email }}</b> bounced, so email steps are skipped for this person while LinkedIn steps carry on. Fix the address under Details and later emails go out normally.</div>{% endif %}
 <div class="grid2">
   <div class="stack-y">
@@ -104,6 +113,17 @@
           <dt>Last touch</dt><dd>{% if summary.last %}{{ summary.last.label }}, {{ summary.last.at | ago }}{% else %}–{% endif %}</dd>
         </dl>
       </div>
+    </section>
+
+    <section class="card">
+      <div class="card-head"><h2>Tags</h2><span class="meta">up to {{ max_tags }} · for filtering lists</span></div>
+      <div class="tags" id="lead-tags" data-lead="{{ l.id }}" data-max="{{ max_tags }}" style="margin-bottom:8px">
+        {% for t in tags %}<span class="tag" data-tag="{{ t }}"><a href="/{{ 'leads' if l.stage == 'lead' else 'prospects' }}?tag={{ t | urlencode }}" style="color:inherit;text-decoration:none">{{ t }}</a><button type="button" data-untag="{{ t }}" aria-label="Remove tag {{ t }}">✕</button></span>{% else %}<span class="meta">No tags yet.</span>{% endfor %}
+      </div>
+      {% if tags | length < max_tags %}<input id="tag-new" list="all-tags" placeholder="Add a tag, e.g. Fintech, P1, 2025 · Enter" aria-label="Add a tag" style="width:100%">
+      <datalist id="all-tags">{% for t in all_tags %}<option value="{{ t.tag }}">{% endfor %}</datalist>{% endif %}
+      <label style="display:flex;gap:8px;align-items:center;margin-top:12px"><input type="checkbox" id="old-contact" data-lead="{{ l.id }}" {{ 'checked' if l.old_contact }}> Old contact: someone you already know (WhatsApp allowed)</label>
+      <p class="meta" style="margin:4px 0 0">WhatsApp: {% if wa_block %}<span style="color:var(--warning)">not used for {{ l.first_name or "this lead" }}</span> ({{ wa_block }}).{% else %}allowed ({{ "old contact" if l.old_contact else l.status }}).{% endif %}</p>
     </section>
 
     <section class="card">

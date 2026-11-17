@@ -8,7 +8,7 @@
           <button class="btn sm" data-log data-lead="{{ r.lead_id }}" data-name="{{ r.cells['Name'] }}" data-company="{{ r.cells['Company'] }}"
                   data-phone="{{ r.phone }}" data-campaign="{{ r.campaign_id }}" data-owner="{{ r.owner_id or '' }}" data-status="{{ r.status }}" title="Log a call, meeting, message or note">Log</button>
           <button class="btn sm ghost" data-compose data-lead="{{ r.lead_id }}" data-name="{{ r.cells['Name'] }}" data-company="{{ r.cells['Company'] }}"
-                  data-email="{{ r.email }}" data-wa="{{ r.wa }}" data-linkedin="{{ r.cells['LinkedIn'] }}" data-first="{{ r.cells['First Name'] }}" title="Send an email or message">Send</button>
+                  data-email="{{ r.email }}" data-wa="{{ r.wa }}" data-wa-block="{{ r.wa_block }}" data-wa-bot="{{ '1' if wa_bot_on and not r.wa_block else '' }}" data-linkedin="{{ r.cells['LinkedIn'] }}" data-first="{{ r.cells['First Name'] }}" title="Send an email or message">Send</button>
           <button class="btn sm ghost" data-history="{{ r.lead_id }}" aria-expanded="false" title="Every email, LinkedIn message and call">History</button>
         </div></td>
         {% for k in status_cols %}{% set v = r.cells[k] %}

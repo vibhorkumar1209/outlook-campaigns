@@ -197,6 +197,37 @@ CREATE TABLE IF NOT EXISTS email_drafts (
     approved_at TEXT,
     done_at TEXT
 );
+-- Up to six free-text tags per lead (industry, priority, year...), for filtering lists. Matched case-insensitively.
+CREATE TABLE IF NOT EXISTS lead_tags (
+    lead_id INTEGER NOT NULL REFERENCES leads(id) ON DELETE CASCADE,
+    tag TEXT NOT NULL COLLATE NOCASE,
+    PRIMARY KEY (lead_id, tag)
+);
+CREATE INDEX IF NOT EXISTS ix_lead_tags_tag ON lead_tags (tag);
+
+-- One-off WhatsApp messages written on a lead's page, for the WhatsApp bot to send (sequence messages are tasks).
+CREATE TABLE IF NOT EXISTS wa_outbox (
+    id INTEGER PRIMARY KEY,
+    lead_id INTEGER NOT NULL REFERENCES leads(id) ON DELETE CASCADE,
+    body TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'queued',          -- draft|queued|sent|failed|cancelled
+    attempts INTEGER NOT NULL DEFAULT 0,
+    note TEXT,
+    created_at TEXT NOT NULL,
+    sent_at TEXT
+);
+
+-- Every message the WhatsApp bot sends or tries to (its own caps, apart from LinkedIn's bot_actions).
+CREATE TABLE IF NOT EXISTS wa_actions (
+    id INTEGER PRIMARY KEY,
+    task_id INTEGER,
+    outbox_id INTEGER,
+    lead_id INTEGER,
+    ok INTEGER NOT NULL,
+    detail TEXT,
+    at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS ix_drafts_status ON email_drafts (status);
 CREATE INDEX IF NOT EXISTS ix_drafts_enrollment ON email_drafts (enrollment_id, step_pos);
 CREATE INDEX IF NOT EXISTS ix_sends_campaign ON sends (campaign_id, step_pos);
@@ -242,6 +273,8 @@ MIGRATIONS = [
     ("leads", "next_followup_at", "TEXT"),                         # from status cadence, or the next step you set
     ("leads", "followup_snoozed_until", "TEXT"),
     ("campaigns", "email_mode", "TEXT NOT NULL DEFAULT 'draft'"),  # draft: emails wait for your approval | auto
+    ("leads", "old_contact", "INTEGER NOT NULL DEFAULT 0"),        # someone you already know: WhatsApp allowed
+    ("campaigns", "audience", "TEXT NOT NULL DEFAULT 'new'"),      # new: cold outreach | warm: leads who replied, old contacts
 ]
 
 

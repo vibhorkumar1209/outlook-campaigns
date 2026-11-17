@@ -1971,9 +1971,10 @@ class WhatsAppTest(Base):
         super().setUp()
         self.wid = self.campaign([("whatsapp", 0, None, "Hi {{ first_name }}, **quick** one"),
                                   ("email", 1, "Hi", "Hello")], name="wa")
-        importer.import_rows(self.conn, [{"Email": "pat@x.com", "Name": "Pat Kim", "Mobile": "+1 (440) 555-0100"},
-                                         {"Email": "nop@x.com", "Name": "No Phone"}],
-                             importer.guess_mapping(["Email", "Name", "Mobile"]), self.wid)
+        importer.import_rows(self.conn, [{"Email": "pat@x.com", "Name": "Pat Kim", "Mobile": "+1 (440) 555-0100", "Old contact": "yes"},
+                                         {"Email": "nop@x.com", "Name": "No Phone", "Old contact": "yes"},
+                                         {"Email": "new@x.com", "Name": "New Person", "Mobile": "+1 440 555 0199"}],
+                             importer.guess_mapping(["Email", "Name", "Mobile", "Old contact"]), self.wid)
         self.conn.execute("UPDATE enrollments SET enrolled_at = ? WHERE campaign_id = ?", (iso(MON), self.wid))
 
     def test_whatsapp_step_is_a_task_and_skips_without_a_phone(self):
@@ -1984,6 +1985,10 @@ class WhatsAppTest(Base):
         self.assertEqual((t["channel"], t["body"]), ("whatsapp", "Hi Pat, *quick* one"))
         nop = one(self.conn, "SELECT e.* FROM enrollments e JOIN leads l ON l.id = e.lead_id WHERE l.email = 'nop@x.com'")
         self.assertEqual(nop["step_pos"], 0)                                       # skipped: no number to message
+        new = one(self.conn, "SELECT e.* FROM enrollments e JOIN leads l ON l.id = e.lead_id WHERE l.email = 'new@x.com'")
+        self.assertEqual(new["step_pos"], 0)                                       # skipped: a stranger, not a warm lead
+        self.assertEqual(scalar(self.conn, "SELECT detail FROM events WHERE enrollment_id = ? AND type = 'step_skipped'", new["id"]),
+                         "WhatsApp is only for Warm leads and old contacts")
         d = FakeDriver()
         db.set_setting(self.conn, "li_mode", "bot")
         db.set_setting(self.conn, "li_bot_hours", ["00:00", "23:59"])
@@ -2037,3 +2042,270 @@ class MailSyncTest(Base):
         bob = one(self.conn, "SELECT id FROM leads WHERE email = 'bob@x.com'")["id"]
         self.assertEqual([c["label"] for c in crm.communications(self.conn, lead_id=bob) if c["channel"] == "email"],
                          ["Email · step 2"])
+
+
+class TagsTest(Base):
+    def lid(self, email):
+        return one(self.conn, "SELECT id FROM leads WHERE email = ?", email)["id"]
+
+    def test_tags_are_capped_and_match_any_case(self):
+        jane, bob = self.lid("jane@x.com"), self.lid("bob@x.com")
+        self.assertEqual(crm.set_tags(self.conn, jane, "Fintech, P1; 2025, fintech"), ["Fintech", "P1", "2025"])
+        with self.assertRaises(ValueError):
+            crm.set_tags(self.conn, jane, ["a", "b", "c", "d", "e", "f", "g"])
+        self.assertEqual(crm.set_tags(self.conn, bob, ["FINTECH"]), ["Fintech"])   # joins the spelling in use
+        r = crm.add_tags(self.conn, [jane, bob], "Q4, p1")
+        self.assertEqual(r, {"tagged": 2, "full": 0})
+        self.assertEqual(crm.tags_of(self.conn, [bob])[bob], ["Fintech", "Q4", "P1"])
+        crm.set_tags(self.conn, jane, ["1", "2", "3", "4", "5", "6"])
+        self.assertEqual(crm.add_tags(self.conn, [jane, bob], "Seven"), {"tagged": 1, "full": 1})
+        self.assertEqual(crm.remove_tag(self.conn, [jane, bob], "seven"), 1)
+        self.assertEqual({t["tag"]: t["n"] for t in crm.all_tags(self.conn)}["Fintech"], 1)
+        sql, args = crm.tag_filter_sql(["fintech", "q4"])
+        got = [r["id"] for r in rows(self.conn, "SELECT l.id FROM leads l WHERE 1" + sql, *args)]
+        self.assertEqual(got, [bob])
+
+    def test_import_tags_and_old_contacts(self):
+        s = importer.import_rows(self.conn, [
+            {"Email": "jane@x.com", "Tags": "Fintech, P1", "Old contact": "Yes"},
+            {"Email": "new@x.com", "Name": "New One", "Tags": "a,b,c,d,e,f,g"}],
+            importer.guess_mapping(["Email", "Name", "Tags", "Old contact"]), None)
+        jane, new = self.lid("jane@x.com"), self.lid("new@x.com")
+        self.assertEqual(crm.tags_of(self.conn, [jane])[jane], ["Fintech", "P1"])
+        self.assertEqual(len(crm.tags_of(self.conn, [new])[new]), crm.MAX_TAGS)
+        self.assertTrue(any("only 6 tags" in x for x in s["skipped"]))
+        self.assertEqual(one(self.conn, "SELECT old_contact FROM leads WHERE id = ?", jane)["old_contact"], 1)
+
+    def test_warm_campaign_takes_people_who_replied(self):
+        jane = self.lid("jane@x.com")
+        engine.mark_replied(self.conn, jane, "email", MON, detail="hi")
+        cold = self.campaign([("email", 0, "Hi", "Hi")], name="cold")
+        warm = self.campaign([("whatsapp", 0, None, "Hi {{ first_name }}")], name="nurture", audience="warm")
+        self.assertEqual(importer.enroll_leads(self.conn, [jane], cold)["not_enrolled"], 1)
+        self.assertEqual(importer.enroll_leads(self.conn, [jane], warm)["enrolled"], 1)
+        self.assertEqual(importer.enroll_leads(self.conn, [jane], warm)["already_enrolled"], 1)
+
+
+class OutOfOfficeTest(Base):
+    def test_return_dates(self):
+        at = datetime(2026, 11, 17, 9, 0, tzinfo=timezone.utc)   # a Tuesday
+        cases = {
+            "I am out of the office until Monday 24 November with limited access to email.": "2026-11-24",
+            "I'm on annual leave and will be back on 24th Nov.": "2026-11-24",
+            "Out of office. Returning December 2, 2026.": "2026-12-02",
+            "I will return on 01/12/2026": "2026-12-01",
+            "Back in the office 11/24": "2026-11-24",
+            "Away at a conference, back tomorrow": "2026-11-18",
+            "I'm travelling and back on Friday": "2026-11-20",
+            "On leave from 10 Nov to 5 Jan 2027": "2027-01-05",
+            "I am currently out of the office with limited access to email.": None,
+            "Back at 9.30 am": None,
+        }
+        for text, want in cases.items():
+            got = crm.ooo_return(text, at)
+            self.assertEqual(got.isoformat() if got else None, want, text)
+        self.assertEqual(crm.auto_reply_kind("Jane is no longer with Acme. Please contact sales@"), "left")
+        self.assertEqual(crm.auto_reply_kind("Automatic reply: thanks for your email"), "auto")
+
+    def test_ooo_shows_on_the_lead_the_email_and_the_draft(self):
+        self.tick(MON)
+        engine.complete_task(self.conn, self.task("jane@x.com")["id"], "done", now=MON)
+        at = MON + timedelta(days=1)
+        self.tick(at)                                                              # email 1 to Jane
+        e = self.enr("jane@x.com")
+        self.g.inbox.append(mail("jane@x.com", "Automatic reply: Hi Acme", cid=e["conversation_id"], at=at + timedelta(minutes=5),
+                                 preview="I am out of the office until 3 November."))
+        self.tick(at + timedelta(minutes=30))
+        jane = one(self.conn, "SELECT id FROM leads WHERE email = 'jane@x.com'")["id"]
+        self.assertEqual(self.enr("jane@x.com")["status"], "active")             # the sequence carries on
+        now = at + timedelta(hours=1)
+        ooo = crm.out_of_office(self.conn, [jane], now=now)[jane]
+        self.assertEqual((ooo["kind"], ooo["back"].isoformat(), ooo["label"]), ("ooo", "2026-11-03", "Out of office · back 03 Nov"))
+        sent = [c for c in crm.communications(self.conn, lead_id=jane) if c["label"].startswith("Email ·")][0]
+        self.assertIn("out of office reply, back 03 Nov", sent["extra"])
+        auto = [c for c in crm.communications(self.conn, lead_id=jane) if c["direction"] == "in"][0]
+        self.assertEqual((auto["label"], auto["extra"]), ("Out of office reply", "back 03 Nov 2026"))
+        self.assertEqual(crm.out_of_office(self.conn, [jane], now=datetime(2026, 11, 5, tzinfo=timezone.utc)), {})  # back now
+        cols, out = stats.campaign_status(self.conn, self.cid, timezone.utc)
+        self.assertIn("(OOO, back 03-Nov)", [r for r in out if r["lead_id"] == jane][0]["cells"]["EM1"])
+
+
+class FakeWA:
+    """WhatsApp Web stand-in: records sends; chats map digits -> messages read back."""
+    def __init__(self):
+        self.sent, self.reads, self.chats = [], [], {}
+        self.fail = self.blocked = None
+
+    def open(self): pass
+    def close(self): pass
+    def snapshot(self, name): pass
+
+    def ready(self):
+        if self.blocked:
+            raise linkedin_bot.BlockedError(self.blocked)
+
+    def send(self, digits, text):
+        if self.fail:
+            raise self.fail
+        self.sent.append((digits, text))
+        self.chats.setdefault(digits, []).append({"id": f"true_{len(self.sent)}", "dir": "out", "meta": "", "text": text})
+
+    def read(self, digits):
+        self.reads.append(digits)
+        return list(self.chats.get(digits, []))
+
+
+class WhatsAppBotTest(Base):
+    def setUp(self):
+        super().setUp()
+        from campaigner import whatsapp_bot as wb
+        self.wb = wb
+        self.wid = self.campaign([("whatsapp", 0, None, "Hi {{ first_name }}"), ("email", 3, "Hi", "Hello")], name="wa")
+        importer.import_rows(self.conn, [
+            {"Email": "pat@x.com", "Name": "Pat Kim", "Mobile": "+1 440 555 0100", "Old contact": "y"},
+            {"Email": "sam@x.com", "Name": "Sam Lee", "Mobile": "+44 20 7946 0000", "Old contact": "y"}],
+            importer.guess_mapping(["Email", "Name", "Mobile", "Old contact"]), self.wid)
+        self.conn.execute("UPDATE enrollments SET enrolled_at = ? WHERE campaign_id = ?", (iso(MON), self.wid))
+        for k, v in (("wa_mode", "bot"), ("wa_hours", ["00:00", "23:59"]), ("wa_days", "mon,tue,wed,thu,fri,sat,sun")):
+            db.set_setting(self.conn, k, v)
+        self.d = FakeWA()
+        self.tick(MON)
+
+    def run_wa(self, at):
+        self.wb.run(self.conn, lambda: self.d, now=at, log=self.logs.append, sleep=lambda s: None, rng=Steady())
+
+    def wtask(self, email):
+        return one(self.conn, """SELECT t.* FROM tasks t JOIN enrollments e ON e.id = t.enrollment_id JOIN leads l ON l.id = e.lead_id
+                                 WHERE l.email = ? AND t.channel = 'whatsapp'""", email)
+
+    def lid(self, email):
+        return one(self.conn, "SELECT id FROM leads WHERE email = ?", email)["id"]
+
+    def test_sends_only_what_you_approved(self):
+        self.run_wa(MON + timedelta(minutes=1))
+        self.assertEqual(self.d.sent, [])                                          # waiting for approval
+        pat = self.wtask("pat@x.com")
+        self.conn.execute("UPDATE tasks SET comment_status = 'approved', body = 'Hi Pat!' WHERE id = ?", (pat["id"],))
+        self.run_wa(MON + timedelta(minutes=2))
+        self.assertEqual(self.d.sent, [("14405550100", "Hi Pat!")])
+        self.assertEqual(self.wtask("pat@x.com")["status"], "done")
+        self.assertEqual(self.wtask("sam@x.com")["status"], "open")
+        c = [x for x in crm.communications(self.conn, lead_id=self.lid("pat@x.com")) if x["channel"] == "whatsapp"][0]
+        self.assertEqual((c["label"], c["by"], c["content"]), ("WhatsApp message", "bot", "Hi Pat!"))
+        self.assertEqual(self.wb.sent_today(self.conn, MON + timedelta(minutes=3)), 1)
+
+    def test_rechecks_who_it_may_message_before_sending(self):
+        db.set_setting(self.conn, "wa_approve", False)
+        self.conn.execute("UPDATE leads SET old_contact = 0, status = 'Cold' WHERE email = 'sam@x.com'")
+        self.run_wa(MON + timedelta(minutes=1))
+        self.assertEqual([d for d, _ in self.d.sent], ["14405550100"])
+        sam = self.wtask("sam@x.com")
+        self.assertEqual((sam["status"], sam["bot_note"]), ("skipped", "WhatsApp is only for Warm leads and old contacts"))
+
+    def test_caps_and_rest(self):
+        db.set_setting(self.conn, "wa_approve", False)
+        db.set_setting(self.conn, "wa_daily_cap", 1)
+        self.run_wa(MON + timedelta(minutes=1))
+        self.run_wa(MON + timedelta(hours=2))
+        self.assertEqual(len(self.d.sent), 1)
+        self.assertIsNotNone(db.get_setting(self.conn, "wa_bot_rest_until"))
+        db.set_setting(self.conn, "wa_daily_cap", 99)
+        self.assertEqual(self.wb.settings(self.conn)["wa_daily_cap"], self.wb.CEILING)
+
+    def test_one_off_and_reading_replies(self):
+        pat = self.lid("pat@x.com")
+        self.conn.execute("UPDATE tasks SET status = 'skipped' WHERE channel = 'whatsapp'")
+        self.conn.execute("INSERT INTO wa_outbox (lead_id, body, status, created_at) VALUES (?, 'Coffee next week?', 'queued', ?)",
+                          (pat, iso(MON)))
+        self.run_wa(MON + timedelta(minutes=1))
+        self.assertEqual(self.d.sent, [("14405550100", "Coffee next week?")])
+        self.assertEqual(one(self.conn, "SELECT status FROM wa_outbox")["status"], "sent")
+        self.assertEqual(crm.communications(self.conn, lead_id=pat)[0]["label"], "WhatsApp message")
+        self.d.chats["14405550100"].insert(0, {"id": "false_old", "dir": "in", "meta": "", "text": "an old chat"})
+        self.d.chats["14405550100"].append({"id": "false_1", "dir": "in", "meta": "[10:21, 19/10/2026] Pat: ", "text": "Sure, Tuesday?"})
+        db.set_setting(self.conn, "wa_bot_rest_until", None)
+        self.run_wa(MON + timedelta(hours=1))
+        self.assertEqual(self.d.reads, ["14405550100"])
+        e = one(self.conn, "SELECT * FROM enrollments WHERE lead_id = ? AND campaign_id = ?", pat, self.wid)
+        self.assertEqual((e["status"], e["reply_channel"]), ("replied", "whatsapp"))
+        self.assertEqual(one(self.conn, "SELECT status FROM leads WHERE id = ?", pat)["status"], "Warm")
+        self.d.chats["14405550100"].append({"id": "false_2", "dir": "in", "meta": "", "text": "Or Wednesday"})
+        self.run_wa(MON + timedelta(hours=2))                                      # next read: logged once each
+        self.run_wa(MON + timedelta(hours=3))
+        got = [(c["label"], c["content"]) for c in crm.communications(self.conn, lead_id=pat) if c["direction"] == "in"]
+        self.assertEqual(sorted(got), [("WhatsApp received", "Or Wednesday"), ("WhatsApp reply", "Sure, Tuesday?")])
+
+    def test_signed_out_pauses_and_unconfirmed_is_never_retried(self):
+        db.set_setting(self.conn, "wa_approve", False)
+        self.d.blocked = "WhatsApp Web is signed out"
+        self.run_wa(MON + timedelta(minutes=1))
+        self.assertIn("signed out", db.get_setting(self.conn, "wa_bot_paused")["reason"])
+        self.assertEqual(crm.actions(self.conn)["alerts"][-1][:28], "The WhatsApp bot is paused: ")
+        self.wb.resume(self.conn)
+        self.d.blocked, self.d.fail = None, self.wb.Unconfirmed("couldn't confirm")
+        self.run_wa(MON + timedelta(minutes=2))
+        t = self.wtask("pat@x.com")
+        self.assertEqual((t["status"], t["bot_attempts"]), ("open", self.wb.MAX_ATTEMPTS))  # left for you
+        self.d.fail = None
+        self.run_wa(MON + timedelta(hours=3))
+        self.assertNotIn("14405550100", [d for d, _ in self.d.sent])
+
+    def test_parse_meta(self):
+        now = datetime(2026, 11, 17, 12, 0, tzinfo=timezone.utc)
+        got = self.wb.parse_meta("[10:21 pm, 16/11/2026] Pat: ", now)
+        self.assertEqual((got.day, got.month, got.hour), (16, 11, 22))
+        got = self.wb.parse_meta("[09:05, 11/3/26] Pat: ", now)                  # 3 Nov (m/d) beats 11 Mar? both past: newest
+        self.assertEqual((got.month, got.day), (11, 3))
+        self.assertIsNone(self.wb.parse_meta("no date", now))
+
+    def test_web_pages_and_bulk_actions(self):
+        from fastapi.testclient import TestClient
+        from campaigner.web import app as webapp
+        real, dbfile, opened = db.connect, Path(self.tmp.name) / "t.db", []
+
+        def connect(*a, **k):
+            opened.append(real(dbfile))
+            return opened[-1]
+        origin = {"Origin": f"http://127.0.0.1:{webapp.PORT}"}
+        pat, jane = self.lid("pat@x.com"), self.lid("jane@x.com")
+        with mock.patch.object(webapp.db, "connect", connect), \
+                mock.patch.object(webapp.runner, "run_wa", lambda: None):
+            c = TestClient(webapp.app, base_url=f"http://127.0.0.1:{webapp.PORT}")
+            r = c.post("/api/leads/bulk", json={"ids": [pat, jane], "action": "tag", "tag": "Fintech, P1"}, headers=origin)
+            self.assertEqual((r.status_code, r.json()["msg"]), (200, "Tagged 2"))
+            self.assertIn("Pat", c.get("/prospects?tag=fintech&tag=P1").text)
+            self.assertNotIn("Pat Kim", c.get("/prospects?tag=Nope").text)
+            r = c.post(f"/api/leads/{jane}/whatsapp", json={"body": "Hi", "send": True}, headers=origin)
+            self.assertEqual(r.status_code, 409)                                   # Jane is New, not an old contact
+            r = c.post("/api/leads/bulk", json={"ids": [jane], "action": "old_contact", "value": True}, headers=origin)
+            self.assertEqual(r.status_code, 200)
+            r = c.post(f"/api/leads/{jane}/whatsapp", json={"body": "Hi {{ first_name }}", "send": True}, headers=origin)
+            self.assertEqual(r.status_code, 422)                                   # no phone number
+            r = c.post(f"/api/leads/{pat}/whatsapp", json={"body": "Hi {{ first_name }}", "send": False}, headers=origin)
+            self.assertEqual(r.status_code, 200)
+            o = one(self.conn, "SELECT * FROM wa_outbox WHERE lead_id = ?", pat)
+            self.assertEqual((o["status"], o["body"]), ("draft", "Hi Pat"))
+            self.assertEqual(c.post(f"/api/wa-outbox/{o['id']}", json={"action": "send"}, headers=origin).status_code, 200)
+            self.assertEqual(one(self.conn, "SELECT status FROM wa_outbox WHERE id = ?", o["id"])["status"], "queued")
+            t = self.wtask("sam@x.com")
+            self.assertIn("Approve &amp; send via bot", c.get("/tasks").text)
+            r = c.post(f"/api/tasks/{t['id']}/wa-approve", json={"body": "Hi Sam, edited"}, headers=origin)
+            self.assertEqual(r.status_code, 200)
+            self.assertEqual(self.wtask("sam@x.com")["comment_status"], "approved")
+            r = c.post(f"/api/leads/{pat}", json={"action": "tags", "tags": list("abcdefg")}, headers=origin)
+            self.assertEqual(r.status_code, 422)
+            warm = self.campaign([("whatsapp", 0, None, "Hi")], name="nurture", audience="warm")
+            r = c.post("/api/leads/bulk", json={"ids": [pat], "action": "enroll", "campaign_id": warm}, headers=origin)
+            self.assertIn("not added", r.json()["msg"])                            # still in the live "wa" campaign
+            r = c.post("/settings/whatsapp-bot", data={"wa_mode": "bot", "wa_daily_cap": "500", "gap_min": "10",
+                                                       "gap_max": "20", "hours_start": "10:00", "hours_end": "18:00",
+                                                       "days": ["mon"]}, headers=origin, follow_redirects=False)
+            self.assertEqual(r.status_code, 303)
+            cfg = self.wb.settings(self.conn)
+            self.assertEqual((cfg["wa_daily_cap"], cfg["wa_gap"], cfg["wa_approve"]), (self.wb.CEILING, [30, 30], False))
+            for path in (f"/leads/{pat}", "/settings", "/prospects?old=1", "/leads", "/drafts", "/today", "/status",
+                         f"/campaigns/{self.wid}?tab=settings"):
+                self.assertEqual(c.get(path).status_code, 200, path)
+        import gc
+        opened.clear()
+        gc.collect()

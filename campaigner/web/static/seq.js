@@ -325,7 +325,7 @@
           h("p", { class: "meta" }, s.channel === "email"
             ? "**bold**, *italic*, lines starting “- ” or “1. ” for lists, [text](https://…) for links. A blank line starts a paragraph. Fallback: {{ title | default('there', true) }}."
             : s.channel === "whatsapp"
-            ? "A task opens WhatsApp with this text ready; you press send. Needs a phone number with a country code on the lead (leads without one skip this step). **bold** and *italic* become WhatsApp's own *bold* and _italic_."
+            ? "Only for Warm or Converted leads and old contacts: everyone else skips this step. Goes to the Task queue: you send it from WhatsApp, or, with the WhatsApp bot on, approve it and the bot sends it through WhatsApp Web. Needs a phone number with a country code. **bold** and *italic* become WhatsApp's own *bold* and _italic_."
             : "LinkedIn messages are plain text: **bold** and *italic* become Unicode bold/italic letters, “- ” lines become • bullets. Use sparingly (screen readers read styled letters awkwardly)."),
           s.channel === "email" ? attachmentsField(s) : null,
         ]),

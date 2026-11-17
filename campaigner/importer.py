@@ -21,6 +21,8 @@ FIELDS = {
     "linkedin_url": "LinkedIn URL",
     "owner": "Owner (assigned to)",
     "status": "Lead status (New / Warm / Cold / Converted / Closed-Lost)",
+    "tags": "Tags (comma-separated, up to 6)",
+    "old_contact": "Old contact (yes / no: WhatsApp allowed)",
     # Optional history, so leads you've already worked outside the app start at the right step.
     "lead_status": "History: lead status",
     "li_status": "History: LinkedIn status",
@@ -39,6 +41,8 @@ GUESS = {
     "title": ["title", "job_title", "position", "role", "designation", "headline"],
     "owner": ["owner", "lead_owner", "assigned_to", "assignee", "bdr", "sdr", "rep", "sales_rep"],
     "status": ["status", "lead_temperature", "temperature", "prospect_status", "crm_status"],
+    "tags": ["tags", "tag", "labels", "label", "segments", "segment"],
+    "old_contact": ["old_contact", "existing_contact", "known_contact", "warm_contact"],
     "lead_status": ["lead_status"],
     "li_status": ["li_status", "linkedin_status", "connection_status"],
     "li_msg_1": ["li_1st_msg", "li_msg_1", "li_message_1", "linkedin_message_1", "li_msg1"],
@@ -116,18 +120,22 @@ def _find(conn, email: str | None, li: str | None) -> dict | None:
     return None
 
 
+YES = ("y", "yes", "true", "1", "x", "✓", "old", "existing")
+
+
 def _keep_out(conn, lead_id: int, campaign_id: int) -> str | None:
-    """Why an existing lead shouldn't join this campaign, or None. Someone who replied is in Leads, and someone in
-    another live sequence would get two at once."""
+    """Why an existing lead shouldn't join this campaign, or None. Someone who replied is in Leads (unless the
+    campaign is for warm leads), and someone in another live sequence would get two at once."""
     if one(conn, "SELECT 1 FROM enrollments WHERE lead_id = ? AND campaign_id = ?", lead_id, campaign_id):
         return None  # counted as already in the campaign
     lead = one(conn, "SELECT stage, dnc, status FROM leads WHERE id = ?", lead_id)
+    warm = (one(conn, "SELECT audience FROM campaigns WHERE id = ?", campaign_id) or {}).get("audience") == "warm"
     if lead["dnc"]:
         return "unsubscribed / is do-not-contact"
     if lead["status"] in crm.CLOSED:
         return f"is {lead['status']}"
-    if lead["stage"] == "lead":
-        return "already replied (in Leads)"
+    if lead["stage"] == "lead" and not warm:
+        return "already replied (in Leads; use a campaign for warm leads)"
     other = one(conn, """SELECT c.name FROM enrollments e JOIN campaigns c ON c.id = e.campaign_id
                          WHERE e.lead_id = ? AND e.campaign_id != ? AND e.status IN ('pending', 'active')
                            AND c.status != 'draft' ORDER BY e.id LIMIT 1""", lead_id, campaign_id)
@@ -197,6 +205,16 @@ def import_rows(conn, rows: list[dict], mapping: dict[str, str], campaign_id: in
         if st:  # e.g. Warm for a high-intent source; everyone else starts New
             conn.execute("UPDATE leads SET status = ?, status_changed_at = ? WHERE id = ? AND status != ?",
                          (st, iso(now), lead_id, st))
+        if (val.get("tags") or "").strip():
+            have = crm.tags_of(conn, [lead_id])[lead_id]
+            new_tags = [t for t in crm.split_tags(val["tags"]) if t.lower() not in {h.lower() for h in have}]
+            room = crm.MAX_TAGS - len(have)
+            if len(new_tags) > room:
+                summary["skipped"].append(f"row {n}: only {crm.MAX_TAGS} tags per lead; kept {', '.join(new_tags[:room]) or 'none'} of the new ones")
+            crm.set_tags(conn, lead_id, have + new_tags[:max(room, 0)])
+        if (val.get("old_contact") or "").strip():
+            conn.execute("UPDATE leads SET old_contact = ? WHERE id = ?",
+                         (int(val["old_contact"].strip().lower() in YES), lead_id))
         if (val.get("owner") or "").strip():
             oid = _owner_id(conn, val["owner"].strip(), owners)
             conn.execute("UPDATE leads SET owner_id = ? WHERE id = ?", (oid, lead_id))
@@ -228,6 +246,30 @@ def import_rows(conn, rows: list[dict], mapping: dict[str, str], campaign_id: in
     if owners:
         summary["owners"] = sorted(owners)
     return summary
+
+
+def enroll_leads(conn, lead_ids, campaign_id: int) -> dict:
+    """Add existing leads (picked on the Leads / Prospects lists) to a campaign, with the same checks as an import."""
+    now = utcnow()
+    out = {"enrolled": 0, "already_enrolled": 0, "not_enrolled": 0, "skipped": []}
+    for lid in lead_ids:
+        lead = one(conn, "SELECT id, first_name, last_name, email FROM leads WHERE id = ?", lid)
+        if not lead:
+            continue
+        why = _keep_out(conn, lid, campaign_id)
+        if why:
+            out["not_enrolled"] += 1
+            out["skipped"].append(f"{(lead['first_name'] + ' ' + lead['last_name']).strip() or lead['email']} {why}")
+            continue
+        cur = conn.execute("INSERT OR IGNORE INTO enrollments (campaign_id, lead_id, enrolled_at) VALUES (?, ?, ?)",
+                           (campaign_id, lid, iso(now)))
+        if cur.rowcount:
+            event(conn, lid, "enrolled", enrollment=one(conn, "SELECT * FROM enrollments WHERE id = ?", cur.lastrowid), at=now)
+            out["enrolled"] += 1
+        else:
+            out["already_enrolled"] += 1
+    crm.assign_campaign_owner(conn, campaign_id)
+    return out
 
 
 def _owner_id(conn, name: str, cache: dict) -> int:
