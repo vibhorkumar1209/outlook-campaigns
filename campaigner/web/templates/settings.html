@@ -88,13 +88,15 @@
           <label><input type="radio" name="li_mode" value="bot" {{ 'checked' if bot.li_mode == 'bot' }}> Bot does them</label>
         </div>
         <div class="meta" style="margin-bottom:6px">Daily caps (0 turns an action off). Used today:
-          {% for a in ["view", "connect", "message", "like", "comment"] %}{{ a }} {{ bot_used.get(a, 0) }}{{ " · " if not loop.last }}{% endfor %}</div>
+          {% for a in ["view", "connect", "message", "like", "comment", "withdraw"] %}{{ a }} {{ bot_used.get(a, 0) }}{{ " · " if not loop.last }}{% endfor %}</div>
         <div class="form-grid">
           <label class="f">Profile views (max {{ bot_ceil.view }})<input type="number" min="0" max="{{ bot_ceil.view }}" name="cap_view" value="{{ bot.li_bot_caps.view }}"></label>
           <label class="f">Invites (max {{ bot_ceil.connect }})<input type="number" min="0" max="{{ bot_ceil.connect }}" name="cap_connect" value="{{ bot.li_bot_caps.connect }}"></label>
           <label class="f">Messages (max {{ bot_ceil.message }})<input type="number" min="0" max="{{ bot_ceil.message }}" name="cap_message" value="{{ bot.li_bot_caps.message }}"></label>
           <label class="f">Likes (max {{ bot_ceil.like }})<input type="number" min="0" max="{{ bot_ceil.like }}" name="cap_like" value="{{ bot.li_bot_caps.like }}"></label>
           <label class="f">Comments (approved) (max {{ bot_ceil.comment }})<input type="number" min="0" max="{{ bot_ceil.comment }}" name="cap_comment" value="{{ bot.li_bot_caps.comment }}"></label>
+          <label class="f">Withdraw old invites (max {{ bot_ceil.withdraw }})<input type="number" min="0" max="{{ bot_ceil.withdraw }}" name="cap_withdraw" value="{{ bot.li_bot_caps.withdraw }}"></label>
+          <label class="f">…pending longer than (weeks, 0 = off)<input type="number" min="0" max="12" name="withdraw_weeks" value="{{ bot.li_bot_withdraw_weeks }}"></label>
           <label class="f">Invites per 7 days (LinkedIn allows ~100)<input type="number" min="0" max="100" name="week_invites" value="{{ bot.li_bot_week_invites }}"></label>
           <label class="f">Gap between actions, min s<input type="number" min="0" name="gap_min" value="{{ bot.li_bot_gap[0] }}"></label>
           <label class="f">Gap between actions, max s<input type="number" min="0" name="gap_max" value="{{ bot.li_bot_gap[1] }}"></label>
@@ -106,9 +108,9 @@
         </div>
         <p class="meta">Paced like a person: it works through people in a random order (never the same person twice in a row), skims each profile before acting, types at reading pace, sometimes browses the feed or stops for a longer pause between actions, and takes a 4–10 minute break every 3–5 actions. A session is {{ (bot.li_bot_per_run // 2) if bot.li_bot_vary else bot.li_bot_per_run }}–{{ bot.li_bot_per_run }} actions{% if bot.li_bot_vary %}, then 8–35 minutes off{% endif %}; never more than {{ bot_hour_cap }} in an hour.
           {% if bot.li_bot_vary %}Each day starts a little later and ends a little earlier than the hours above, has a lunch lull, and uses 50–100% of the caps, so no two days look the same.{% endif %}
-          New invites stop while 200 are still open, and halve when under 20% are accepted.</p>
+          New invites stop while 200 are still open (LinkedIn's own count, including invites you sent yourself), and halve when under 20% are accepted.{% if bot.li_bot_withdraw_weeks %} Invites unanswered for {{ bot.li_bot_withdraw_weeks }}+ weeks are withdrawn a few per session, oldest first; LinkedIn won't let you re-invite someone for 3 weeks after a withdrawal.{% endif %}</p>
         <p class="meta"><b>Today:</b> {{ bot_plan.hours }}{% if bot_plan.lunch_hours %}, lunch {{ bot_plan.lunch_hours }}{% endif %} ·
-          views {{ bot_plan.caps.view }} · invites {{ bot_plan.caps.connect }} · messages {{ bot_plan.caps.message }} · likes {{ bot_plan.caps.like }} · comments {{ bot_plan.caps.comment }} · {{ bot_plan.total }} actions in all
+          views {{ bot_plan.caps.view }} · invites {{ bot_plan.caps.connect }} · messages {{ bot_plan.caps.message }} · likes {{ bot_plan.caps.like }} · comments {{ bot_plan.caps.comment }}{% if bot.li_bot_withdraw_weeks %} · withdrawals {{ bot_plan.caps.withdraw }}{% endif %} · {{ bot_plan.total }} actions in all
           {% for n in bot_plan.notes %} · {{ n }}{% endfor %}.
           Open invites {{ bot_plan.invites.pending }}{% if bot_plan.invites.rate is not none %} · {{ "%.0f" | format(bot_plan.invites.rate * 100) }}% of recent invites accepted{% endif %}.</p>
         <div class="days" style="margin:12px 0">

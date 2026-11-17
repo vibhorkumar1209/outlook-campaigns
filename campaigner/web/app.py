@@ -1199,6 +1199,7 @@ async def settings_linkedin_bot(request: Request):
     db.set_setting(conn, "li_mode", "bot" if f.get("li_mode") == "bot" else "assisted")
     db.set_setting(conn, "li_bot_caps", {a: num(f"cap_{a}", 0, hi) for a, hi in linkedin_bot.CEILINGS.items()})
     db.set_setting(conn, "li_bot_vary", bool(f.get("vary")))
+    db.set_setting(conn, "li_bot_withdraw_weeks", num("withdraw_weeks", 3, 12))
     db.set_setting(conn, "li_bot_week_invites", num("week_invites", 90, 100))
     gmin = num("gap_min", 45, 3600)
     db.set_setting(conn, "li_bot_gap", [gmin, max(gmin, num("gap_max", 120, 3600))])

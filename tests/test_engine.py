@@ -7,7 +7,7 @@ from unittest import mock
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from campaigner import db, engine, importer, linkedin_bot, stats
+from campaigner import crm, db, engine, importer, linkedin_bot, stats
 from campaigner.db import iso, one, parse, rows, scalar
 from campaigner.graph import AuthError
 from campaigner.render import email_html
@@ -1112,6 +1112,81 @@ class RhythmTest(Base):
         self.assertIn("open", d.calls)
 
 
+class WithdrawTest(Base):
+    class Sent(object):
+        pass
+
+    def setUp(self):
+        super().setUp()
+        lock = linkedin_bot._ProfileLock()
+        lock.path = Path(self.tmp.name) / "profile.lock"
+        patcher = mock.patch.object(linkedin_bot, "PROFILE_LOCK", lock)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for k, v in [("li_mode", "bot"), ("li_bot_hours", ["00:00", "23:59"]), ("li_bot_vary", False),
+                     ("li_bot_days", "mon,tue,wed,thu,fri,sat,sun"), ("li_bot_caps", {a: 0 for a in linkedin_bot.CEILINGS} | {"withdraw": 3})]:
+            db.set_setting(self.conn, k, v)
+        self.conn.execute("UPDATE leads SET li_state = 'invited' WHERE email = 'jane@x.com'")
+
+    def driver(self, sent, total=512):
+        class D(FakeDriver):
+            def sent_invites(self, min_days, want):
+                self.calls.append(("sent_invites", min_days, want))
+                return [x for x in sent if linkedin_bot.sent_age_days(x["age"]) >= min_days], total
+            def withdraw(self, inv):
+                self.calls.append(("withdraw", inv["slug"]))
+                if inv["slug"] == "broken":
+                    raise linkedin_bot.ActionError("still listed after Withdraw")
+        return D()
+
+    def run_bot(self, d, at=MON):
+        linkedin_bot.run(self.conn, lambda: d, now=at, log=self.logs.append, sleep=lambda s: None, rng=Steady())
+        return d
+
+    def test_sent_age(self):
+        f = linkedin_bot.sent_age_days
+        self.assertEqual([f("Sent 3 weeks ago"), f("Sent 1 month ago"), f("Sent a week ago"), f("Sent yesterday"),
+                          f("Sent today"), f("Sent 5 hours ago"), f("whatever")],
+                         [21, 30, 7, 1.0, 0.0, 5 * (1 / 24), None])
+
+    def test_withdraws_old_invites_and_frees_the_lead(self):
+        sent = [{"slug": "janedoe", "name": "Jane Doe", "age": "Sent 1 month ago"},
+                {"slug": "stranger", "name": "Not In App", "age": "Sent 3 weeks ago"},
+                {"slug": "fresh", "name": "New One", "age": "Sent 2 weeks ago"}]
+        d = self.run_bot(self.driver(sent))
+        self.assertIn(("sent_invites", 21, 3), d.calls)
+        self.assertEqual([c[1] for c in d.calls if c[0] == "withdraw"], ["janedoe", "stranger"])
+        jane = one(self.conn, "SELECT * FROM leads WHERE email = 'jane@x.com'")
+        self.assertEqual(jane["li_state"], "none")
+        self.assertIsNotNone(one(self.conn, "SELECT * FROM events WHERE lead_id = ? AND type = 'li_withdrawn'", jane["id"]))
+        self.assertEqual(scalar(self.conn, "SELECT COUNT(*) FROM bot_actions WHERE action = 'withdraw' AND ok = 1"), 2)
+        self.assertEqual(db.get_setting(self.conn, "li_pending_total")["n"], 512)
+        # LinkedIn's count (512) beats the app's own: new invites stop
+        plan = linkedin_bot.day_plan(self.conn, linkedin_bot.settings(self.conn), MON)
+        self.assertEqual(plan["caps"]["connect"], 0)
+        comms = crm.communications(self.conn, lead_id=jane["id"])
+        self.assertTrue(any(c["label"] == "LinkedIn invite withdrawn" for c in comms))
+        # daily cap: 3 a day
+        sent2 = [{"slug": f"p{i}", "name": f"P{i}", "age": "Sent 2 months ago"} for i in range(5)]
+        d = self.run_bot(self.driver(sent2), at=MON + timedelta(minutes=30))
+        self.assertEqual(len([c for c in d.calls if c[0] == "withdraw"]), 1)
+
+    def test_nothing_old_waits_before_looking_again(self):
+        d = self.run_bot(self.driver([{"slug": "fresh", "name": "New", "age": "Sent 2 days ago"}], total=30))
+        self.assertIn("open", d.calls)
+        looked = lambda d: any(c[0] == "sent_invites" for c in d.calls if isinstance(c, tuple))  # noqa: E731
+        self.assertFalse(looked(self.run_bot(self.driver([]), at=MON + timedelta(hours=1))))
+        self.assertTrue(looked(self.run_bot(self.driver([]), at=MON + timedelta(hours=13))))
+
+    def test_failure_stops_withdrawing_for_the_session(self):
+        sent = [{"slug": "broken", "name": "B", "age": "Sent 1 month ago"},
+                {"slug": "stranger", "name": "S", "age": "Sent 1 month ago"}]
+        d = self.run_bot(self.driver(sent))
+        self.assertEqual([c[1] for c in d.calls if c[0] == "withdraw"], ["broken"])
+        self.assertEqual(scalar(self.conn, "SELECT COUNT(*) FROM bot_actions WHERE action = 'withdraw' AND ok = 0"), 1)
+        self.assertTrue(any("couldn't withdraw" in l for l in self.logs))
+
+
 class FakeDriver:
     def __init__(self, posts=(), connect="sent", message="sent", blocked=False, connections=()):
         self.calls, self.posts, self.connect_result, self.message_result, self.blocked = [], list(posts), connect, message, blocked
@@ -1157,6 +1232,7 @@ class BotTest(Base):
         db.set_setting(self.conn, "li_bot_hours", ["00:00", "23:59"])
         db.set_setting(self.conn, "li_bot_days", "mon,tue,wed,thu,fri,sat,sun")
         db.set_setting(self.conn, "li_bot_vary", False)  # RhythmTest covers the daily variation
+        db.set_setting(self.conn, "li_bot_withdraw_weeks", 0)  # WithdrawTest covers withdrawals
         self.drivers = []
 
     def bot(self, driver=None, at=MON, draft=None):
