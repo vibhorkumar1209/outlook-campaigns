@@ -40,7 +40,7 @@
   <a class="tile link" href="#followups"><div class="k">Follow-ups due</div><div class="v">{{ a.reminders | length }}</div><div class="s">warm, cold and next steps</div></a>
   <a class="tile link" href="/drafts"><div class="k">Email drafts</div><div class="v">{{ a.drafts | length }}</div><div class="s">waiting for your approval</div></a>
   <a class="tile link" href="/tasks"><div class="k">LinkedIn tasks</div><div class="v">{{ a.linkedin + a.comments }}</div><div class="s">{{ a.comments }} comment{{ "s" if a.comments != 1 }} to approve</div></a>
-  <a class="tile link" href="/tasks"><div class="k">WhatsApp messages</div><div class="v">{{ a.whatsapp }}</div><div class="s">ready to send</div></a>
+  <a class="tile link" href="/whatsapp"><div class="k">WhatsApp messages</div><div class="v">{{ a.whatsapp }}</div><div class="s">ready to send</div></a>
 </section>
 
 <section class="card" id="followups">

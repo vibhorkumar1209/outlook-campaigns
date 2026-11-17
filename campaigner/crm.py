@@ -600,7 +600,7 @@ def digest(conn, tz=None, member: dict | None = None) -> tuple[str, str, int]:
                      f'<a style="{link}" href="{url}/tasks">Open the queue</a>')
     if a["whatsapp"]:
         queue.append(f'<b>{a["whatsapp"]} WhatsApp message{"s" if a["whatsapp"] != 1 else ""}</b> ready to send. '
-                     f'<a style="{link}" href="{url}/tasks">Open the queue</a>')
+                     f'<a style="{link}" href="{url}/whatsapp">Open the WhatsApp queue</a>')
     if a["comments"]:
         queue.append(f'<b>{a["comments"]} LinkedIn comment{"s" if a["comments"] != 1 else ""}</b> to write or approve. '
                      f'<a style="{link}" href="{url}/tasks">Open the queue</a>')

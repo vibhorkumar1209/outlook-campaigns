@@ -47,13 +47,23 @@ $$("[data-run]").forEach((b) => b.addEventListener("click", async () => {
   setTimeout(() => (b.disabled = false), 3000);
 }));
 
-// Task queue (LinkedIn and WhatsApp).
+// Task cards: the LinkedIn queue and the WhatsApp queue.
 function updateCount(card) {
   const ta = $(".task-body", card), c = $("[data-count]", card);
   if (!ta || !c) return;
   const n = ta.value.length;
   c.textContent = `${n}/300` + (n > 200 ? " · free LinkedIn accounts cap notes at 200" : "");
   c.classList.toggle("warn", n > 200);
+}
+// The LinkedIn and WhatsApp queues each keep their own count (nav badge + page header).
+function setQueueCount(card, r) {
+  const box = card.closest("[data-nav]");
+  const n = r[(box && box.dataset.open) || "open"];
+  if (n === undefined) return;
+  const badge = $("#" + ((box && box.dataset.nav) || "nav-tasks") + " .badge");
+  if (badge) badge.textContent = n;
+  const left = $("#tasks-left");
+  if (left) left.textContent = box && box.dataset.open === "wa_open" ? Math.max(0, Number(left.textContent) - 1) : n;
 }
 $$(".task").forEach((card) => {
   updateCount(card);
@@ -70,8 +80,7 @@ $$(".task").forEach((card) => {
           : await api(`/api/tasks/${card.dataset.task}`, { action: "done", engage: { post_url: card.dataset.post, liked: true } });
         card.classList.add("gone");
         setTimeout(() => card.remove(), 250);
-        const badge = $("#nav-tasks .badge");
-        if (badge) badge.textContent = r.open;
+        setQueueCount(card, r);
         if (act === "approve") toast("Approved. The bot posts it on its next run.");
       } catch (err) {
         toast(err.message, true);
@@ -143,10 +152,7 @@ $$(".task").forEach((card) => {
       const r = await api(`/api/tasks/${card.dataset.task}`, { action: act, body: ta ? ta.value : null, engage });
       card.classList.add("gone");
       setTimeout(() => card.remove(), 250);
-      const badge = $("#nav-tasks .badge");
-      if (badge) badge.textContent = r.open;
-      const left = $("#tasks-left");
-      if (left) left.textContent = r.open;
+      setQueueCount(card, r);
     } catch (err) {
       toast(err.message, true);
       $$("button", card).forEach((b) => (b.disabled = false));
@@ -593,7 +599,7 @@ document.addEventListener("click", async (e) => {
   b.disabled = true;
   try {
     await api(`/api/wa-outbox/${b.dataset.waOutbox}`, { action: b.dataset.act });
-    toast(b.dataset.act === "send" ? "Queued: the WhatsApp bot sends it shortly, within its hours" : "Cancelled");
+    toast({ send: "Queued: the WhatsApp bot sends it shortly, within its hours", sent: "Marked as sent" }[b.dataset.act] || "Cancelled");
     setTimeout(() => location.reload(), 700);
   } catch (err) { toast(err.message, true); b.disabled = false; }
 });
