@@ -1295,6 +1295,7 @@ def settings(request: Request):
     tracker = Tracker.from_env()
     return page(request, "settings.html", conn, logs=list(runner.logs)[-120:], busy=runner.busy,
                 eng=engine.engage_settings(conn), voice=db.get_setting(conn, "comment_voice", ""),
+                ooo_opener=db.get_setting(conn, "ooo_opener", engine.OOO_OPENER_DEFAULT) or "",
                 bot=linkedin_bot.settings(conn), bot_status=linkedin_bot.status(conn),
                 bot_used=linkedin_bot.used_today(conn, utcnow()), bot_plan=linkedin_bot.day_plan(conn, linkedin_bot.settings(conn), utcnow()),
                 bot_ceil=linkedin_bot.CEILINGS, bot_hour_cap=linkedin_bot.HOUR_CAP, li_login_state=runner.li_login_state,
@@ -1410,6 +1411,18 @@ def settings_engagement(engage_every_days: int = Form(7), engage_lookback_months
     db.set_setting(conn, "engage_lookback_months", min(max(engage_lookback_months, 1), 12))
     db.set_setting(conn, "comment_voice", comment_voice.strip()[:1000])
     return back("/settings", msg="Engagement settings saved")
+
+
+@app.post("/settings/auto-replies")
+def settings_auto_replies(ooo_opener: str = Form("")):
+    conn = db.connect()
+    text = " ".join(ooo_opener.split())[:300]
+    try:
+        ENV.parse(text)  # syntax only: lead fields like {{ first_name }} are filled in when it's used
+    except TemplateSyntaxError as ex:
+        return back("/settings", err=f"Opening line: {ex}")
+    db.set_setting(conn, "ooo_opener", text)
+    return back("/settings", msg="Out-of-office settings saved")
 
 
 @app.post("/settings/linkedin-bot")

@@ -2324,3 +2324,118 @@ class WhatsAppBotTest(Base):
         import gc
         opened.clear()
         gc.collect()
+
+
+class ReplyCheckTest(Base):
+    """The LinkedIn bot's inbox check: likely replies first, a broken profile is skipped, the rest rotate."""
+
+    def lead(self, i, first, last="X"):
+        return {"lead_id": i, "first_name": first, "last_name": last, "linkedin_url": f"https://www.linkedin.com/in/{first.lower()}",
+                "sent_text": "Hi"}
+
+    def driver(self, inbox, replies, broken=()):
+        d = FakeDriver()
+        d.inbox = lambda: inbox
+
+        def thread(url, ours):
+            d.calls.append(("thread", url))
+            if any(b in url for b in broken):
+                raise TimeoutError("Locator.inner_text: Timeout 10000ms exceeded.")
+            return replies.get(url)
+        d.thread_reply = thread
+        return d
+
+    def test_likely_reply_first_and_a_broken_profile_does_not_stop_the_check(self):
+        jane = one(self.conn, "SELECT id FROM leads WHERE email = 'jane@x.com'")["id"]
+        self.conn.execute("UPDATE leads SET stage = 'prospect' WHERE id = ?", (jane,))
+        cands = [self.lead(9001, "Ann"), self.lead(9002, "Ben"), {**self.lead(jane, "Jane", "Doe")}]
+        d = self.driver([{"name": "Jane Doe", "snippet": "Jane: sounds good", "last_from_me": False}],
+                        {"https://www.linkedin.com/in/jane": "sounds good"}, broken=("ann",))
+        linkedin_bot.check_replies(self.conn, d, cands, MON, self.logs.append)
+        opened = [c[1] for c in d.calls if c[0] == "thread"]
+        self.assertEqual(opened[0], "https://www.linkedin.com/in/jane")              # the likely reply first
+        self.assertIn("https://www.linkedin.com/in/ben", opened)                       # not stopped by Ann's page
+        self.assertEqual(one(self.conn, "SELECT stage FROM leads WHERE id = ?", jane)["stage"], "lead")
+        self.assertTrue(any("couldn't open Ann X" in l for l in self.logs))
+
+    def test_others_rotate_and_repeated_failures_stop_early(self):
+        cands = [self.lead(9000 + i, f"P{i}") for i in range(10)]
+        d = self.driver([], {})
+        linkedin_bot.check_replies(self.conn, d, cands, MON, self.logs.append)
+        first = [c[1] for c in d.calls if c[0] == "thread"]
+        self.assertEqual(len(first), linkedin_bot.REPLY_ROTATE)
+        d = self.driver([], {})
+        linkedin_bot.check_replies(self.conn, d, cands, MON + timedelta(minutes=10), self.logs.append)
+        second = [c[1] for c in d.calls if c[0] == "thread"]
+        self.assertFalse(set(first) & set(second))                                     # the next ones in line
+        d = self.driver([], {}, broken=("linkedin.com",))
+        linkedin_bot.check_replies(self.conn, d, cands, MON + timedelta(minutes=20), self.logs.append)
+        self.assertEqual(len([c for c in d.calls if c[0] == "thread"]), linkedin_bot.REPLY_FAILS_IN_A_ROW)
+        self.assertIn("stopped early", self.logs[-1])
+
+
+class AttuneTest(Base):
+    """After an out-of-office the prospect stays in the sequence; the next message waits and is adjusted."""
+    FOLLOW = "Hi {{ first_name }},\n\nFollowing up on my note."
+
+    def setUp(self):
+        super().setUp()
+        self.kc = self.campaign([("email", 0, "Hello", "Hi {{ first_name }},\n\nIntro."), ("email", 2, None, self.FOLLOW)],
+                                name="ooo")
+        importer.import_rows(self.conn, [{"Email": "kim@x.com", "Name": "Kim Lee", "Company": "Acme"}],
+                             importer.guess_mapping(["Email", "Name", "Company"]), self.kc)
+        self.conn.execute("UPDATE enrollments SET enrolled_at = ?", (iso(MON),))
+        self.tick(MON)                                                                 # intro email to Kim
+
+    def kim_mails(self):
+        return [s for s in self.g.sent if s[1] == "kim@x.com"]
+
+    def auto(self, text, subject="Automatic reply: Hello"):
+        e = one(self.conn, "SELECT e.* FROM enrollments e JOIN leads l ON l.id = e.lead_id WHERE l.email = 'kim@x.com'")
+        self.g.inbox.append(mail("kim@x.com", subject, cid=e["conversation_id"], at=MON + timedelta(minutes=5), preview=text))
+        self.tick(MON + timedelta(minutes=30))
+
+    def test_waits_until_the_day_after_their_return_then_opens_with_the_line(self):
+        self.assertEqual(len(self.kim_mails()), 1)
+        self.auto("I am out of the office until 26 October with limited access to email.")
+        self.tick(MON + timedelta(days=2, hours=1))                                    # step 2 due: held
+        self.assertEqual(len(self.kim_mails()), 1)
+        held = one(self.conn, "SELECT detail FROM events WHERE type = 'step_held'")
+        self.assertEqual(held["detail"], "out of office: waits until 27 Oct")
+        self.tick(datetime(2026, 10, 27, 8, 0, tzinfo=timezone.utc))                   # before the window opens
+        self.assertEqual(len(self.kim_mails()), 1)
+        self.tick(datetime(2026, 10, 27, 10, 0, tzinfo=timezone.utc))
+        html = self.kim_mails()[-1][3]
+        self.assertLess(html.index("Hi Kim,"), html.index("Hope you had a good break."))
+        self.assertLess(html.index("Hope you had a good break."), html.index("Following up"))
+        self.assertEqual(one(self.conn, "SELECT stage FROM leads WHERE email = 'kim@x.com'")["stage"], "prospect")
+
+    def test_no_return_date_waits_a_week_and_templates_can_word_it_themselves(self):
+        self.conn.execute("UPDATE steps SET body = ? WHERE campaign_id = ? AND pos = 1",
+                          ("Hi {{ first_name }},\n\n{% if ooo %}Welcome back.{% endif %} Following up.", self.kc))
+        self.auto("I am currently out of the office with limited access to email.")
+        self.tick(MON + timedelta(days=6))
+        self.assertEqual(len(self.kim_mails()), 1)
+        self.tick(MON + timedelta(days=7, hours=1))
+        html = self.kim_mails()[-1][3]
+        self.assertIn("Welcome back.", html)
+        self.assertNotIn("Hope you had a good break", html)
+
+    def test_left_the_company_skips_email_but_keeps_the_prospect(self):
+        self.auto("Kim Lee is no longer with Acme. Please contact sales@acme.com.")
+        self.tick(MON + timedelta(days=2, hours=1))
+        self.assertEqual(len(self.kim_mails()), 1)
+        ev = one(self.conn, "SELECT detail FROM events WHERE type = 'step_skipped' AND channel = 'email' ORDER BY id DESC LIMIT 1")
+        self.assertIn("left the company", ev["detail"])
+        self.assertEqual(one(self.conn, "SELECT stage FROM leads WHERE email = 'kim@x.com'")["stage"], "prospect")
+
+    def test_plain_acknowledgement_changes_nothing_and_opener_can_be_off(self):
+        self.auto("Thanks for your email. This is an automated response.", subject="Automatic reply: Hello")
+        self.tick(MON + timedelta(days=2, hours=1))
+        self.assertEqual(len(self.kim_mails()), 2)
+        self.assertNotIn("Hope you had", self.kim_mails()[-1][3])
+        ctx = {}
+        db.set_setting(self.conn, "ooo_opener", "")
+        info = {"kind": "ooo", "back": None, "at": iso(MON)}
+        self.assertEqual(engine.attune(self.conn, self.FOLLOW, ctx, info), self.FOLLOW)
+        self.assertTrue(ctx["ooo"])
