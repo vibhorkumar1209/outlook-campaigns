@@ -182,7 +182,17 @@
       <div class="card-head"><h2>LinkedIn detection</h2></div>
       <p>Accepts and replies are read from LinkedIn's notification emails (choose the inbox on <a href="/senders">Senders</a>). In LinkedIn → Settings → Communications → Email, keep these on:</p>
       <ul class="meta"><li>Invitations: <i>invitation accepted</i></li><li>Messages: <i>new messages</i></li></ul>
+      <p class="meta">LinkedIn sends these to the email address on your LinkedIn account. If that isn't a mailbox connected here (e.g. a personal Gmail), forward LinkedIn's mails to the one chosen on Senders: in Gmail, a filter on <code>from:linkedin.com</code> with <i>Forward it to</i>. With the LinkedIn bot on, it also reads your LinkedIn inbox for replies every 10 minutes.</p>
       <p class="meta">Detection matches the lead's full name in the notification. If it misses one, use <i>Mark connected</i> or <i>They replied</i>.</p>
+    </section>
+
+    <section class="card" id="auto-replies">
+      <div class="card-head"><h2>Out-of-office replies</h2></div>
+      <p class="meta">They stay a prospect and their sequence carries on, adjusted: the next email, LinkedIn or WhatsApp message waits until the day after their return date (7 days when they gave none), and it opens with the line below, right after the greeting. A <i>no longer with the company</i> reply skips their remaining emails; LinkedIn steps continue. In a template, <code>{% raw %}{% if ooo %}…{% endif %}{% endraw %}</code> and <code>{% raw %}{{ ooo_back }}{% endraw %}</code> let you write your own version instead.</p>
+      <form method="post" action="/settings/auto-replies" class="stack-y" style="gap:10px">
+        <label class="f">Opening line after an out-of-office (blank: none)<input name="ooo_opener" maxlength="300" value="{{ ooo_opener }}" placeholder="Hope you had a good break."></label>
+        <div><button class="btn">Save</button></div>
+      </form>
     </section>
 
     <section class="card">

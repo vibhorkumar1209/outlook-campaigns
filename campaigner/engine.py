@@ -49,6 +49,10 @@ DAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 OPEN = ("pending", "active", "done")
 REPLY_LOOKBACK = timedelta(days=30)   # keep watching finished sequences this long
 WAIT_FOR_CONNECT = timedelta(days=7)  # connection-gated steps wait this long past due, then skip
+OOO_HOLD = timedelta(days=7)          # out-of-office with no return date: the next message waits this long
+MESSAGES = ("email", "li_message", WHATSAPP)  # steps that write to them (held while they're away)
+OOO_OPENER_DEFAULT = "Hope you had a good break."
+GREETING_RE = re.compile(r"^\s*(hi|hello|hey|dear|good (morning|afternoon|evening)|greetings)\b[^\n]{0,60}$", re.I)
 # Test mode: a campaign with "dummy" in its name runs its whole sequence within 30 minutes. Waits are scaled to
 # DUMMY_TOTAL, leaving headroom for the 1-minute send check and the LinkedIn bot's pace between actions.
 DUMMY_TOTAL = timedelta(minutes=25)
@@ -693,6 +697,48 @@ def ingest_tracking(conn, tracker, log) -> None:
 
 # ---------- sequencing ----------
 
+# ---------- automatic replies: hold and attune the next message ----------
+
+def away_info(conn, e: dict) -> dict | None:
+    """Their out-of-office / 'no longer here' auto-reply to our last message, if one came since: {kind, back, at}.
+    Our next message (email, LinkedIn or WhatsApp) clears it. A generic acknowledgement changes nothing."""
+    last_out = scalar(conn, """SELECT MAX(at) FROM events WHERE lead_id = ? AND (type = 'sent'
+                               OR (type = 'task_done' AND channel IN ('li_message', 'whatsapp')) OR type = 'wa_out')""",
+                      e["lead_id"])
+    r = one(conn, """SELECT detail, content, at FROM events WHERE lead_id = ? AND type = 'auto_reply' AND at >= ?
+                     ORDER BY at DESC LIMIT 1""", e["lead_id"], last_out or "")
+    if not r:
+        return None
+    info = crm.auto_reply_info(r["detail"], r["content"], r["at"])
+    if info["kind"] == "left" and e.get("email_updated_at") and parse(e["email_updated_at"]) > parse(r["at"]):
+        return None  # you've since given them a new address
+    return info if info["kind"] in ("ooo", "left") else None
+
+
+def back_at(c: dict, info: dict) -> datetime:
+    """When to write again after an out-of-office: the day after their return date, when the send window opens
+    (or OOO_HOLD after the auto-reply when they gave no date)."""
+    if not info["back"]:
+        return parse(info["at"]) + OOO_HOLD
+    h, m = (int(x) for x in (c.get("window_start") or "09:00").split(":"))
+    return datetime(info["back"].year, info["back"].month, info["back"].day, h, m, tzinfo=tz_of(c)) + timedelta(days=1)
+
+
+def attune(conn, body: str, ctx: dict, info: dict | None) -> str:
+    """After an out-of-office, templates can use {{ ooo }} / {{ ooo_back }}; a template that doesn't gets the
+    opener from Settings right after its greeting line."""
+    ctx["ooo"] = bool(info and info["kind"] == "ooo")
+    ctx["ooo_back"] = f"{info['back'].day} {info['back'].strftime('%b')}" if ctx["ooo"] and info["back"] else ""
+    opener = (db.get_setting(conn, "ooo_opener", OOO_OPENER_DEFAULT) or "").strip()
+    if not ctx["ooo"] or not opener or "ooo" in (body or ""):
+        return body
+    lines = (body or "").split("\n")
+    if lines and GREETING_RE.match(lines[0]):
+        rest = "\n".join(lines[1:]).lstrip("\n")
+        return f"{lines[0]}\n\n{opener}\n\n{rest}" if rest else f"{lines[0]}\n\n{opener}"
+    return f"{opener}\n\n{body}" if body else opener
+
+
 def gate(st: dict, e: dict, now: datetime, due: datetime,
          wait_for_connect: timedelta = WAIT_FOR_CONNECT) -> tuple[str | None, bool]:
     """(skip reason, wait). Neither = go."""
@@ -754,7 +800,7 @@ def _fail(conn, e: dict, k: int, msg: str, log, permanent: bool) -> None:
 
 ENROLLED_SQL = """
     SELECT e.*, l.email, l.linkedin_url, l.first_name, l.last_name, l.company, l.title, l.data, l.li_state, l.dnc,
-           l.email_bounced, l.status AS lead_status_now, l.old_contact
+           l.email_bounced, l.email_updated_at, l.status AS lead_status_now, l.old_contact
     FROM enrollments e JOIN leads l ON l.id = e.lead_id
     WHERE e.campaign_id = ? AND e.status IN ('pending', 'active')
       AND NOT EXISTS (SELECT 1 FROM tasks t WHERE t.enrollment_id = e.id AND t.status = 'open'
@@ -854,6 +900,21 @@ def process_campaign(conn, c: dict, boxes: Mailboxes, tracker, now: datetime, se
                 event(conn, e["lead_id"], "step_skipped", enrollment=e, channel=st["channel"], step_pos=k,
                       detail=reason, at=now)
                 continue
+            e["away"] = away_info(conn, e) if st["channel"] in MESSAGES else None
+            if e["away"] and e["away"]["kind"] == "left" and st["channel"] == "email":
+                _advance(conn, e, k, now)
+                event(conn, e["lead_id"], "step_skipped", enrollment=e, channel="email", step_pos=k,
+                      detail="they've left the company (automatic reply); LinkedIn steps continue", at=now)
+                continue
+            if e["away"] and e["away"]["kind"] == "ooo":
+                until = back_at(c, e["away"])
+                if now < until:
+                    held = f"out of office: waits until {until.astimezone(tz_of(c)).strftime('%d %b')}"
+                    if not scalar(conn, "SELECT 1 FROM events WHERE enrollment_id = ? AND step_pos = ? AND type = 'step_held' "
+                                        "AND detail = ?", e["id"], k, held):
+                        event(conn, e["lead_id"], "step_held", enrollment=e, channel=st["channel"], step_pos=k,
+                              detail=held, at=now)
+                    break
             if st["channel"] == "email":
                 queue.append((e, k, st))
                 break
@@ -861,7 +922,9 @@ def process_campaign(conn, c: dict, boxes: Mailboxes, tracker, now: datetime, se
             if is_li and li_today >= c["li_daily_cap"]:
                 break
             try:
-                body = (linkedin_text if is_li else whatsapp_text)(render_text(st["body"], lead_context(e)))
+                ctx = lead_context(e)
+                tpl = attune(conn, st["body"], ctx, e.get("away"))
+                body = (linkedin_text if is_li else whatsapp_text)(render_text(tpl, ctx))
             except TemplateError as ex:
                 _fail(conn, e, k, f"template: {ex}", log, permanent=True)
                 break
@@ -960,6 +1023,7 @@ def send_emails(conn, c, steps, queue, boxes: Mailboxes, tracker, now, send, sle
             continue
         sid = secrets.token_urlsafe(9)
         ctx = lead_context(e)
+        body_tpl = attune(conn, st["body"], ctx, e.get("away"))
         ctx["unsubscribe_url"] = (tracker.unsub_url(sid) if tracker
                                   else f"mailto:{sender_email(conn, acct)}?subject=Unsubscribe")
         link = (lambda u, sid=sid: u if tracker.owns(u) else tracker.click_url(sid, u)) \
@@ -968,7 +1032,7 @@ def send_emails(conn, c, steps, queue, boxes: Mailboxes, tracker, now, send, sle
         tracked = (1 if pixel else 0) | (2 if link else 0)
         try:
             subject = render_text(st["subject"] or first_email["subject"], ctx)
-            html = email_html(st["body"], c["signature"], ctx, link=link, pixel=pixel)
+            html = email_html(body_tpl, c["signature"], ctx, link=link, pixel=pixel)
             files = attachments.load(json.loads(st.get("attachments") or "[]"))
         except TemplateError as ex:
             _fail(conn, e, k, f"template: {ex}", log, permanent=True)

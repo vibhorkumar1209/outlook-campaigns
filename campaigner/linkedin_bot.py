@@ -49,6 +49,9 @@ MAX_RUN = timedelta(minutes=45)
 ACTION_OF = {"li_view": "view", "li_connect": "connect", "li_message": "message", "li_engage": "like"}
 MAX_ATTEMPTS = 2
 REPLY_CHECK_EVERY = timedelta(minutes=10)  # LinkedIn inbox scan for replies to the bot's messages
+REPLY_LIKELY_MAX = 8        # threads where the inbox shows they spoke last: all opened, up to this many a check
+REPLY_ROTATE = 4            # plus this many others (not in the inbox list), least recently checked first
+REPLY_FAILS_IN_A_ROW = 3    # LinkedIn misbehaving: stop this check, try again next time
 ACCEPT_CHECK_EVERY = timedelta(minutes=15)  # "recently added" connections scan for accepted invites
 ACCEPT_DEEP_EVERY = timedelta(days=1)       # once a day, read further back: catches older invites accepted
 ACCEPT_LIMIT, ACCEPT_DEEP_LIMIT = 40, 300
@@ -408,7 +411,7 @@ def run(conn, driver_factory, *, now: datetime | None = None, log=print, sleep=N
         if action == "connect" and week_invites >= cfg["li_bot_week_invites"]:
             continue
         todo.append((t, action))
-    candidates = reply_candidates(conn) if hours_ok and reply_check_due(conn, now) else []
+    candidates = reply_candidates(conn, now) if hours_ok and reply_check_due(conn, now) else []
     invited = accept_candidates(conn) if hours_ok and accept_check_due(conn, now) else []
     weeks = cfg["li_bot_withdraw_weeks"]
     withdraw_left = caps.get("withdraw", 0) - used.get("withdraw", 0)
@@ -600,34 +603,69 @@ REPLY_CANDIDATES_SQL = """
 """
 
 
-def reply_candidates(conn) -> list[dict]:
+def reply_candidates(conn, now: datetime | None = None) -> list[dict]:
     """Prospects who got a LinkedIn message from us in the last 30 days, even if their sequence has since
     ended (bounced, stopped): a reply still makes them a lead."""
-    return rows(conn, REPLY_CANDIDATES_SQL, iso(utcnow() - timedelta(days=30)))
+    return rows(conn, REPLY_CANDIDATES_SQL, iso((now or utcnow()) - timedelta(days=30)))
 
 
 def _norm(s: str) -> str:
     return " ".join(re.sub(r"[^a-z0-9 ]+", " ", (s or "").lower()).split())
 
 
-def inbox_says_no_reply(items: list[dict], lead: dict) -> bool:
-    """True only when the inbox list shows, unambiguously, that we spoke last in this lead's thread."""
+def inbox_match(items: list[dict], lead: dict) -> dict | None:
+    """This lead's conversation in the inbox list, when it can be told apart from others."""
     first, last = _norm(lead["first_name"]), _norm(lead["last_name"])
     named = [i for i in items if _norm(i["name"]).split()[:1] == first.split()[:1]]
     strong = [i for i in named if last and last in _norm(i["name"])]
-    match = strong[0] if strong else (named[0] if len(named) == 1 else None)
+    return strong[0] if strong else (named[0] if len(named) == 1 else None)
+
+
+def inbox_says_no_reply(items: list[dict], lead: dict) -> bool:
+    """True only when the inbox list shows, unambiguously, that we spoke last in this lead's thread."""
+    match = inbox_match(items, lead)
     return bool(match and match["last_from_me"])
 
 
-def check_replies(conn, driver, candidates: list[dict], now: datetime, log) -> None:
-    items = driver.inbox()
+def reply_plan(conn, items: list[dict], candidates: list[dict]) -> list[dict]:
+    """Whose threads to open this time: first everyone the inbox shows speaking last (a likely reply), then a few
+    of the rest in rotation. A reply moves a thread to the top of the inbox, so the rotation is only a backstop."""
+    marks = db.get_setting(conn, "li_reply_marks", {}) or {}
+    likely, others = [], []
     for lead in candidates:
-        if inbox_says_no_reply(items, lead):
+        match = inbox_match(items, lead)
+        if match and match["last_from_me"]:
             continue
-        reply = driver.thread_reply(lead["linkedin_url"], lead["sent_text"])
-        if reply:
-            if engine.mark_replied(conn, lead["lead_id"], "linkedin", now, detail=reply[:200], content=reply):
-                log(f"reply (LinkedIn) from {lead['first_name']} {lead['last_name']}: moved to Leads")
+        (likely if match else others).append(lead)
+    others.sort(key=lambda l: marks.get(str(l["lead_id"]), ""))
+    return likely[:REPLY_LIKELY_MAX] + others[:REPLY_ROTATE]
+
+
+def check_replies(conn, driver, candidates: list[dict], now: datetime, log) -> None:
+    """Open the conversations that may hold a reply. One profile that won't load is skipped, not the whole check."""
+    items = driver.inbox()
+    marks = db.get_setting(conn, "li_reply_marks", {}) or {}
+    live = {str(c["lead_id"]) for c in candidates}
+    marks = {k: v for k, v in marks.items() if k in live}
+    fails = 0
+    for lead in reply_plan(conn, items, candidates):
+        who = f"{lead['first_name']} {lead['last_name']}".strip()
+        marks[str(lead["lead_id"])] = iso(now)
+        try:
+            reply = driver.thread_reply(lead["linkedin_url"], lead["sent_text"])
+        except BlockedError:
+            raise
+        except Exception as e:
+            fails += 1
+            log(f"LinkedIn bot: couldn't open {who}'s conversation ({str(e).splitlines()[0][:120]}); next time")
+            if fails >= REPLY_FAILS_IN_A_ROW:
+                log("LinkedIn bot: reply check stopped early (LinkedIn isn't loading pages)")
+                break
+            continue
+        fails = 0
+        if reply and engine.mark_replied(conn, lead["lead_id"], "linkedin", now, detail=reply[:200], content=reply):
+            log(f"reply (LinkedIn) from {who}: moved to Leads")
+    db.set_setting(conn, "li_reply_marks", marks)
 
 
 def handle(conn, driver, t: dict, action: str, *, now: datetime, log, draft) -> bool:
