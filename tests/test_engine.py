@@ -2358,18 +2358,25 @@ class ReplyCheckTest(Base):
         self.assertEqual(one(self.conn, "SELECT stage FROM leads WHERE id = ?", jane)["stage"], "lead")
         self.assertTrue(any("couldn't open Ann X" in l for l in self.logs))
 
-    def test_others_rotate_and_repeated_failures_stop_early(self):
-        cands = [self.lead(9000 + i, f"P{i}") for i in range(10)]
+    def test_unchecked_first_then_rotation_and_repeated_failures_stop_early(self):
+        n = linkedin_bot.REPLY_FRESH_MAX + 2
+        cands = [{**self.lead(9000 + i, f"P{i}"), "sent_at": iso(MON - timedelta(hours=n - i))} for i in range(n)]
         d = self.driver([], {})
         linkedin_bot.check_replies(self.conn, d, cands, MON, self.logs.append)
         first = [c[1] for c in d.calls if c[0] == "thread"]
-        self.assertEqual(len(first), linkedin_bot.REPLY_ROTATE)
+        self.assertEqual(len(first), linkedin_bot.REPLY_FRESH_MAX)                     # never-checked people, oldest first
+        self.assertEqual(first[0], "https://www.linkedin.com/in/p0")
         d = self.driver([], {})
         linkedin_bot.check_replies(self.conn, d, cands, MON + timedelta(minutes=10), self.logs.append)
         second = [c[1] for c in d.calls if c[0] == "thread"]
-        self.assertFalse(set(first) & set(second))                                     # the next ones in line
-        d = self.driver([], {}, broken=("linkedin.com",))
+        self.assertEqual(second[:2], ["https://www.linkedin.com/in/p8", "https://www.linkedin.com/in/p9"])
+        self.assertEqual(len(second), 2 + linkedin_bot.REPLY_ROTATE)                   # then re-checks in rotation
+        cands[0]["sent_at"] = iso(MON + timedelta(minutes=15))                         # a new message to P0
+        d = self.driver([], {})
         linkedin_bot.check_replies(self.conn, d, cands, MON + timedelta(minutes=20), self.logs.append)
+        self.assertEqual([c[1] for c in d.calls if c[0] == "thread"][0], "https://www.linkedin.com/in/p0")
+        d = self.driver([], {}, broken=("linkedin.com",))
+        linkedin_bot.check_replies(self.conn, d, cands, MON + timedelta(minutes=30), self.logs.append)
         self.assertEqual(len([c for c in d.calls if c[0] == "thread"]), linkedin_bot.REPLY_FAILS_IN_A_ROW)
         self.assertIn("stopped early", self.logs[-1])
 
