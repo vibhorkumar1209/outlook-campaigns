@@ -50,7 +50,9 @@ ACTION_OF = {"li_view": "view", "li_connect": "connect", "li_message": "message"
 MAX_ATTEMPTS = 2
 REPLY_CHECK_EVERY = timedelta(minutes=10)  # LinkedIn inbox scan for replies to the bot's messages
 REPLY_LIKELY_MAX = 8        # threads where the inbox shows they spoke last: all opened, up to this many a check
-REPLY_ROTATE = 4            # plus this many others (not in the inbox list), least recently checked first
+REPLY_FRESH_MAX = 8         # plus people not checked since our last message to them (not in the inbox list)
+REPLY_ROTATE = 4            # plus this many re-checks of the rest, least recently checked first
+INBOX_SCROLLS = 6           # the inbox list loads ~10 conversations at a time; scroll to reach the limit
 REPLY_FAILS_IN_A_ROW = 3    # LinkedIn misbehaving: stop this check, try again next time
 ACCEPT_CHECK_EVERY = timedelta(minutes=15)  # "recently added" connections scan for accepted invites
 ACCEPT_DEEP_EVERY = timedelta(days=1)       # once a day, read further back: catches older invites accepted
@@ -628,17 +630,24 @@ def inbox_says_no_reply(items: list[dict], lead: dict) -> bool:
 
 
 def reply_plan(conn, items: list[dict], candidates: list[dict]) -> list[dict]:
-    """Whose threads to open this time: first everyone the inbox shows speaking last (a likely reply), then a few
-    of the rest in rotation. A reply moves a thread to the top of the inbox, so the rotation is only a backstop."""
+    """Whose threads to open this time: first everyone the inbox shows speaking last (a likely reply), then people
+    not checked since our last message to them (oldest message first), then a few re-checks in rotation."""
     marks = db.get_setting(conn, "li_reply_marks", {}) or {}
-    likely, others = [], []
+    likely, fresh, others = [], [], []
     for lead in candidates:
         match = inbox_match(items, lead)
         if match and match["last_from_me"]:
             continue
-        (likely if match else others).append(lead)
+        mark = marks.get(str(lead["lead_id"]))
+        if match:
+            likely.append(lead)
+        elif not mark or mark < (lead.get("sent_at") or ""):
+            fresh.append(lead)
+        else:
+            others.append(lead)
+    fresh.sort(key=lambda l: l.get("sent_at") or "")
     others.sort(key=lambda l: marks.get(str(l["lead_id"]), ""))
-    return likely[:REPLY_LIKELY_MAX] + others[:REPLY_ROTATE]
+    return likely[:REPLY_LIKELY_MAX] + fresh[:REPLY_FRESH_MAX] + others[:REPLY_ROTATE]
 
 
 def check_replies(conn, driver, candidates: list[dict], now: datetime, log) -> None:
@@ -1086,12 +1095,41 @@ class ChromeDriver:
       return out;
     }"""
 
+    # Scroll the conversation list (the nearest scrollable box around the last conversation) to load more.
+    _INBOX_MORE_JS = r"""() => {
+      const roots = [document];
+      const collect = (r) => { for (const el of r.querySelectorAll('*')) if (el.shadowRoot) { roots.push(el.shadowRoot); collect(el.shadowRoot); } };
+      collect(document);
+      let last = null;
+      for (const r of roots) for (const li of r.querySelectorAll('li'))
+        if (/conversation details/i.test(li.innerText || '')) last = li;
+      if (!last) return false;
+      for (let el = last.parentElement; el; el = el.parentElement || (el.getRootNode && el.getRootNode().host)) {
+        const oy = getComputedStyle(el).overflowY;
+        if ((oy === 'auto' || oy === 'scroll') && el.scrollHeight > el.clientHeight + 20) {
+          el.scrollTop = el.scrollHeight;
+          return true;
+        }
+      }
+      last.scrollIntoView({block: 'end'});
+      return true;
+    }"""
+
     def inbox(self, limit: int = 40) -> list[dict]:
         """Recent conversations: [{name, snippet, last_from_me}]. Read-only (LinkedIn may mark the top thread read)."""
         self._goto(self.base + "/messaging/")
         self.page.wait_for_timeout(2500)
+        rows = self.page.evaluate(self._INBOX_JS)
+        for _ in range(INBOX_SCROLLS):
+            if len(rows) >= limit or not self.page.evaluate(self._INBOX_MORE_JS):
+                break
+            self.page.wait_for_timeout(random.randint(1500, 2500))
+            more = self.page.evaluate(self._INBOX_JS)
+            if len(more) <= len(rows):
+                break
+            rows = more
         out = []
-        for lines in self.page.evaluate(self._INBOX_JS)[:limit]:
+        for lines in rows[:limit]:
             if len(lines) < 3:
                 continue
             snippet = next((l for l in lines[1:] if re.match(r"^[^:]{1,40}: ", l) or " sent " in l), "")
