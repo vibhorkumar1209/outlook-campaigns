@@ -17,7 +17,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from jinja2 import TemplateError, TemplateSyntaxError
 
-from .. import ai, attachments, crm, db, domain_health, engine, importer, linkedin_bot, osutil, stats, updater, whatsapp_bot
+from .. import ai, attachments, intent_outbox, crm, db, domain_health, engine, importer, linkedin_bot, osutil, stats, updater, whatsapp_bot
 from ..db import iso, one, parse, rows, scalar, utcnow
 from ..graph import AuthError, Graph, GraphError
 from ..render import (ENV, WRAP, email_html, lead_context, lead_phone, linkedin_text, render_text, text_to_html,
@@ -153,6 +153,7 @@ async def local_only(request: Request, call_next):
 def _start():
     if os.environ.get("OC_TICKER", "1") == "1":
         runner.start_loop(int(os.environ.get("OC_TICK_MINUTES", "10")))
+        intent_outbox.start(intake_intent)
 
 
 def connected_senders(conn) -> list[dict]:
@@ -1256,32 +1257,43 @@ async def import_commit(request: Request):
 
 
 # ---------- Intent Engine intake ----------
-# Each lead carries its own 3 emails (written by the Intent Engine from its triggers:
+# Each lead carries its own emails (written by the Intent Engine from its triggers:
 # email 1 = most recent trigger, follow-ups = older ones). The sequence is just the
 # templates that pull those fields, so every lead gets their own copy.
-INTENT_EMAILS = 3
-INTENT_SEQUENCE = [
-    {"channel": "email", "delay_days": 0, "subject": "{{ intent_email_1_subject }}", "body": "{{ intent_email_1_body }}"},
-    {"channel": "email", "delay_days": 3, "body": "{{ intent_email_2_body }}"},
-    {"channel": "email", "delay_days": 5, "body": "{{ intent_email_3_body }}"},
-]
+# Leads arrive two ways: POST /api/intake/intent-engine (local), or the outbox
+# collector below, which pulls what the RefractOne page queued on the API.
+INTENT_DELAYS = {3: [0, 3, 5], 5: [0, 3, 4, 5, 7]}  # days after the previous email
 INTAKE_FIELDS = ("email", "first_name", "last_name", "company", "title", "linkedin_url", "tags", "status")
 
 
-@app.post("/api/intake/intent-engine")
-async def intake_intent_engine(request: Request):
-    """Body: {"campaign_name": str, "campaign_id": int?, "leads": [Intent Engine campaign_leads]}.
-    New campaigns are created as drafts with the intent sequence; nothing sends until you activate."""
-    p = await request.json()
+class IntakeError(ValueError):
+    pass
+
+
+def intent_sequence(n: int) -> list[dict]:
+    return [{"channel": "email", "delay_days": d, "body": f"{{{{ intent_email_{k}_body }}}}",
+             **({"subject": "{{ intent_email_1_subject }}"} if k == 1 else {})}
+            for k, d in enumerate(INTENT_DELAYS[n], 1)]
+
+
+def _email_count(leads: list[dict]) -> int:
+    for n in sorted(INTENT_DELAYS, reverse=True):
+        need = [f"intent_email_{k}_body" for k in range(1, n + 1)] + ["intent_email_1_subject"]
+        if all(all(str((l.get("data") or {}).get(f, "")).strip() for f in need) for l in leads):
+            return n
+    raise IntakeError("Email sequence missing on some leads; re-run the Intent Engine")
+
+
+def intake_intent(p: dict) -> dict:
+    """{"campaign_name": str, "campaign_id": int?, "leads": [Intent Engine campaign_leads]} →
+    a draft campaign (nothing sends until you activate) with the leads enrolled."""
     leads = p.get("leads") or []
     if not isinstance(leads, list) or not leads:
-        return JSONResponse({"ok": False, "error": "no leads"}, status_code=422)
-    need = [f"intent_email_{k}_body" for k in range(1, INTENT_EMAILS + 1)] + ["intent_email_1_subject"]
+        raise IntakeError("no leads")
+    n = _email_count(leads)
     data_rows = []
     for l in leads:
         d = {k: v for k, v in (l.get("data") or {}).items() if isinstance(v, (str, int, float))}
-        if any(not str(d.get(f, "")).strip() for f in need):
-            return JSONResponse({"ok": False, "error": f"{l.get('first_name', '')} {l.get('last_name', '')}: email sequence missing; re-run the Intent Engine"}, status_code=422)
         row = {k: str(v) for k, v in d.items()}
         row.update({f: str(l.get(f) or "") for f in INTAKE_FIELDS[:6]})
         row.update({"tags": "Intent Engine", "status": "Warm"})
@@ -1296,7 +1308,7 @@ async def intake_intent_engine(request: Request):
         cur = conn.execute("INSERT INTO campaigns (name, sender, created_at) VALUES (?, ?, ?)",
                            (name, engine.default_sender(conn), iso(utcnow())))
         cid = cur.lastrowid
-        _save_steps(conn, cid, _validate_steps(INTENT_SEQUENCE)[0])
+        _save_steps(conn, cid, _validate_steps(intent_sequence(n))[0])
     reach = [r for r in data_rows if r["email"].strip() or importer.normalize_linkedin(r["linkedin_url"])]
     summary = importer.import_rows(conn, reach, {f: f for f in INTAKE_FIELDS} | {f: "" for f in importer.FIELDS if f not in INTAKE_FIELDS}, int(cid))
     # The engine never guesses addresses, so leads often arrive with no email and
@@ -1319,7 +1331,15 @@ async def intake_intent_engine(request: Request):
         summary["enrolled"] += importer.enroll_leads(conn, [lid], int(cid))["enrolled"]
     if no_contact:
         summary["needs_email"] = [f"{r['first_name']} {r['last_name']}".strip() for r in no_contact]
-    return {"ok": True, "campaign_id": int(cid), "url": f"{crm.base_url()}/campaigns/{cid}", "summary": summary}
+    return {"ok": True, "campaign_id": int(cid), "url": f"{crm.base_url()}/campaigns/{cid}", "emails": n, "summary": summary}
+
+
+@app.post("/api/intake/intent-engine")
+async def intake_intent_engine(request: Request):
+    try:
+        return intake_intent(await request.json())
+    except IntakeError as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=422)
 
 
 # ---------- senders / deliverability ----------
