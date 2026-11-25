@@ -54,6 +54,26 @@ runner = Runner()
 app = FastAPI(docs_url=None, redoc_url=None)
 app.mount("/static", StaticFiles(directory=HERE / "static"), name="static")
 
+# The RefractOne Intent Engine page (in the browser) posts leads straight here.
+# Only that app's origins may call /api/intake; Chrome also needs the
+# Private-Network header to let a public https page reach 127.0.0.1.
+INTAKE_ORIGIN = re.compile(r"^(https://it-deals-frontend[a-z0-9-]*\.vercel\.app|http://(localhost|127\.0\.0\.1)(:\d+)?)$")
+
+
+@app.middleware("http")
+async def intake_cors(request: Request, call_next):
+    if not request.url.path.startswith("/api/intake/"):
+        return await call_next(request)
+    origin = request.headers.get("origin")
+    if origin and not INTAKE_ORIGIN.match(origin):
+        return JSONResponse({"ok": False, "error": "origin not allowed"}, status_code=403)
+    cors = {"Access-Control-Allow-Origin": origin, "Vary": "Origin", "Access-Control-Allow-Methods": "POST, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type", "Access-Control-Allow-Private-Network": "true",
+            "Access-Control-Max-Age": "600"} if origin else {}
+    resp = Response(status_code=204) if request.method == "OPTIONS" else await call_next(request)
+    resp.headers.update(cors)
+    return resp
+
 
 templates = Jinja2Templates(directory=HERE / "templates")
 
@@ -121,7 +141,8 @@ async def local_only(request: Request, call_next):
     # Block DNS rebinding and cross-site form posts: this app can send email as you.
     if request.headers.get("host", "") not in HOSTS:
         return PlainTextResponse("bad host", 400)
-    if request.method not in ("GET", "HEAD"):
+    # /api/intake/ has its own origin allowlist (intake_cors).
+    if request.method not in ("GET", "HEAD") and not request.url.path.startswith("/api/intake/"):
         origin = request.headers.get("origin") or request.headers.get("referer") or ""
         if not any(origin.startswith(f"http://{h}") for h in HOSTS):
             return PlainTextResponse("cross-origin request blocked", 403)
@@ -1232,6 +1253,52 @@ async def import_commit(request: Request):
     summary = importer.import_rows(conn, up["rows"], mapping, cid)
     c = get_campaign(conn, cid) if cid else None
     return page(request, "import_done.html", conn, s=summary, c=c, filename=up["filename"])
+
+
+# ---------- Intent Engine intake ----------
+# Each lead carries its own 3 emails (written by the Intent Engine from its triggers:
+# email 1 = most recent trigger, follow-ups = older ones). The sequence is just the
+# templates that pull those fields, so every lead gets their own copy.
+INTENT_EMAILS = 3
+INTENT_SEQUENCE = [
+    {"channel": "email", "delay_days": 0, "subject": "{{ intent_email_1_subject }}", "body": "{{ intent_email_1_body }}"},
+    {"channel": "email", "delay_days": 3, "body": "{{ intent_email_2_body }}"},
+    {"channel": "email", "delay_days": 5, "body": "{{ intent_email_3_body }}"},
+]
+INTAKE_FIELDS = ("email", "first_name", "last_name", "company", "title", "linkedin_url", "tags", "status")
+
+
+@app.post("/api/intake/intent-engine")
+async def intake_intent_engine(request: Request):
+    """Body: {"campaign_name": str, "campaign_id": int?, "leads": [Intent Engine campaign_leads]}.
+    New campaigns are created as drafts with the intent sequence; nothing sends until you activate."""
+    p = await request.json()
+    leads = p.get("leads") or []
+    if not isinstance(leads, list) or not leads:
+        return JSONResponse({"ok": False, "error": "no leads"}, status_code=422)
+    need = [f"intent_email_{k}_body" for k in range(1, INTENT_EMAILS + 1)] + ["intent_email_1_subject"]
+    data_rows = []
+    for l in leads:
+        d = {k: v for k, v in (l.get("data") or {}).items() if isinstance(v, (str, int, float))}
+        if any(not str(d.get(f, "")).strip() for f in need):
+            return JSONResponse({"ok": False, "error": f"{l.get('first_name', '')} {l.get('last_name', '')}: email sequence missing; re-run the Intent Engine"}, status_code=422)
+        row = {k: str(v) for k, v in d.items()}
+        row.update({f: str(l.get(f) or "") for f in INTAKE_FIELDS[:6]})
+        row.update({"tags": "Intent Engine", "status": "Warm"})
+        data_rows.append(row)
+    conn = db.connect()
+    cid = p.get("campaign_id")
+    if cid:
+        get_campaign(conn, int(cid))
+    else:
+        companies = sorted({r["company"] for r in data_rows if r["company"]})
+        name = (p.get("campaign_name") or "").strip() or f"Intent Engine · {', '.join(companies[:3])} · {utcnow():%d %b}"
+        cur = conn.execute("INSERT INTO campaigns (name, sender, created_at) VALUES (?, ?, ?)",
+                           (name, engine.default_sender(conn), iso(utcnow())))
+        cid = cur.lastrowid
+        _save_steps(conn, cid, _validate_steps(INTENT_SEQUENCE)[0])
+    summary = importer.import_rows(conn, data_rows, {f: f for f in INTAKE_FIELDS} | {f: "" for f in importer.FIELDS if f not in INTAKE_FIELDS}, int(cid))
+    return {"ok": True, "campaign_id": int(cid), "url": f"{crm.base_url()}/campaigns/{cid}", "summary": summary}
 
 
 # ---------- senders / deliverability ----------
