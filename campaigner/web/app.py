@@ -1297,7 +1297,28 @@ async def intake_intent_engine(request: Request):
                            (name, engine.default_sender(conn), iso(utcnow())))
         cid = cur.lastrowid
         _save_steps(conn, cid, _validate_steps(INTENT_SEQUENCE)[0])
-    summary = importer.import_rows(conn, data_rows, {f: f for f in INTAKE_FIELDS} | {f: "" for f in importer.FIELDS if f not in INTAKE_FIELDS}, int(cid))
+    reach = [r for r in data_rows if r["email"].strip() or importer.normalize_linkedin(r["linkedin_url"])]
+    summary = importer.import_rows(conn, reach, {f: f for f in INTAKE_FIELDS} | {f: "" for f in importer.FIELDS if f not in INTAKE_FIELDS}, int(cid))
+    # The engine never guesses addresses, so leads often arrive with no email and
+    # no LinkedIn. Keep them in the (draft) campaign; add the email on the lead page.
+    no_contact = [r for r in data_rows if r not in reach]
+    now = utcnow()
+    for r in no_contact:
+        extra = {k: v for k, v in r.items() if k not in INTAKE_FIELDS and v}
+        lead = one(conn, "SELECT id FROM leads WHERE email IS NULL AND linkedin_url IS NULL AND first_name = ? AND last_name = ? "
+                   "AND company = ?", r["first_name"], r["last_name"], r["company"])
+        if lead:
+            conn.execute("UPDATE leads SET title = ?, data = ? WHERE id = ?", (r["title"], json.dumps(extra), lead["id"]))
+            lid = lead["id"]
+        else:
+            lid = conn.execute("INSERT INTO leads (first_name, last_name, company, title, data, status, created_at) "
+                               "VALUES (?, ?, ?, ?, ?, 'Warm', ?)",
+                               (r["first_name"], r["last_name"], r["company"], r["title"], json.dumps(extra), iso(now))).lastrowid
+            summary["created"] += 1
+        crm.add_tags(conn, [lid], ["Intent Engine"])
+        summary["enrolled"] += importer.enroll_leads(conn, [lid], int(cid))["enrolled"]
+    if no_contact:
+        summary["needs_email"] = [f"{r['first_name']} {r['last_name']}".strip() for r in no_contact]
     return {"ok": True, "campaign_id": int(cid), "url": f"{crm.base_url()}/campaigns/{cid}", "summary": summary}
 
 
